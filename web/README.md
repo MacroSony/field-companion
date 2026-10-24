@@ -8,7 +8,7 @@ Plain HTML/CSS/JS, no build step. Serve this directory at `/` with the protocol 
 
 - Phone: `/?session=demo` (the session defaults to `demo`). Tap **Start listening**, allow the microphone, and use earphones. Phones require HTTPS; localhost also works.
 - Projector: `/?display=1&session=demo`. Connects automatically with `role=display`, never requests the microphone or GPS, and is silent by default. Designed for 1280×720 and 1920×1080 landscape.
-- Projector audio: add `&audio=1`, then click **Start display audio** to unlock WebAudio. The backend enables its half-duplex echo guard for this connection: phone speech is gated while the assistant speaks and for 300 ms afterward; the phone tap button still cancels speech.
+- Projector audio: add `&audio=1`, then click **Start display audio** to unlock WebAudio. Phone speech continues during playback; speaker/projector interruption waits for a non-echo transcript before cancelling. Earphones without an audio-enabled display can interrupt at voice onset. Tap remains an immediate fallback.
 - Session and role parameters are forwarded to the WebSocket, including when using the optional `?ws=wss%3A%2F%2Fother-host%2Fws` override. Hello is always first and uses `lang: "en"`.
 - English common names are primary, scientific names italicized below. `zh` fields are ignored. Photos appear on observations, heard detections, candidates, and map popups. Missing or failed photos fall back to a local source icon.
 - The phone's **Observation map** is collapsed initially. The projector map is always open. Observation coordinates determine markers and bounds; the phone additionally shows its available GPS position as a blue dot. Displays do not invent a phone location.

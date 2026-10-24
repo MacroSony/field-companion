@@ -170,6 +170,16 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["status"], "deferred")
         self.c.rt_send.assert_not_awaited()
 
+    async def test_stop_during_answer_setup_does_not_restart_speech(self):
+        async def stop_arrives(config):
+            await self.c.handle_rt({"type": "conversation.item.input_audio_transcription.completed",
+                                   "transcript": "Stop, stop."})
+        self.c.update_session = AsyncMock(side_effect=stop_arrives)
+        response = await self.c.generate("answer")
+        self.assertEqual(response["status"], "deferred")
+        self.assertTrue(self.c.auto_speech_paused)
+        self.assertFalse(any(call.args[0]["type"] == "response.create" for call in self.c.rt_send.call_args_list))
+
     async def test_tap_cancels_and_drops_late_audio(self):
         self.c.phase = "answer"
         self.c.connected = self.c.active = True
@@ -181,14 +191,15 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         await self.c.handle_rt({"type": "response.output_audio.delta", "response_id": "r1", "delta": "AAA="})
         self.assertFalse(self.phone.audio)
 
-    async def test_echo_guard_blocks_realtime_and_keeps_ring(self):
+    async def test_speaker_playback_keeps_stt_streaming_and_marks_birdnet_ring(self):
         display = FakePhone()
         self.c.clients.add(s.Client(display, self.c, "display", True))
         self.c.connected = True
         self.c.play_until = time.monotonic() + 1
         await self.c.ingest_audio(bytes(4800))
         self.assertTrue(self.c.state_payload()["echo_guard"])
-        self.assertTrue(self.c.audio_queue.empty())
+        self.assertFalse(self.c.audio_queue.empty())
+        self.assertTrue(self.c.echo_ring[:2400].all())
         self.assertEqual(self.c.position, 2400)
         self.c.play_until = time.monotonic() - .9
         await self.c.ingest_audio(bytes(4800))
@@ -226,20 +237,65 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(s, "time", SimpleNamespace(monotonic=lambda: 104.51)):
             self.assertFalse(self.c.echo_blocked())
 
-    async def test_guarded_vad_ignored_but_earphones_barge_in(self):
+    async def test_speaker_waits_for_non_echo_transcript_but_earphones_use_vad(self):
         self.c.play_until = time.monotonic() + 2
         self.c.response_id = "answer"
         with patch.object(self.c, "log") as log:
             await self.c.handle_rt({"type": "input_audio_buffer.speech_started"})
-            log.assert_called_with("vad_ignored", reason="assistant_playback")
-        self.assertFalse(self.c.user_speaking)
-        self.assertFalse(self.c.awaiting_transcript)
+            log.assert_called_with("barge_in_candidate", confirmation="transcript")
+        self.assertTrue(self.c.user_speaking)
+        self.assertTrue(self.c.awaiting_transcript)
         self.assertNotIn({"type": "flush"}, self.phone.events)
         self.c.rt_send.assert_not_awaited()
         await self.c.handle_phone({"type": "audio_mode", "earphones": True})
         await self.c.handle_rt({"type": "input_audio_buffer.speech_started"})
         self.assertTrue(self.c.user_speaking)
         self.assertIn({"type": "flush"}, self.phone.events)
+
+    async def test_speaker_stop_cancels_queued_audio_and_drops_late_chunks(self):
+        self.c.connected = self.c.active = True
+        self.c.phase, self.c.response_id = "answer", "old-answer"
+        self.client.playback_pending = True
+        self.c.play_until = 0  # Device playback can outlast the server estimate.
+        await self.c.handle_rt({"type": "input_audio_buffer.speech_started"})
+        self.assertNotIn({"type": "flush"}, self.phone.events)
+        await self.c.handle_rt({"type": "conversation.item.input_audio_transcription.completed", "transcript": "等一下。"})
+        self.assertIn({"type": "flush"}, self.phone.events)
+        self.assertIn("old-answer", self.c.cancelled_ids)
+        self.assertFalse(self.c.audio_allowed)
+        self.assertFalse(self.c.playback_pending())
+        self.assertTrue(self.c.auto_speech_paused)
+        self.assertEqual(list(self.c.pending), [])
+        await self.c.handle_rt({"type": "response.audio.delta", "response_id": "old-answer", "delta": "AAA="})
+        self.assertEqual(self.phone.audio, [])
+
+    async def test_chinese_speaker_echo_does_not_interrupt_but_new_question_does(self):
+        self.c.connected = self.c.active = True
+        self.c.phase, self.c.response_id = "answer", "speaking"
+        self.c.play_until = time.monotonic() + 20
+        self.c.remember_spoken(("speaking", "one", "audio"), "另外，调查 R1 已完成，要我讲一下结果吗？")
+        await self.c.handle_rt({"type": "input_audio_buffer.speech_started"})
+        await self.c.handle_rt({"type": "conversation.item.input_audio_transcription.completed",
+                               "transcript": "调查 R1 已完成，要我讲一下结果吗？"})
+        self.assertNotIn({"type": "flush"}, self.phone.events)
+        self.assertFalse(self.c.pending)
+        # Short explanation acceptance and stop commands must survive echo filtering.
+        self.assertFalse(self.c.transcript_is_echo("讲一下结果。"))
+        self.assertFalse(self.c.transcript_is_echo("停一下。"))
+        await self.c.handle_rt({"type": "conversation.item.input_audio_transcription.completed",
+                               "transcript": "今天记录了多少种鸟？"})
+        self.assertIn({"type": "flush"}, self.phone.events)
+        self.assertEqual(self.c.pending[-1][1], "今天记录了多少种鸟？")
+        self.assertFalse(self.c.auto_speech_paused)
+
+    async def test_audio_sender_keeps_speaker_microphone_open_during_playback(self):
+        self.c.connected = True
+        self.c.play_until = time.monotonic() + 5
+        await self.c.ingest_audio(bytes(1920))
+        sender = asyncio.create_task(self.c.audio_sender())
+        self.c.tasks.append(sender)
+        await asyncio.wait_for(self.c.audio_queue.join(), 1)
+        self.assertTrue(any(call.args[0]["type"] == "input_audio_buffer.append" for call in self.c.rt_send.call_args_list))
 
     async def test_birdnet_drops_all_overlapping_windows_including_tail(self):
         self.c.bird_window = AsyncMock()
@@ -279,7 +335,7 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
                                "delta": "I appreciate the quiet woods. What would you like to ask?"})
         self.assertTrue(self.c.transcript_is_echo("I appreciate the."))
         self.assertTrue(self.c.transcript_is_echo("What would you like to ask?"))
-        # Short replies are never treated as echo (the speaker-mode gate covers those);
+        # Short replies are not treated as echo;
         # answers that reuse the prompt's words must pass.
         self.assertFalse(self.c.transcript_is_echo("quiet"))
         self.assertFalse(self.c.transcript_is_echo("Yes, add them."))
@@ -296,6 +352,7 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.c.pending), 1)
         self.c.spoken.clear()
         self.c.spoken.append(("old", "I appreciate the.", time.monotonic() - 11))
+        self.client.playback_end = time.monotonic() - 11
         self.assertFalse(self.c.transcript_is_echo("I appreciate the."))
 
     async def test_audio_fanout_and_session_isolation(self):

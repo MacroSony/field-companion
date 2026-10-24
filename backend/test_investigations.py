@@ -193,6 +193,32 @@ class InvestigationSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.c.expert.answer.call_args.args[0], "First investigation?")
         self.assertTrue(any("is analyzing evidence" in (text or "") for _, text in self.generated))
 
+    async def test_schedule_ack_is_only_one_short_sentence_in_both_languages(self):
+        first = await self.c.tool("ask_expert", {"question": "What does it eat?"})
+        second = await self.c.tool("ask_expert", {"question": "它住在哪里？"})
+        self.assertEqual(first["answer"], "Investigation R1 is scheduled.")
+        self.assertEqual(second["answer"], "调查 R2 已安排。")
+        await self.c.tool("manage_investigation", {"action": "cancel", "id": "R1"})
+        self.c.turn_question = "Try R1 again"
+        retry = await self.c.tool("manage_investigation", {"action": "retry", "id": "R1"})
+        self.assertEqual(retry["answer"], "Investigation R3 is scheduled.")
+
+    async def test_stop_leaves_ready_results_silent_until_another_user_turn(self):
+        self.c.connected = True
+        self.c.generate = AsyncMock(return_value={"status": "completed", "output": []})
+        await self.c.handle_rt({"type": "conversation.item.input_audio_transcription.completed", "transcript": "Stop."})
+        await self.c.tool("ask_expert", {"question": "First?"})
+        self.release.set()
+        await until(lambda: self.c.investigations.jobs["R1"].status == "completed")
+        self.c.tasks.append(asyncio.create_task(self.c.turn_worker()))
+        self.c.work_ready.set()
+        await asyncio.sleep(.02)
+        self.c.generate.assert_not_awaited()
+        self.assertTrue(self.c.auto_speech_paused)
+        await self.c.handle_phone({"type": "text", "text": "How many species?"})
+        await until(lambda: self.c.generate.await_count >= 1)
+        self.assertFalse(self.c.auto_speech_paused)
+
     async def test_focus_and_new_input_preserve_result_without_hint_leaking(self):
         result = await self.c.tool("ask_expert", {"question": "Could it be another species?"})
         job = self.c.investigations.jobs[result["investigation_id"]]

@@ -29,26 +29,32 @@ expose it publicly. Server restart loses session state.
 - Input: 48 kHz mono PCM16; output: 24 kHz mono PCM16. Stateful 63-tap FIR
   downsampling preserves packet phase. BirdNET uses three-second windows every
   1.5 seconds, a 30-second ring and one worker thread per session.
-- The mic defaults to **speaker** (`earphones=false`): safe half-duplex without
-  needing a display. `audio_mode` (or hello's boolean `earphones`) selects
-  earphones/full-duplex; any display with `audio=1` still forces echo guarding.
+- The mic defaults to **speaker** (`earphones=false`). Realtime input continues
+  during assistant playback. In speaker mode, including an audio-enabled display,
+  VAD starts are candidates: a non-echo final transcript cancels the old reply.
+  Earphones without a speaking display can cancel immediately at VAD start.
 - Guarding starts before the first outgoing assistant PCM. Browser `playback`
   reports track actual scheduled start and final source completion, including
-  flush. Active reports hold the gate closed. Input resumes after the later of
+  flush. Active reports hold automatic notices and BirdNET protection closed until
   reported end and PCM-duration estimate plus 500 ms; old/non-reporting clients
-  use estimate plus 800 ms. The latest audio-output deadline wins. Guarded VAD
-  starts are ignored, not treated as barge-in; Tap still cancels and flushes.
+  use estimate plus 800 ms. These deadlines no longer withhold Realtime mic input.
+  Tap still cancels immediately. Spoken “stop” / “等一下” cancels without a spoken
+  acknowledgement and defers automatic notices until the next user turn.
 - Speaker-mode BirdNET windows overlapping assistant playback or its tail are
   marked in the audio ring, dropped even if processed after playback, and logged
   as `bird_window_skipped` / `assistant_playback`. Earphone BirdNET is unchanged.
 - Always-on STT echo defense remembers the last three spoken assistant captions
   (including partial captions before cancellation). Within ten seconds of speech,
-  a contiguous match of at least three normalized words covering >=70% of the
-  input drops it before routing and logs `echo_dropped`; shorter inputs pass.
+  a contiguous match of at least three normalized English words (six tokens for
+  Chinese, with each Chinese character a token) covering >=70% of the input drops
+  it before routing and logs `echo_dropped`; shorter inputs and stop commands pass.
   Typed text is unaffected. Genuine repeated words can also be filtered: this is
-  a conservative heuristic, not AEC. Browser AEC stays off for BirdNET.
+  a conservative heuristic. Browser echo cancellation is requested; noise
+  suppression and automatic gain control remain off. Browser support and actual
+  speaker/mic acoustic performance still require device testing; see
+  [the capture constraint documentation](https://developer.mozilla.org/en-US/docs/Web/API/MediaTrackConstraints/echoCancellation).
 - The phone status toggle persists Speaker/Earphones in localStorage. The hint
-  distinguishes Tap interruption from voice interruption; first run recommends
+  describes voice interruption with a Tap fallback; first run recommends
   earphones. See `docs/PROTOCOL.md` for wire details.
 
 ## Route first, answer second

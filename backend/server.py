@@ -15,6 +15,7 @@ import io
 from difflib import SequenceMatcher
 import json
 import logging
+import re
 from pathlib import Path
 import sys
 import time
@@ -345,6 +346,7 @@ class Session:
         self.suggestions = {}  # insertion ordered; monotonic times stay server-side
         self.last_proactive = float("-inf")
         self.proactive_turn = False
+        self.auto_speech_paused = False
         self.names = {}
         self.nearby_cache = {}
         self.ring = np.zeros(30 * SR, dtype=np.float32)
@@ -385,13 +387,7 @@ class Session:
             return {"ok": False, "status": "queue_full", "answer":
                 "调查队列已满，请取消一项或等一项完成。" if self.chinese(question) else
                 "The investigation queue is full; cancel a task or wait for one to finish."}
-        ahead = sum(j.status in ACTIVE for j in self.investigations.jobs.values()
-                    if int(j.id[1:]) < int(job.id[1:]))
-        answer = (f"已安排调查 {job.id}，" + (f"前面还有 {ahead} 项；" if ahead else "")
-                  + "你可以继续提问，有结果我会通知你。" if self.chinese(question) else
-                  f"Investigation {job.id} is scheduled. "
-                  + (("There is 1 task ahead. " if ahead == 1 else f"There are {ahead} tasks ahead. ") if ahead else "")
-                  + "You can keep talking; I will let you know when it is ready.")
+        answer = f"调查 {job.id} 已安排。" if self.chinese(question) else f"Investigation {job.id} is scheduled."
         return {"ok": True, "status": "scheduled", "investigation_id": job.id,
                 "answer": answer, "investigation": job.payload()}
 
@@ -562,8 +558,7 @@ class Session:
             return fallback(self.turn_question or old.question, "not_configured")
         job = await self.investigations.submit(old.question, old.observation, parent_id=old.id)
         return {"ok": True, "investigation_id": job.id,
-                "answer": f"已用原问题和原观察证据重新安排调查 {job.id}。" if zh else
-                          f"Investigation {job.id} is scheduled using the original question and evidence."}
+                "answer": f"调查 {job.id} 已安排。" if zh else f"Investigation {job.id} is scheduled."}
 
     async def speak_expert(self, answer, *, guard=None):
         # Keep metadata/hints out of the speech task; a general answer prompt
@@ -734,9 +729,12 @@ class Session:
 
     async def flush_audio(self):
         self.audio_playback_id = None
+        self.play_until = 0
+        self.echo_estimate = min(self.echo_estimate, time.monotonic())
         for client in self.playback_clients():
             client.playback_id = None
             client.playback_pending = client.playback_active = False
+            client.playback_end = time.monotonic()
         await self.phone_json({"type": "flush"})
 
     def echo_deadline(self):
@@ -750,7 +748,22 @@ class Session:
 
     @staticmethod
     def normalized_words(text):
-        return "".join(c.lower() if c.isalnum() else " " for c in text).split()
+        # Chinese speech has no word spaces. Keep characters as tokens so long
+        # Chinese playback echoes can be compared just like English word runs.
+        return re.findall(r"[\u3400-\u9fff]|[^\W_\u3400-\u9fff]+", text.lower())
+
+    @staticmethod
+    def stop_request(text):
+        command = "".join(c.lower() for c in text if c.isalnum())
+        commands = {"stop", "stoptalking", "stopspeaking", "pleasestop", "stopplease",
+            "pause", "pauseplease", "pleasepause", "wait", "holdon", "onesecond",
+            "停", "停下", "停一下", "先停一下", "别说了", "先别说了", "不要说了",
+            "等等", "等一下", "等会儿", "暂停", "暂停一下"}
+        return any(command == phrase * repeat for phrase in commands for repeat in (1, 2, 3))
+
+    def assistant_audio_pending(self):
+        return (self.playback_pending() or time.monotonic() < self.play_until
+                or (self.active and self.phase == "answer"))
 
     def remember_spoken(self, key, text):
         if not text.strip():
@@ -762,6 +775,8 @@ class Session:
         self.spoken.append((key, text, time.monotonic()))
 
     def transcript_is_echo(self, text):
+        if self.stop_request(text):
+            return False
         words = self.normalized_words(text)
         if not words:
             return False
@@ -771,12 +786,13 @@ class Session:
                                max((c.playback_end for c in self.clients), default=0)) <= 10]
         # Echo = a long CONTIGUOUS run of the assistant's own words. Bag-of-words overlap
         # misfired on answers like "Yes, add them" to "...add them?" or "Cardinal." (10/23).
-        if len(words) < 3:
+        minimum = 6 if self.chinese(text) else 3
+        if len(words) < minimum:
             return False
         for line in recent + ([" ".join(recent)] if len(recent) > 1 else []):
             other = self.normalized_words(line)
             m = SequenceMatcher(None, words, other, autojunk=False).find_longest_match(0, len(words), 0, len(other))
-            if m.size >= 3 and m.size >= .7 * len(words):
+            if m.size >= minimum and m.size >= .7 * len(words):
                 return True
         return False
 
@@ -858,6 +874,8 @@ class Session:
     async def generate(self, phase, *, guard=None):
         self.phase = phase
         await self.update_session(self.config(phase))
+        if phase == "answer" and self.auto_speech_paused:
+            return {"status": "deferred"}  # A stop during setup must not restart speech.
         if guard is not None and not guard():
             return {"status": "deferred"}
         self.response_id = None
@@ -960,6 +978,8 @@ class Session:
                     self.pending[0] = (kind, value, stopped)
                     self.log("turns_merged", n=len(parts))
             self.turn_stale = stopped is not None and time.monotonic() - stopped > 12
+            if kind in ("notify", "investigation") and self.auto_speech_paused:
+                continue
             if kind in ("notify", "investigation") and self.playback_pending():
                 continue
             if kind == "notify" and (self.awaiting_transcript or self.quiet
@@ -1153,19 +1173,17 @@ class Session:
                         waiter.set_exception(RuntimeError("Realtime request rejected"))
                 await self.error("Realtime request failed (" + str(code)[:100] + ").")
         elif ty == "input_audio_buffer.speech_started":
-            if self.echo_blocked():
-                self.log("vad_ignored", reason="assistant_playback")
-                return
             self.input_revision += 1
             self.user_speaking = True
             self.awaiting_transcript = True
-            if time.monotonic() < self.play_until:
-                if self.response_id:
-                    self.cancelled_ids.append(self.response_id)
-                self.play_until = 0
-                await self.flush_audio()
-                await self.rt_send({"type": "response.cancel"})
-                self.log("barge_in")
+            if self.assistant_audio_pending():
+                if self.echo_guard:
+                    # Speaker leakage can trigger VAD. Keep listening and only
+                    # cancel when STT confirms speech that is not our own echo.
+                    self.log("barge_in_candidate", confirmation="transcript")
+                else:
+                    await self.cancel_speech()
+                    self.log("barge_in", confirmation="vad")
             await self.state()
         elif ty == "input_audio_buffer.speech_stopped":
             self.user_speaking = False
@@ -1181,10 +1199,18 @@ class Session:
                 self.log("echo_dropped", text=text)
                 await self.flush_pending()
                 return
+            if text.strip() and self.assistant_audio_pending():
+                await self.cancel_speech()
+                self.log("barge_in", confirmation="transcript")
             await self.phone_json({"type": "transcript", "role": "user", "text": text, "final": True})
             self.log("user_transcript", text=text)
             if text.strip():
                 self.input_revision += 1
+                if self.stop_request(text):
+                    self.auto_speech_paused = True
+                    await self.flush_pending()
+                    return  # Stay listening; a stop command needs no spoken reply.
+                self.auto_speech_paused = False
                 self.pending.append(("text", text, self.speech_stopped_at))  # transcript as text; audio buffer is cleared
                 await self.flush_pending()
         elif ty == "conversation.item.input_audio_transcription.failed":
@@ -1531,7 +1557,7 @@ class Session:
         filtered, self.filter_state = lfilter(self.filter_taps, [1.0], frame, zi=self.filter_state)
         pcm = (np.clip(filtered[self.decimation_phase::2], -1, 1) * 32767).astype("<i2").tobytes()
         self.decimation_phase = (self.decimation_phase - n) % 2
-        if self.connected and not self.echo_blocked():
+        if self.connected:
             if self.audio_queue.full():
                 self.audio_queue.get_nowait()  # bounded latency rather than stale audio after a network stall
                 self.log("audio_queue_drop")
@@ -1555,7 +1581,7 @@ class Session:
         while True:
             pcm = await self.audio_queue.get()
             try:
-                if self.connected and not self.echo_blocked():
+                if self.connected:
                     await self.rt_send({"type": "input_audio_buffer.append", "audio": base64.b64encode(pcm).decode()})
             except Exception as exc:
                 self.log("audio_send_failed", error_type=type(exc).__name__)
@@ -1648,10 +1674,17 @@ class Session:
             if not isinstance(text, str) or not text.strip() or len(text) > 8000:
                 raise ValueError("text must contain 1–8000 characters")
             self.input_revision += 1
+            if self.stop_request(text):
+                self.auto_speech_paused = True
+                await self.cancel_speech()
+                await self.flush_pending()
+                return
+            self.auto_speech_paused = False
             self.pending.append(("text", text, None))
             await self.flush_pending()
         elif ty == "look":
             self.input_revision += 1
+            self.auto_speech_paused = False
             await self.request_look(event.get("hint", ""), event.get("group"))
         elif ty == "observation_action":
             obs = self.observations.get(event.get("id"))
@@ -1694,7 +1727,7 @@ class Session:
             self.cancelled_ids.append(self.response_id)
         self.audio_allowed = False
         self.play_until = 0
-        if self.connected and (self.active or self.response_id):
+        if self.connected and self.active:
             await self.rt_send({"type": "response.cancel"})
         await self.flush_audio()
         await self.state()

@@ -98,6 +98,9 @@ async def main():
         })''')
         assert results['items'] == 4 and results['heard'] == 2 and results['candidates'] == 3, results
         assert results['sampleRate'] == 48000 and results['flushStoppedSources'] > 0 and not results['overflow'], results
+        assert await evaluate("window.__contexts[0] && document.getElementById('capture-settings').textContent.includes('echoCancellation: true')")
+        assert await evaluate("document.getElementById('interrupt-hint').textContent.includes('stop')")
+        results['speakerEchoCancellation'] = True
         assert await evaluate("document.getElementById('audio-mode').getAttribute('aria-pressed')") == 'false'
         await evaluate("document.getElementById('audio-mode').click()")
         assert await evaluate("document.getElementById('audio-mode').getAttribute('aria-pressed') === 'true' && localStorage.getItem('field-earphones') === 'true'")

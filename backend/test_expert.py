@@ -310,7 +310,7 @@ class ExpertSessionTests(unittest.IsolatedAsyncioTestCase):
             result = await self.c.tool("ask_expert", {"question": f"Question {earphones}?"})
             await self.c.handle_rt({"type": "input_audio_buffer.speech_started"})
             self.assertEqual(result["status"], "scheduled")
-            self.assertEqual(self.c.user_speaking, earphones)
+            self.assertTrue(self.c.user_speaking)
             self.assertIn(result["investigation_id"], self.c.investigations.jobs)
 
     async def test_simple_checklist_and_count_paths_never_call_expert(self):

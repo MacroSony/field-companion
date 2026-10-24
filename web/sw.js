@@ -1,5 +1,5 @@
 'use strict';
-const CACHE = 'field-companion-shell-v9';
+const CACHE = 'field-companion-shell-v10';
 const SHELL = ['index.html', 'style.css', 'camera.js', 'app.js', 'audio-worklet.js', 'manifest.json', 'icon.svg', 'vendor/leaflet/leaflet.js', 'vendor/leaflet/leaflet.css', 'vendor/leaflet/images/marker-icon.png', 'vendor/leaflet/images/marker-icon-2x.png', 'vendor/leaflet/images/marker-shadow.png', 'vendor/leaflet/images/layers.png', 'vendor/leaflet/images/layers-2x.png'];
 self.addEventListener('install', event => {
   event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL)).then(() => self.skipWaiting()));

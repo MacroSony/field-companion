@@ -52,7 +52,7 @@
       $('audio-mode').textContent = earphones ? '🎧 Earphones' : '🔊 Speaker';
       $('audio-mode').setAttribute('aria-pressed', String(earphones));
     }
-    if ($('interrupt-hint')) $('interrupt-hint').textContent = earphones ? 'Say something to interrupt' : 'Tap to interrupt';
+    if ($('interrupt-hint')) $('interrupt-hint').textContent = earphones ? 'Say something to interrupt' : 'Say “stop” or tap to interrupt';
     if ($('earphone-tip')) $('earphone-tip').hidden = !firstAudioTip;
     $('tap').disabled = $('send').disabled = !state.connected;
     $('mic').disabled = !stream || !state.running;
@@ -99,7 +99,7 @@
     line.textContent = `${track.label || 'Microphone'} · sampleRate: ${value('sampleRate')} Hz · channelCount: ${value('channelCount')} · echoCancellation: ${value('echoCancellation')} · noiseSuppression: ${value('noiseSuppression')} · autoGainControl: ${value('autoGainControl')} · deviceId: ${value('deviceId')} · AudioContext: ${rate} Hz`;
   }
   async function requestMic(deviceId) {
-    const audio = {echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1, sampleRate: 48000};
+    const audio = {echoCancellation: true, noiseSuppression: false, autoGainControl: false, channelCount: 1, sampleRate: 48000};
     try {
       return {input: await navigator.mediaDevices.getUserMedia({audio: {...audio, ...(deviceId ? {deviceId: {exact: deviceId}} : {})}}), deviceId};
     } catch (error) {

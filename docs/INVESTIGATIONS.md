@@ -9,7 +9,7 @@ species data sources.
 ## Using it
 
 - Ask “Could it be a Hairy Woodpecker?” or “它吃什么？” about the current focus.
-  The acknowledgement names a task such as `R1`.
+  The acknowledgement is only “Investigation R1 is scheduled.” / “调查 R1 已安排。”
 - Continue talking, recording observations or looking at another organism.
 - Ask “How is investigation R1 going?”, “Any results?” or “第一个调查到哪一步了？”
   to get the actual recorded stage. No percentages or estimated completion times
@@ -175,3 +175,10 @@ one real source-backed GPT result, an explicit explanation request, and a
 simulated 45-second investigation while normal questions continued. These checks
 collect PCM without physical playback; the mobile device remains the final
 audible acceptance check. Reports are in ignored `out/investigation-checks/`.
+
+Speaker interruption now keeps Realtime microphone input open while the browser
+requests acoustic echo cancellation. A non-echo transcript cancels queued speech;
+“stop” / “等一下” needs no spoken acknowledgement and leaves automatic ready
+offers deferred until another user turn. Background investigations keep running.
+Headphones retain voice-onset cancellation. Speaker confirmation includes the STT
+utterance endpoint delay; this is not an instant local acoustic detector.
