@@ -1,0 +1,13 @@
+{
+  "id": "/",
+  "name": "野伴 · Field Companion",
+  "short_name": "野伴",
+  "description": "A hands-free birding companion. Eyes up, ears open.",
+  "lang": "zh-Hans",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0c1915",
+  "theme_color": "#11251e",
+  "icons": [{"src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable"}]
+}

@@ -1,0 +1,31 @@
+{
+  "connection": "已连接 · Connected",
+  "items": 4,
+  "heard": 2,
+  "candidates": 3,
+  "sampleRate": 48000,
+  "flushStoppedSources": 13,
+  "overflow": false,
+  "serviceWorker": true,
+  "autoReconnect": true,
+  "micPauseStopsFrames": true,
+  "ebirdRows": 3,
+  "ebirdColumns": 19,
+  "genericRowsIncludingHeader": 5,
+  "gpsInExport": [
+    "43.66",
+    "-79.39"
+  ],
+  "firstSentFrame": {
+    "type": "hello",
+    "lang": "zh",
+    "lat": 43.66,
+    "lng": -79.39
+  },
+  "microphoneBinaryFrames": 279,
+  "microphoneFrameBytes": [
+    1920
+  ],
+  "runtimeExceptions": [],
+  "offlineShell": true
+}
