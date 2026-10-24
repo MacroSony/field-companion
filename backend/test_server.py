@@ -85,9 +85,9 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("recent_sounds(seconds=15)", instructions)
         self.assertIn("Only explicit questions about logged sightings/counts", instructions)
         tools = {t["name"]: t for t in s.TOOLS}
-        self.assertIn("filler-only", tools["ignore"]["description"])
+        self.assertIn("lone fillers", tools["ignore"]["description"])
         self.assertIn("Never log questions", tools["add_observation"]["description"])
-        self.assertIn("never confirm", tools["accept_suggestions"]["description"])
+        self.assertIn("Never accept on lone", tools["accept_suggestions"]["description"])
         self.assertIn("all", tools["remove_observation"]["parameters"]["properties"])
         self.seed("Anas platyrhynchos")
         focus = await self.c.new_focus()

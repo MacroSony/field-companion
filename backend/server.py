@@ -207,7 +207,7 @@ TOOLS = [
     tool_schema("new_observation", "Start a different organism as a new focus.", {"group": {"type": "string", "enum": GROUPS}}),
     tool_schema("describe", "Attach a user description to the focus; resolve only explicit species names.", {"text": NAME, "name": NAME}, ("text",)),
     tool_schema("ask_expert", "Reason about the current focus: candidate comparisons, 'could it be X?', conflicting evidence, diet, habitat or behaviour. Read-only; never log.", {"question": NAME}, ("question",)),
-    tool_schema("accept_suggestions", "Accept existing pending suggestions only on explicit approval or an add command. Questions, including 'Did you hear them?', never confirm. Silent.",
+    tool_schema("accept_suggestions", 'Accept pending suggestions only on explicit yes/yeah/sure or an intelligible add command. Never accept on lone Ah/Okay/Uh/Oh/Mm/Mm-hmm, questions, or a notification. Silent.',
                 {"species": SPECIES, "counts": {"type": "object", "additionalProperties": COUNT}}),
     tool_schema("dismiss_suggestions", "Decline pending suggestions. No = all; optional subset. Silent.", {"species": SPECIES}),
     tool_schema("add_observations", "Log only explicit organism sighting reports in ONE action; increase existing counts. Never log questions, greetings, or mic checks. No speech.",
@@ -224,8 +224,8 @@ TOOLS = [
                 {"seconds": {"type": "number", "minimum": 0, "maximum": 3600}}, ("seconds",)),
     tool_schema("nearby_species", "List recent iNaturalist species near GPS; narrow down description-based IDs before asking for confirmation.",
                 {"group": {"type": "string", "enum": GROUPS}}, ("group",)),
-    tool_schema("speak", "Request speech for general questions, greetings, or mic checks ('Can you hear me?'); not for questions needing checklist or recent-sound data. No answer during routing.", {"reason": NAME}, ("reason",)),
-    tool_schema("ignore", "Silently ignore chatter, unintelligible fragments, filler-only speech ('Ah', 'Uh', 'Oh'), and incomplete commands. Never infer confirmation from garbled speech."),
+    tool_schema("speak", "Request speech for general questions, greetings, or mic checks ('Can you hear me?'); not for questions needing checklist or recent-sound data. No answer during routing. Never for lone fillers/acknowledgements (Ah/Okay/Uh/Oh/Mm/Mm-hmm): ignore those.", {"reason": NAME}, ("reason",)),
+    tool_schema("ignore", 'Silently ignore chatter, unintelligible fragments, incomplete commands, and lone fillers/acknowledgements (Ah, Okay, Uh, Oh, Mm, Mm-hmm). These fillers MUST be ignored even with pending suggestions or an unfinished prior request; never accept or dismiss on them.'),
 ]
 INSTRUCTIONS = """You are a concise hands-free birding/naturalist companion with an open microphone.
 Reply in English by default; the user may speak Chinese: answer in the language of the question.
@@ -260,6 +260,7 @@ Chatter -> ignore; sighting -> add_observation; addressed question -> speak or a
 Earlier tool outputs are already handled. Do not invent sightings from questions.
 [TAP] means the next utterance is addressed to you.
 """
+ROUTING = 'HIGHEST-PRIORITY ROUTING RULE: A turn consisting only of ah, okay, uh, oh, mm, or mm-hmm is ignore, even immediately after a pending-suggestion question or an unfinished earlier request. These fillers are NOT approval or dismissal. Yes/yeah/sure or an intelligible add command can approve. Apply this before choosing any other tool.' + "\n" + ROUTING
 ANSWER = INSTRUCTIONS + """
 ANSWER PHASE: answer ONLY the latest addressed question in ONE short sentence. No tools.
 Use supplied tool results and checklist. Never acknowledge any earlier log or chatter;

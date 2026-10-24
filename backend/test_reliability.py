@@ -95,6 +95,14 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
         for text in ['Okay.', 'yes', 'yeah', 'sure', 'Ah, add it', '']:
             self.assertFalse(self.c.filler_only(text), text)
 
+    def test_priority_prompt_is_route_only(self):
+        self.assertTrue(s.ROUTING.startswith('HIGHEST-PRIORITY ROUTING RULE:'))
+        self.assertNotIn('HIGHEST-PRIORITY', s.ANSWER)
+        tools = {t['name']: t['description'] for t in s.TOOLS}
+        self.assertIn('explicit yes/yeah/sure', tools['accept_suggestions'])
+        self.assertIn('never accept or dismiss', tools['ignore'])
+        self.assertIn('Never for lone', tools['speak'])
+
     async def test_answer_and_post_tool_failures_never_retry(self):
         for phase, executed in [('answer', False), ('route', True)]:
             self.statuses = ['failed']
