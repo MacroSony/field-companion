@@ -1,6 +1,6 @@
 'use strict';
 (() => {
-  const CLIENT_BUILD = '2026-10-24-speaker-echo';
+  const CLIENT_BUILD = '2026-10-24-speaker-safe';
   const $ = id => document.getElementById(id);
   const params = new URLSearchParams(location.search);
   const displayMode = params.get('display') === '1';
@@ -50,14 +50,14 @@
   function updateControls() {
     camera.updateConnection();
     if ($('audio-mode')) {
-      $('audio-mode').textContent = earphones ? 'Earphones · voice interruption on' : 'Speaker · voice or tap to interrupt';
+      $('audio-mode').textContent = earphones ? 'Earphones · voice interruption on' : 'Speaker · tap to interrupt';
       $('audio-mode').setAttribute('aria-pressed', String(earphones));
     }
     if ($('assistant-mute')) {
       $('assistant-mute').disabled = !audioEnabled;
       $('assistant-mute').setAttribute('aria-pressed', String(assistantMuted));
     }
-    if ($('interrupt-hint')) $('interrupt-hint').textContent = earphones ? 'Say something to interrupt' : 'Say “stop” or tap to interrupt';
+    if ($('interrupt-hint')) $('interrupt-hint').textContent = earphones ? 'Say something to interrupt' : 'Tap to interrupt; speak after the reply';
     if ($('earphone-tip')) $('earphone-tip').hidden = false;
     $('tap').disabled = $('send').disabled = !state.connected;
     $('reconnect').hidden = !replaced;

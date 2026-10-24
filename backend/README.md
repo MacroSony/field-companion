@@ -3,6 +3,22 @@
 The optional [GPT Naturalist expert path](../docs/EXPERT.md) handles complex
 comparisons and species-fact follow-ups without changing the logging fast path.
 
+## Speaker playback safety (2026-10-24)
+
+Speaker mode again alternates listening and replies: queued/active assistant audio
+and the existing short echo tail block PCM from reaching Higgs. The send path also
+rechecks the gate after waiting for the Realtime send lock. Guarded VAD/STT cannot
+cancel playback, change the input revision, or trigger camera/other tasks. Bounded
+VAD records retain blocked-turn provenance for delayed final transcripts, without
+treating a reused provider item ID as permanently blocked.
+
+Use **Tap to talk** to stop a reply, then speak after its short tail. Earphones
+retain voice interruption while displays are silent; an audio-enabled display
+also requires the safe gate. Typed messages and camera buttons remain available.
+Microphone ring/filter processing continues for BirdNET, with its existing
+speaker-contaminated window exclusions. This restores the safe interaction policy;
+it does not claim to repair physical acoustic echo cancellation.
+
 ## Phone-log fixes (2026-10-24)
 
 Camera confirmation sends its capture command directly on the phone socket after

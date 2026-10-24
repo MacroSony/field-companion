@@ -186,6 +186,16 @@ async def test(port, cdp):
             state = await js("({text:document.body.innerText.slice(0,1600),requests:window.__requests?.length,uploads:window.__uploads,geometry:window.__geometry})")
             raise AssertionError(f"Timed out: {expression}; state={state}")
 
+        async def voice_input(text):
+            # Speaker mode deliberately excludes speech during output. Match a
+            # real user who waits for all browser audio and the echo tail, rather
+            # than injecting final STT while a cached camera cue is playing.
+            await until("document.getElementById('audio-mode').getAttribute('aria-pressed') === 'false' && "
+                        "window.__lastPlaybackReport?.active === false && window.__lastPlaybackReport?.drained === true && "
+                        "performance.now() - window.__lastPlaybackReport.at >= 900 && "
+                        "window.__messages.filter(e=>e.type==='state').at(-1)?.speaking === false")
+            await js("window.__sockets[0].send(JSON.stringify({type:'text',text:" + json.dumps(text) + "}))")
+
         await call("Page.enable")
         await call("Runtime.enable")
         await call("Network.enable")
@@ -239,6 +249,14 @@ async def test(port, cdp):
           const WS = window.WebSocket;
           window.WebSocket = class extends WS { constructor(...args) { super(...args); window.__sockets.push(this);
             this.addEventListener('message', e => { if(typeof e.data === 'string') window.__messages.push(JSON.parse(e.data)); });
+            const send=this.send.bind(this);
+            this.send=data=>{
+              if(typeof data==='string') {
+                const message=JSON.parse(data);
+                if(message.type==='playback') window.__lastPlaybackReport={...message,at:performance.now()};
+              }
+              return send(data);
+            };
           } };
         """)
         await call("Page.navigate", url=origin + "/?session=" + session)
@@ -278,7 +296,7 @@ async def test(port, cdp):
         await js("window.__sockets[0].send(JSON.stringify({type:'text',text:'fixture:hold-photo'}))")
         await js("document.getElementById('camera-shutter').click()")
         await until("document.getElementById('observation-status').textContent === 'Analyzing photo'")
-        await js("window.__sockets[0].send(JSON.stringify({type:'text',text:'fixture:progress'}))")
+        await voice_input("fixture:progress")
         await until("window.__messages.slice(" + str(before_manual) + ").some(e=>e.text===\"I'm still analyzing the photo. I'll tell you when it's ready.\")")
         assert await js("document.querySelectorAll('#observation-evidence img').length === 0")
         results["processingQueryDoesNotInventIdentification"] = True
@@ -292,7 +310,7 @@ async def test(port, cdp):
         assert taking < capture < ready
         results["identifySpeaksTakingThenPhotoReady"] = True
         ambiguous_marker = await js("window.__messages.length")
-        await js("window.__sockets[0].send(JSON.stringify({type:'text',text:'fixture:ambiguous'}))")
+        await voice_input("fixture:ambiguous")
         await until("window.__messages.slice(" + str(ambiguous_marker) + ").some(e=>e.text===\"I didn't understand. Please say that again.\")")
         assert await js("document.querySelectorAll('.counter output').length === 0")
         assert await js("document.getElementById('observation-status').textContent !== 'Added to checklist'")
@@ -338,13 +356,13 @@ async def test(port, cdp):
         assert await js("window.__streams[0].getAudioTracks()[0].readyState === 'live'")
         # Look opens a usable preview and announces readiness, without even
         # encoding a frame. A second completed STT turn authorizes the photo.
-        async def voice_ready(wait_for_drain=False):
+        async def voice_ready():
             marker = await js("window.__messages.length")
             uploads = await js("window.__uploads.length")
             encodes = await js("window.__encodes.length")
-            await js("window.__sockets[0].send(JSON.stringify({type:'text',text:'fixture:voice-look'}))")
+            await voice_input("fixture:voice-look")
             await until("window.__messages.slice(" + str(marker) + ").some(e=>e.text==='Camera ready. Say start to take a photo.') && !document.getElementById('camera-shutter').disabled")
-            await asyncio.sleep(3.6 if wait_for_drain else .3)
+            await asyncio.sleep(.3)
             assert await js("window.__uploads.length") == uploads
             assert await js("window.__encodes.length") == encodes
 
@@ -357,11 +375,11 @@ async def test(port, cdp):
             assert any(e.get("type") == "audio_end" and e["id"].startswith("feedback-") for e in messages[:capture])
 
         before_voice = len(events)
-        await voice_ready(wait_for_drain=True)
+        await voice_ready()
         voice_marker = await js("window.__messages.length")
         await js("window.__sockets[0].send(JSON.stringify({type:'text',text:'fixture:hold-worker'}))")
         await until("window.__messages.slice(" + str(voice_marker) + ").some(e=>e.type==='fixture_busy')")
-        await js("window.__sockets[0].send(JSON.stringify({type:'text',text:'fixture:voice-start'}))")
+        await voice_input("fixture:voice-start")
         await until("document.querySelectorAll('#observation-evidence img').length === 1 && !document.getElementById('camera-shutter').disabled")
         results["captureBypassesBlockedConversationWorker"] = True
         await js("window.__sockets[0].send(JSON.stringify({type:'text',text:'fixture:release-worker'}))")
@@ -370,7 +388,7 @@ async def test(port, cdp):
         before_voice = len(events)
         await voice_ready()
         voice_marker = await js("window.__messages.length")
-        await js("window.__sockets[0].send(JSON.stringify({type:'text',text:'fixture:voice-start'}))")
+        await voice_input("fixture:voice-start")
         await until("document.querySelectorAll('#observation-evidence img').length === 2 && !document.getElementById('camera-shutter').disabled")
         await until("window.__messages.slice(" + str(voice_marker) + ").some(e=>e.text==='Photo ready. Starting identification.')")
         feedback_before_capture(before_voice)
@@ -381,13 +399,14 @@ async def test(port, cdp):
         await js("Object.defineProperty(document,'hidden',{configurable:true,value:true}); document.dispatchEvent(new Event('visibilitychange'))")
         assert await js("window.__streams.filter(s=>s.getVideoTracks().length).every(s=>s.getTracks().every(t=>t.readyState==='ended'))")
         assert await js("window.__streams[0].getAudioTracks()[0].readyState === 'live'")
-        await js("delete document.hidden; window.__sockets[0].send(JSON.stringify({type:'text',text:'fixture:voice-start'}))")
+        await js("delete document.hidden")
+        await voice_input("fixture:voice-start")
         await asyncio.sleep(.4)
         assert await js("window.__uploads.length") == uploads
         assert await js("document.getElementById('camera-panel').hidden")
         results["backgroundInvalidatesConfirmation"] = True
         await voice_ready()
-        await js("window.__sockets[0].send(JSON.stringify({type:'text',text:'fixture:voice-start'}))")
+        await voice_input("fixture:voice-start")
         await until("document.querySelectorAll('#observation-evidence img').length === 3 && !document.getElementById('camera-shutter').disabled")
         results["backgroundStopsCameraOnly"] = True
         await js("document.getElementById('stop').click()")

@@ -420,6 +420,8 @@ class Session:
         self.active = False
         self.user_speaking = False
         self.awaiting_transcript = False
+        self.input_audio_turns = deque()
+        self.current_input_audio_turn = None
         self.response_id = None
         self.cancelled_ids = deque(maxlen=100)
         self.audio_allowed = True
@@ -1048,6 +1050,56 @@ class Session:
         estimate = max(self.echo_estimate, self.play_until)
         return max((max(estimate, c.playback_end) + (.5 if c.playback_end else .8)
                     for c in clients), default=estimate + .8)
+
+    def prune_input_audio_turns(self):
+        cutoff = time.monotonic() - 30
+        while self.input_audio_turns and (len(self.input_audio_turns) > 32
+                or self.input_audio_turns[0]["at"] < cutoff):
+            old = self.input_audio_turns.popleft()
+            if self.current_input_audio_turn is old:
+                self.current_input_audio_turn = None
+                self.user_speaking = self.awaiting_transcript = False
+
+    def match_input_audio_turn(self, event, *, final=False):
+        self.prune_input_audio_turns()
+        # This preview can reuse item_id after clear. Match occurrences in FIFO
+        # order, assuming finals for one id preserve its VAD-turn ordering.
+        record = next((r for r in self.input_audio_turns
+                       if r["id"] == event.get("item_id")
+                       and (final or r["stopped"] is None)), None)
+        if record is not None and final:
+            self.input_audio_turns.remove(record)
+        return record
+
+    async def finish_input_audio(self, event):
+        record = self.match_input_audio_turn(event, final=True)
+        blocked = (record is not None and record["blocked"]) or self.echo_blocked()
+        current = self.current_input_audio_turn
+        owns_input = record is current if record is not None else current is None
+        if owns_input:
+            self.current_input_audio_turn = None
+            self.user_speaking = self.awaiting_transcript = False
+        newer_input = (current is not None and record is not current
+                       and (self.user_speaking or self.awaiting_transcript))
+        # This preview retains uncommitted input when auto-response is disabled.
+        # Clear completed/failed audio without erasing a newer accepted turn.
+        if not newer_input:
+            await self.rt_send({"type": "input_audio_buffer.clear"})
+        if blocked:
+            self.log("input_audio_guarded", event_type=event.get("type"),
+                     item_id=event.get("item_id"), reason="playback_turn" if record and record["blocked"] else "playback")
+            if event.get("item_id"):
+                reused = any(r["id"] == event["item_id"] for r in self.input_audio_turns)
+                reused |= (self.current_input_audio_turn is not None
+                           and self.current_input_audio_turn["id"] == event["item_id"])
+                if reused:
+                    # The provider id may now refer to the newer audio item.
+                    self.log("input_audio_delete_skipped", item_id=event["item_id"], reason="reused_item_id")
+                else:
+                    await self.delete_items([event["item_id"]])
+            await self.flush_pending()
+            return False
+        return True
 
     @staticmethod
     def normalized_words(text):
@@ -1710,6 +1762,8 @@ class Session:
                     self.response_id = None
                     self.awaited_response_id = None
                     self.user_speaking = self.awaiting_transcript = False
+                    self.input_audio_turns.clear()
+                    self.current_input_audio_turn = None
                     self.conversation_ids.clear()
                     self.deleted_item_ids.clear()
                     self.item_owners.clear()
@@ -1748,6 +1802,8 @@ class Session:
                 self.rt = None
                 self.connected = False
                 self.user_speaking = self.awaiting_transcript = False
+                self.input_audio_turns.clear()
+                self.current_input_audio_turn = None
                 self.active = False
                 if not self.closed:
                     self.play_until = 0
@@ -1829,6 +1885,14 @@ class Session:
                         waiter.set_exception(RuntimeError("Realtime request rejected"))
                 await self.error("Realtime request failed (" + str(code)[:100] + ").")
         elif ty == "input_audio_buffer.speech_started":
+            record = {"id": event.get("item_id"), "blocked": self.echo_blocked(),
+                      "at": time.monotonic(), "stopped": None}
+            self.input_audio_turns.append(record)
+            self.prune_input_audio_turns()
+            if record["blocked"]:
+                self.log("input_audio_guarded", event_type=ty, item_id=record["id"], reason="playback")
+                return
+            self.current_input_audio_turn = record
             self.input_revision += 1
             self.user_speaking = True
             self.awaiting_transcript = True
@@ -1842,15 +1906,18 @@ class Session:
                     self.log("barge_in", confirmation="vad")
             await self.state()
         elif ty == "input_audio_buffer.speech_stopped":
-            self.user_speaking = False
-            self.speech_stopped_at = time.monotonic()
+            record = self.match_input_audio_turn(event)
+            if record is not None:
+                record["stopped"] = time.monotonic()
+            if (record is not None and record["blocked"]) or self.echo_blocked():
+                return
+            if record is self.current_input_audio_turn:
+                self.user_speaking = False
+                self.speech_stopped_at = time.monotonic()
         elif ty == "conversation.item.input_audio_transcription.completed":
-            self.awaiting_transcript = False
+            if not await self.finish_input_audio(event):
+                return
             text = event.get("transcript", "")
-            # With create_response=false the server never commits the buffer, so STT
-            # re-transcribes everything since session start. Clear it per turn (tested 10/23).
-            await self.rt_send({"type": "input_audio_buffer.clear"})
-            self.user_speaking = False
             if self.transcript_is_echo(text):
                 self.log("echo_dropped", text=text)
                 if event.get("item_id"):
@@ -1883,7 +1950,8 @@ class Session:
                                                        context=self.input_context()), self.speech_stopped_at))
                 await self.flush_pending()
         elif ty == "conversation.item.input_audio_transcription.failed":
-            self.awaiting_transcript = False
+            if not await self.finish_input_audio(event):
+                return
             await self.error("Input transcription failed.")
             await self.flush_pending()
         elif ty == "response.created":
@@ -2291,7 +2359,7 @@ class Session:
         filtered, self.filter_state = lfilter(self.filter_taps, [1.0], frame, zi=self.filter_state)
         pcm = (np.clip(filtered[self.decimation_phase::2], -1, 1) * 32767).astype("<i2").tobytes()
         self.decimation_phase = (self.decimation_phase - n) % 2
-        if self.connected:
+        if self.connected and not self.echo_blocked():
             if self.audio_queue.full():
                 self.audio_queue.get_nowait()  # bounded latency rather than stale audio after a network stall
                 self.log("audio_queue_drop")
@@ -2315,8 +2383,12 @@ class Session:
         while True:
             pcm = await self.audio_queue.get()
             try:
-                if self.connected:
-                    await self.rt_send({"type": "input_audio_buffer.append", "audio": base64.b64encode(pcm).decode()})
+                async with self.rt_lock:
+                    # Playback can begin while a queued packet waits for this
+                    # lock. Recheck at transmission, not only at capture time.
+                    if self.connected and self.rt is not None and not self.echo_blocked():
+                        await self.rt.send(json.dumps({"type": "input_audio_buffer.append",
+                            "audio": base64.b64encode(pcm).decode()}))
             except Exception as exc:
                 self.log("audio_send_failed", error_type=type(exc).__name__)
             finally:
@@ -2537,6 +2609,8 @@ class Session:
             rows.clear()
         self.last_proactive = float("-inf")
         self.user_speaking = self.awaiting_transcript = self.active = False
+        self.input_audio_turns.clear()
+        self.current_input_audio_turn = None
         self.response_id = self.awaited_response_id = None
         self.turn_items = None
         self.deleted_item_ids.clear()

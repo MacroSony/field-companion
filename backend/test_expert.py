@@ -299,7 +299,7 @@ class ExpertSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.c.expert_readout)
         self.assertEqual(self.c.config("answer"), normal)
 
-    async def test_speaker_echo_and_barge_in_preserve_background_investigation(self):
+    async def test_speaker_guard_and_earphone_barge_in_preserve_background_investigation(self):
         client = s.Client(SimpleNamespace(send_json=AsyncMock()), self.c)
         self.c.clients.add(client)
         self.c.mic = client
@@ -310,7 +310,8 @@ class ExpertSessionTests(unittest.IsolatedAsyncioTestCase):
             result = await self.c.tool("ask_expert", {"question": f"Question {earphones}?"})
             await self.c.handle_rt({"type": "input_audio_buffer.speech_started"})
             self.assertEqual(result["status"], "scheduled")
-            self.assertTrue(self.c.user_speaking)
+            self.assertEqual(self.c.user_speaking, earphones)
+            self.assertEqual(self.c.awaiting_transcript, earphones)
             self.assertIn(result["investigation_id"], self.c.investigations.jobs)
 
     async def test_simple_checklist_and_count_paths_never_call_expert(self):

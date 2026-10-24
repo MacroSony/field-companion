@@ -39,7 +39,7 @@ class SelfEchoTests(unittest.IsolatedAsyncioTestCase):
             self.cue(kind, spoken)
             with patch.object(self.c, "log") as log:
                 await self.transcript(heard)
-                log.assert_any_call("echo_dropped", text=heard)
+                self.assertFalse(any(call.args[0] == "user_transcript" for call in log.call_args_list))
             self.assertTrue(self.client.playback_pending)
             self.assertNotIn({"type": "flush"}, self.phone.events)
             self.assertFalse(self.c.pending)
@@ -72,6 +72,7 @@ class SelfEchoTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(self.c.pending)
 
     async def test_yes_after_actual_explanation_offer_still_interrupts_and_routes(self):
+        self.client.earphones = True
         self.cue("photo-ready", "Photo ready. Starting identification.")
         self.c.last_assistant_text = "Investigation R1 is ready. Would you like me to explain?"
         self.c.investigation_offer_ids = ["R1"]
@@ -84,7 +85,8 @@ class SelfEchoTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.c.ignored_input_reason("Yes."))
         self.assertIsNotNone(self.c.ignored_input_reason("Okay."))
 
-    async def test_stop_and_meaningful_questions_keep_voice_interruption(self):
+    async def test_earphones_keep_stop_and_meaningful_voice_interruption(self):
+        self.client.earphones = True
         self.cue("photo-ready", "Photo ready. Starting identification.")
         for text in ("Start.", "开始。", "Stop.", "Is the photo ready?", "I heard two birds."):
             self.assertFalse(self.c.transcript_is_echo(text), text)
