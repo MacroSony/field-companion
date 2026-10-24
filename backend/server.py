@@ -901,6 +901,17 @@ class Session:
         calls = [i for i in response.get("output", []) if i.get("type") == "function_call"]
         self.log("route_done", tools=[c["name"] for c in calls],
                  arguments=[self.audit_args(c.get("arguments")) for c in calls])
+        if len(calls) == 2 and {c["name"] for c in calls} == {"remove_observation", "dismiss_suggestions"}:
+            remove = next(c for c in calls if c["name"] == "remove_observation")
+            try:
+                clear_all = json.loads(remove.get("arguments") or "{}").get("all") is True
+            except (ValueError, TypeError, AttributeError):
+                clear_all = False
+            if clear_all:
+                # The sole allowed compound route: dismiss before clearing outing.
+                for call in sorted(calls, key=lambda c: c["name"] != "dismiss_suggestions"):
+                    await self.finish_route({"status": "completed", "output": [call]})
+                return
         if len(calls) != 1:
             await self.error("Routing did not select one action; please try again.")
             return

@@ -95,6 +95,22 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
         for text in ['Okay.', 'yes', 'yeah', 'sure', 'Ah, add it', '']:
             self.assertFalse(self.c.filler_only(text), text)
 
+    async def test_remove_all_pair_only_and_ordered(self):
+        def call(name, args):
+            return {'type': 'function_call', 'name': name, 'call_id': name, 'arguments': json.dumps(args)}
+        self.c.tool = AsyncMock(return_value={'ok': True})
+        self.c.broadcast_checklist = AsyncMock()
+        pair = [call('remove_observation', {'all': True}), call('dismiss_suggestions', {})]
+        await self.c.finish_route({'status': 'completed', 'output': pair})
+        self.assertEqual([c.args[0] for c in self.c.tool.call_args_list], ['dismiss_suggestions', 'remove_observation'])
+        self.assertEqual(len([e for e in self.events if e['type'] == 'conversation.item.create']), 2)
+        for other in [[call('remove_observation', {'all': False}), pair[1]],
+                      [call('remove_observation', {'all': 'true'}), pair[1]],
+                      [pair[0], call('add_observation', {})], pair + [pair[1]]]:
+            self.c.tool.reset_mock()
+            await self.c.finish_route({'status': 'completed', 'output': other})
+            self.c.tool.assert_not_awaited()
+
     async def test_audit_args_compact_bounded_and_redacted(self):
         self.assertEqual(self.c.audit_args('{"count": 2, "all": true}'), '{"count":2,"all":true}')
         self.assertEqual(len(self.c.audit_args(json.dumps({'notes': 'x' * 300}))), 200)
