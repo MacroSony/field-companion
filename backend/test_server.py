@@ -7,6 +7,8 @@ import math
 from types import SimpleNamespace
 from urllib.parse import urlencode
 import time
+import tempfile
+from pathlib import Path
 import unittest
 from unittest.mock import AsyncMock, patch
 from PIL import Image
@@ -77,6 +79,147 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
     async def route(self, name, args=None):
         await self.c.finish_route({"status": "completed", "output": [{"type": "function_call",
             "name": name, "call_id": "c1", "arguments": json.dumps(args or {})}]})
+
+    async def test_router_wording_and_remove_all(self):
+        instructions = self.c.config("route")["instructions"]
+        self.assertIn("recent_sounds(seconds=15)", instructions)
+        self.assertIn("Only explicit questions about logged sightings/counts", instructions)
+        tools = {t["name"]: t for t in s.TOOLS}
+        self.assertIn("lone fillers", tools["ignore"]["description"])
+        self.assertIn("Never log questions", tools["add_observation"]["description"])
+        self.assertIn("Never accept on lone", tools["accept_suggestions"]["description"])
+        self.assertIn("all", tools["remove_observation"]["parameters"]["properties"])
+        self.seed("Anas platyrhynchos")
+        focus = await self.c.new_focus()
+        self.c.sound_windows.append((1, s.Detection("d1", "sound", s.now_iso())))
+        self.c.history.append((1, {"en": "Mallard"}))
+        result = await self.c.tool("remove_observation", {"all": True})
+        self.assertTrue(result["ok"])
+        self.assertEqual(self.c.items, [])
+        self.assertFalse(self.c.observations or self.c.focus or self.c.sound_windows or self.c.history)
+        self.assertIn({"type": "reset"}, self.phone.events)
+
+    async def test_allowlist_filter_nonbird_out_of_range_fail_closed(self):
+        def d(sci, en="Bird", conf=.99):
+            return {"scientific_name": sci, "common_name": en, "confidence": conf}
+        detections = [d("Anas platyrhynchos"), d("Pteroptochos megapodius"),
+                      d("Human non-vocal"), d("Canis lupus", "Dog"), d("Noise"),
+                      d("Anas platyrhynchos", conf=.24)]
+        allowed = {"Anas platyrhynchos", "Human non-vocal", "Canis lupus", "Noise"}
+        self.assertEqual([d["scientific_name"] for d in s.eligible_detections(detections, allowed)],
+                         ["Anas platyrhynchos"])
+        self.assertEqual(s.eligible_detections(detections, set()), [])
+
+    async def test_allowlist_sources_persist_and_failure(self):
+        self.c.allowed_species = s.Session.allowed_species.__get__(self.c)
+        species = SimpleNamespace(SpeciesList=lambda: SimpleNamespace(return_list=lambda **kw:
+            [{"scientific_name": "Anas platyrhynchos"}]))
+        rows = {"results": [{"taxon": {"name": "Podiceps grisegena", "rank": "species", "iconic_taxon_name": "Aves"}}]}
+        with tempfile.TemporaryDirectory() as tmp, patch.object(s, "ALLOWLIST_DIR", Path(tmp)), \
+             patch.dict("sys.modules", {"birdnetlib.species": species}), patch.object(s, "inat", return_value=rows) as api:
+            self.assertEqual(self.c.allowed_species(), {"Anas platyrhynchos", "Podiceps grisegena"})
+            self.assertEqual(api.call_args.kwargs["place_id"], 6883)
+            self.assertEqual(api.call_args.kwargs["verifiable"], "true")
+            self.assertNotIn("d1", api.call_args.kwargs)
+            self.c._allowed_key = None
+            api.side_effect = RuntimeError("offline")
+            self.assertEqual(len(self.c.allowed_species()), 2)
+            self.c.lat = 0
+            self.assertEqual(self.c.allowed_species(), set())
+
+    async def test_allowlist_paginates_outside_ontario(self):
+        self.c.allowed_species = s.Session.allowed_species.__get__(self.c)
+        calls = []
+        def geo(**kwargs):
+            calls.append(kwargs)
+            return [{"scientific_name": "Anas platyrhynchos"}]
+        species = SimpleNamespace(SpeciesList=lambda: SimpleNamespace(return_list=geo))
+        row = {"taxon": {"name": "Podiceps grisegena", "rank": "species", "iconic_taxon_name": "Aves"}}
+        self.c.lat, self.c.lng = 40, -120
+        with tempfile.TemporaryDirectory() as tmp, patch.object(s, "ALLOWLIST_DIR", Path(tmp)), \
+             patch.dict("sys.modules", {"birdnetlib.species": species}), \
+             patch.object(s, "inat", side_effect=[{"results": [row]*500}, {"results": []}]) as api:
+            self.assertEqual(len(self.c.allowed_species()), 2)
+            self.assertEqual(api.call_count, 2)
+            self.assertEqual(api.call_args.kwargs["page"], 2)
+            self.assertEqual(api.call_args.kwargs["radius"], 100)
+            self.assertNotIn("place_id", api.call_args.kwargs)
+            self.assertEqual(calls[0]["threshold"], .001)
+
+    async def test_heard_gate_and_low_confidence_history(self):
+        sci = "Anas platyrhynchos"
+        self.c.names[sci] = {"sci": sci, "en": "Mallard"}
+        detection = {"scientific_name": sci, "common_name": "Mallard", "confidence": .3}
+        self.c.analyze = lambda _: [detection]
+        await self.c.bird_window(np.zeros(1), 3*s.SR)
+        self.assertFalse([e for e in self.phone.events if e["type"] == "heard"])
+        self.assertEqual(len(self.c.history), 1)
+        detection["confidence"] = .55
+        await self.c.bird_window(np.zeros(1), 6*s.SR)
+        await self.c.bird_window(np.zeros(1), 6*s.SR)
+        self.assertFalse([e for e in self.phone.events if e["type"] == "heard"])
+        await self.c.bird_window(np.zeros(1), 18*s.SR)  # old hit expired
+        self.assertFalse([e for e in self.phone.events if e["type"] == "heard"])
+        await self.c.bird_window(np.zeros(1), 20*s.SR)
+        self.assertEqual(len([e for e in self.phone.events if e["type"] == "heard"]), 1)
+        self.assertFalse(self.phone.events[-2].get("unusual", False))
+        detection["confidence"] = .7
+        await self.c.bird_window(np.zeros(1), 40*s.SR)
+        self.assertEqual(len([e for e in self.phone.events if e["type"] == "heard"]), 2)
+
+    async def test_history_window_and_fresh_snapshot(self):
+        self.c.active = True
+        for i in range(13):
+            await self.c.handle_rt({"type": "conversation.item.added", "item": {"id": str(i)}})
+        await self.c.handle_rt({"type": "conversation.item.created", "item": {"id": "12"}})
+        await self.c.prune_history()
+        self.assertEqual(len(self.c.conversation_ids), 13)  # active calls/outputs protected
+        self.c.active = False
+        self.c.turn_in_progress = True
+        await self.c.prune_history()
+        self.assertEqual(len(self.c.conversation_ids), 13)
+        self.c.turn_in_progress = False
+        await self.c.prune_history()
+        self.assertEqual(list(self.c.conversation_ids), [str(i) for i in range(5,13)])
+        deleted = [c.args[0]["item_id"] for c in self.c.rt_send.call_args_list]
+        self.assertEqual(deleted, [str(i) for i in range(5)])
+        focus = self.seed("Anas platyrhynchos")
+        self.c.focus = focus.id
+        focus.hint = "closer"
+        self.assertEqual(self.c.route_snapshot()["focus"]["hint"], "closer")
+        self.assertIn('"count": 2', self.c.config("route")["instructions"])
+        self.c.observations.clear()
+        self.assertIn('"checklist": []', self.c.config("route")["instructions"])
+
+    async def test_reset_clears_and_reconnects(self):
+        self.c.rt = SimpleNamespace(close=AsyncMock())
+        self.c.connected = self.c.user_speaking = self.c.awaiting_transcript = True
+        self.seed()
+        await self.c.new_focus()
+        self.c.suggestions = {"bird": {}}
+        self.c.history.append((1, {}))
+        self.c.pending.append(("notify", None, None))
+        self.c.seen.add("bird")
+        self.client.playback_active = True
+        await self.c.handle_phone({"type": "reset"}, self.client)
+        self.c.rt.close.assert_awaited_once()
+        for rows in (self.c.items, self.c.suggestions, self.c.history, self.c.pending, self.c.seen):
+            self.assertFalse(rows)
+        self.assertFalse(self.c.connected or self.c.user_speaking or self.c.awaiting_transcript)
+        self.assertFalse(self.client.playback_active)
+        self.assertIn({"type": "checklist", "items": []}, self.phone.events)
+        self.assertIn({"type": "suggestions", "items": []}, self.phone.events)
+        self.assertIn({"type": "flush"}, self.phone.events)
+
+    async def test_location_and_response_id(self):
+        await self.c.handle_phone({"type": "location", "lat": 44, "lng": -80})
+        self.assertEqual((self.c.lat, self.c.lng), (44, -80))
+        self.c.response_waiter = asyncio.get_running_loop().create_future()
+        self.c.awaited_response_id = "new"
+        await self.c.handle_rt({"type": "response.done", "response": {"id": "old"}})
+        self.assertFalse(self.c.response_waiter.done())
+        await self.c.handle_rt({"type": "response.done", "response": {"id": "new"}})
+        self.assertTrue(self.c.response_waiter.done())
 
     async def test_hello_and_vad(self):
         await self.c.handle_phone({"type": "hello", "lang": "zh"})
@@ -547,14 +690,14 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
     async def test_best_confidence_distinct_windows_and_dedup(self):
         names = {"sci": "Cardinalis cardinalis", "en": "Northern Cardinal", "photo": ""}
         self.c.names[names["sci"]] = names
-        detection = {"scientific_name": names["sci"], "common_name": names["en"], "confidence": .95}
+        detection = {"scientific_name": names["sci"], "common_name": names["en"], "confidence": .65}
         self.c.analyze = lambda _: [detection]
         await self.c.bird_window(np.zeros(1), 3 * s.SR)
         await self.c.bird_window(np.zeros(1), 3 * s.SR)
         self.assertFalse(self.c.suggestions)  # duplicate window is not a second hit
         detection["confidence"] = .55
         await self.c.bird_window(np.zeros(1), int(4.5 * s.SR))
-        self.assertEqual(self.c.suggestions[names["sci"]]["conf"], .95)
+        self.assertEqual(self.c.suggestions[names["sci"]]["conf"], .65)
         self.assertLess(self.c.suggestions[names["sci"]]["first_heard"], self.c.suggestions[names["sci"]]["last_heard"])
         await self.c.tool("dismiss_suggestions", {})
         await self.c.bird_window(np.zeros(1), 6 * s.SR)

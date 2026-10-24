@@ -22,27 +22,23 @@
     <header class="topbar">
       <a class="brand" href="./" aria-label="Field Companion home"><svg viewBox="0 0 32 32" aria-hidden="true"><path d="M5 24c8 0 10-11 20-17-1 10-5 17-13 16M7 25 22 11M9 18l7 1M15 12l4 1"/></svg><span>Field Companion<small>Eyes up. Ears open.</small></span></a>
       <div class="display-meta"><span id="display-status">Connecting</span><a id="phone-hint"></a></div>
-      <button id="quiet" class="quiet-toggle" type="button" aria-pressed="false" title="Quiet mode: assistant speaks only after a tap"><span aria-hidden="true">☾</span><span>Quiet</span><i aria-hidden="true"></i></button>
+      <div class="header-actions"><button id="reset-display" class="header-reset" type="button">Reset session</button><button id="settings-open" class="settings-open" type="button" aria-label="Settings" aria-haspopup="dialog">⚙</button></div>
     </header>
 
     <main>
       <section class="listening-panel" aria-label="Session controls and status">
-        <div class="status-line"><span id="connection" class="connection"><i></i><span>Offline</span></span><button id="audio-mode" class="audio-mode" type="button" aria-pressed="false" title="Switch between speaker and earphones">🔊 Speaker</button><span id="activity">Ready when you are</span></div>
-        <div class="mic-settings">
-          <label for="mic-device">Microphone</label>
-          <select id="mic-device" disabled aria-describedby="capture-settings"><option value="">Default · allow microphone to list devices</option></select>
-        </div>
-        <details class="audio-details"><summary>Audio details</summary><p id="capture-settings" class="capture-settings">Capture settings appear after Start.</p></details>
+        <div class="status-line"><span id="connection" class="connection"><i></i><span>Offline</span></span><span id="activity">Ready when you are</span></div>
         <div class="soundscape" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div>
         <div id="mic-meter" class="level-meter" role="meter" aria-label="Microphone level" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="level-fill"></div></div>
-        <div class="panel-foot"><span id="model">Open mic · hands free</span><span id="session-time">00:00</span></div>
+        <div class="panel-foot"><span>Field session</span><span id="session-time">00:00</span></div>
         <button id="start" class="start-button" type="button"><span aria-hidden="true">◉</span> Start listening <span aria-hidden="true">↗</span></button>
         <p id="interrupt-hint" class="start-note">Say “stop” or tap to interrupt</p>
-        <p id="earphone-tip" class="start-note" hidden>Earphones recommended — quieter for birds, and you can interrupt by voice.</p>
         <p id="start-note" class="start-note">Microphone needs HTTPS or localhost</p>
         <button id="stop" class="stop-button" type="button" hidden>End session</button>
       </section>
 
+      <button id="reconnect" class="secondary-button" type="button" hidden>Another phone took over this session. Tap to reconnect.</button>
+      <div id="version-banner" class="notice" role="status" hidden>New version available — <button id="reload" type="button">reload</button></div>
       <div id="notice" class="notice" role="status" hidden></div>
 
       <section class="look-section" aria-labelledby="look-heading">
@@ -70,21 +66,12 @@
         <div class="observation-actions"><label for="observation-count">Count <input id="observation-count" type="number" min="1" step="1" value="1" inputmode="numeric"></label><button id="observation-confirm" class="look-button" type="button" disabled>Add to checklist</button><button id="observation-again" class="look-button" type="button" disabled>Look again</button><button id="observation-discard" class="look-button" type="button" disabled>Discard</button></div>
       </section>
 
-      <section class="heard-section" aria-labelledby="heard-heading">
-        <div class="section-label"><h2 id="heard-heading">Heard nearby</h2><span class="live-label"><i></i> LIVE</span></div>
-        <div id="heard" class="heard-strip"><p class="empty-inline">Listening for the next discovery.<small>Bird song detections will appear here.</small></p></div>
-      </section>
+      <div id="suggestions" class="suggestion-row" aria-label="BirdNET suggestions — add or dismiss" hidden></div>
 
       <section class="checklist-section" aria-labelledby="checklist-heading">
         <div class="section-label"><h2 id="checklist-heading">Field checklist</h2><span id="totals" class="totals">0 species · 0 individuals</span></div>
         <div id="checklist" class="checklist"><div class="empty-checklist"><span aria-hidden="true">⌁</span><h3>Your next discovery starts here</h3><p>Try “two mallards on the pond.”</p></div></div>
       </section>
-
-      <details id="map-card" class="map-card">
-        <summary>Observation map <span aria-hidden="true">⌄</span></summary>
-        <div id="map" role="region" aria-label="Map of observations"></div>
-        <p id="map-note" class="map-note">Waiting for location data</p>
-      </details>
 
       <section id="candidates-section" class="candidates-section" aria-labelledby="candidates-heading" hidden><div class="section-label"><h2 id="candidates-heading">Possible matches</h2></div><div id="candidates" class="candidate-strip"></div></section>
 
@@ -98,16 +85,48 @@
         <div class="caption-row"><span class="speaker">You</span><p id="user-caption">Say what you see, or ask about a bird song.</p></div>
         <div class="caption-row assistant"><span class="speaker">Assistant</span><p id="assistant-caption">Ready for your next discovery.</p></div>
       </section>
+      <details id="heard-card" class="heard-section">
+        <summary id="heard-heading">Heard nearby <span aria-hidden="true">⌄</span></summary>
+        <div id="heard" class="heard-strip"><p class="empty-inline">Listening for the next discovery.<small>Bird song detections will appear here.</small></p></div>
+      </details>
+
+      <details id="map-card" class="map-card">
+        <summary>Observation map <span aria-hidden="true">⌄</span></summary>
+        <div id="map" role="region" aria-label="Map of observations"></div>
+        <p id="map-note" class="map-note">Waiting for location data</p>
+      </details>
+
       <p class="privacy-note">Audio streams only while running</p>
     </main>
 
     <footer class="bottom-bar">
-      <div class="primary-controls"><button id="tap" class="talk-button" type="button" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10v2a7 7 0 0 0 14 0v-2M12 19v3M8 22h8"/></svg><span>Tap to talk<small>Ask your companion</small></span><span class="talk-arrow" aria-hidden="true">↗</span></button><button id="mic" class="square-button" type="button" aria-pressed="false" aria-label="Pause microphone" disabled><span id="mic-icon" aria-hidden="true">Ⅱ</span><small id="mic-label">Pause</small></button><button id="export" class="square-button" type="button" aria-haspopup="dialog"><span aria-hidden="true">↥</span><small>Export CSV</small></button></div>
-      <form id="text-form" class="text-form"><label class="sr-only" for="text-input">Message the companion</label><input id="text-input" name="text" placeholder="Type a sighting…" maxlength="2000" autocomplete="off"><button id="send" type="submit" aria-label="Send message" disabled>↑</button></form>
+      <div class="primary-controls"><button id="tap" class="talk-button" type="button" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10v2a7 7 0 0 0 14 0v-2M12 19v3M8 22h8"/></svg><span>Tap to talk<small>Next thing you say is for me;<br>tap again to stop it talking</small></span><span class="talk-arrow" aria-hidden="true">↗</span></button><button id="mic" class="square-button" type="button" aria-pressed="false" aria-label="Pause mic" disabled><span id="mic-icon" aria-hidden="true">Ⅱ</span><small id="mic-label">Pause mic</small></button></div>
     </footer>
   </div>
 
-  <div id="audio-overlay" class="audio-overlay" hidden><div><p class="eyebrow">PROJECTOR AUDIO</p><h2>Let the field speak.</h2><p>Click to enable assistant audio. This screen never uses a microphone.</p><p class="echo-note">While audio is enabled, phone voice input pauses during assistant speech. The phone’s tap button can still interrupt.</p><button id="enable-audio" class="start-button" type="button">Start display audio <span>↗</span></button><a id="silent-display" href="?display=1">Continue without audio</a></div></div>
+  <dialog id="settings-dialog" class="settings-drawer" aria-labelledby="settings-heading">
+    <form method="dialog"><button class="dialog-close" aria-label="Close settings">×</button></form>
+    <h2 id="settings-heading">Settings</h2>
+    <p class="setting-label">Speaker / Earphones <small>Speak to interrupt; earphones respond sooner.</small></p>
+    <button id="audio-mode" class="secondary-button" type="button" aria-pressed="false">Speaker</button>
+        <p id="earphone-tip" class="start-note" hidden>Earphones recommended — quieter for birds, and you can interrupt by voice.</p>
+    <button id="quiet" class="quiet-toggle" type="button" aria-pressed="false"><span>Quiet (only speaks when you tap)</span><i aria-hidden="true"></i></button>
+        <div class="mic-settings">
+          <label for="mic-device">Microphone</label>
+          <select id="mic-device" disabled aria-describedby="capture-settings"><option value="">Default · allow microphone to list devices</option></select>
+        </div>
+        <p id="capture-settings" class="capture-settings">Capture settings appear after Start.</p>
+
+    <p class="setting-label">Model <span id="model">Not connected</span></p>
+    <label class="headset-setting"><input id="headset-enabled" type="checkbox"> Headset-button push-to-talk</label>
+    <p class="capture-settings">Opt in to media controls and silent looping audio while listening.</p>
+    <label class="setting-label" for="text-input">Type instead</label>
+      <form id="text-form" class="text-form"><label class="sr-only" for="text-input">Message the companion</label><input id="text-input" name="text" placeholder="Type a sighting…" maxlength="2000" autocomplete="off"><button id="send" type="submit" aria-label="Send message" disabled>↑</button></form>
+    <button id="export" class="secondary-button" type="button" aria-haspopup="dialog">Export CSV</button>
+    <button id="reset" class="secondary-button reset-button" type="button">Reset session</button>
+    <p class="capture-settings">Build <span id="client-build"></span></p>
+  </dialog>
+  <div id="audio-overlay" class="audio-overlay" hidden><div><p class="eyebrow">PROJECTOR AUDIO</p><h2>Let the field speak.</h2><p>Click to enable assistant audio. This screen never uses a microphone.</p><p class="echo-note">Phone voice input stays on during assistant speech. Speak or tap on the phone to interrupt.</p><button id="enable-audio" class="start-button" type="button">Start display audio <span>↗</span></button><a id="silent-display" href="?display=1">Continue without audio</a></div></div>
   <dialog id="export-dialog" aria-labelledby="export-heading"><form method="dialog"><button class="dialog-close" aria-label="Close" value="cancel">×</button></form><p class="eyebrow">TAKE YOUR FIELD NOTES HOME</p><h2 id="export-heading">Export observations</h2><p id="export-summary"></p><label>Location name<input id="location-name" placeholder="e.g. High Park"></label><div class="export-location"><label>State / province<input id="export-state" placeholder="e.g. ON"></label><label>Country<input id="export-country" placeholder="e.g. CA"></label></div><p class="export-note">eBird includes birds only, without headers. Incidental protocol: this version does not collect complete survey effort.<br>Generic CSV includes all taxa and column headers.</p><button id="export-ebird" class="start-button" type="button">Download eBird CSV <span>↓</span></button><button id="export-all" class="secondary-button" type="button">All taxa · Generic CSV ↓</button></dialog>
   <audio id="headset-audio" loop playsinline hidden></audio>
   <div id="headset-toast" class="headset-toast" role="status" hidden></div>

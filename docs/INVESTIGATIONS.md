@@ -154,9 +154,13 @@ in Quiet mode and later generated audio for the original target; no checklist
 entry or new target's hint was changed. Physical phone/microphone/speaker and
 field-recognition acceptance remain separate.
 
-After merging the parallel recognition/runtime branch, retain its fresh-state,
-history and reset behavior along with this independent queue. A full session reset
-should close/cancel the previous investigation queue before creating a new one.
+The round-two recognition/runtime integration retains fresh-state snapshots,
+bounded conversation history and failed-turn recovery alongside this independent
+queue. A full session reset closes/cancels the previous investigation queue before
+creating a new one, and clears completed cards and explanation offers. Clearing
+only the checklist preserves investigations based on their original evidence.
+The filler rule still ignores a lone "Okay" after a BirdNET suggestion; "Okay" /
+"好的" after the latest investigation explanation offer accepts that offer.
 
 ## Ready offers and playback regression — 2026-10-24
 

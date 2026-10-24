@@ -164,6 +164,26 @@ class InvestigationSessionTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.c.close()
 
+    async def test_reset_cancels_old_jobs_and_clears_offers_before_new_outing(self):
+        await self.c.tool("ask_expert", {"question": "Original question?"})
+        await self.c.tool("ask_expert", {"question": "Queued question?"})
+        await until(lambda: self.c.investigations.running_task is not None)
+        old_queue = self.c.investigations
+        self.c.investigation_offer_ids = ["R1"]
+        self.c.auto_speech_paused = True
+        await self.c.reset()
+        self.assertTrue(old_queue.closed)
+        self.assertTrue(all(job.status == "cancelled" for job in old_queue.jobs.values()))
+        self.assertFalse(self.c.investigations.closed)
+        self.assertIs(self.c.investigations.settings, old_queue.settings)
+        self.assertFalse(self.c.investigations.jobs or self.c.pending or self.c.investigation_offer_ids)
+        self.assertFalse(self.c.auto_speech_paused)
+        self.assertTrue(any(e["type"] == "investigations" and not e["items"] for e in self.events))
+        self.release.set()
+        await asyncio.sleep(.02)
+        self.assertFalse(self.c.pending)
+        self.assertEqual((await self.c.tool("get_investigations", {}))["investigations"], [])
+
     async def test_slow_expert_releases_voice_worker_for_more_questions_and_jobs(self):
         self.c.connected = True
 

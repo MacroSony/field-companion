@@ -176,6 +176,18 @@ def tool_schema(name, description, properties=None, required=()):
 
 
 VISION_URL = os.environ.get("VISION_URL", "http://127.0.0.1:8795")
+
+
+def _web_build():
+    try:
+        m = re.search(r"CLIENT_BUILD = '([^']+)'", (Path(__file__).resolve().parent.parent / "web" / "app.js").read_text())
+        return m.group(1) if m else "unknown"
+    except OSError:
+        return "unknown"
+
+
+SERVER_BUILD = _web_build()
+
 NAME = {"type": "string"}
 COUNT = {"type": "integer", "minimum": 1}
 TASK_SELECTOR = {"id": NAME, "selection": {"type": "string", "enum": ["first", "latest", "all"]}}
@@ -201,24 +213,25 @@ TOOLS = [
                 {**TASK_SELECTOR, "explain": {"type": "boolean"}}),
     tool_schema("manage_investigation", "Cancel or retry an investigation. Retry uses its ORIGINAL question and evidence, even after changing focus. Use id or first/latest/all; default latest active for cancel.",
                 {**TASK_SELECTOR, "action": {"type": "string", "enum": ["cancel", "retry"]}}, ("action",)),
-    tool_schema("accept_suggestions", "Confirm pending BirdNET suggestions. Yes/both/all = all pending; just X = subset. Silent.",
+    tool_schema("accept_suggestions", "Accept pending suggestions only on explicit yes/yeah/sure or an intelligible add command. Never accept on lone Ah/Okay/Uh/Oh/Mm/Mm-hmm, questions, or a notification. Silent.",
                 {"species": SPECIES, "counts": {"type": "object", "additionalProperties": COUNT}}),
     tool_schema("dismiss_suggestions", "Decline pending suggestions. No = all; optional subset. Silent.", {"species": SPECIES}),
-    tool_schema("add_observations", "Log multiple user-confirmed species in ONE action, one earcon, no speech.",
+    tool_schema("add_observations", "Log only explicit organism sighting reports in ONE action; increase existing counts. Never log questions, greetings, or mic checks. No speech.",
                 {"items": {"type": "array", "items": OBSERVATION, "minItems": 1}}, ("items",)),
-    tool_schema("add_observation", "Log a user-confirmed sighting; increases existing count. No spoken acknowledgement.",
+    tool_schema("add_observation", "Log only an explicit organism sighting report; increase existing count. Never log questions, greetings, or mic checks. No speech.",
                 {"name": NAME, "group": {"type": "string", "enum": GROUPS}, "count": COUNT,
                  "notes": {"type": "string"}}, ("name", "group", "count", "notes")),
-    tool_schema("remove_observation", "Remove a species. No spoken acknowledgement.", {"name": NAME}, ("name",)),
+    tool_schema("remove_observation", "Remove a species, or clear the checklist with all=true ONLY when the user explicitly says all/everything/clear. Silent.",
+                {"name": NAME, "all": {"type": "boolean"}}),
     tool_schema("set_count", "Correct the TOTAL count of an existing species, rather than adding to it. No speech.",
                 {"name": NAME, "count": COUNT}, ("name", "count")),
-    tool_schema("get_checklist", "Read the confirmed checklist.") ,
-    tool_schema("recent_sounds", "Query timestamped BirdNET detections, not confirmed sightings.",
+    tool_schema("get_checklist", "Fetch confirmed logged sightings/counts, not sounds heard.") ,
+    tool_schema("recent_sounds", "Fetch recent sounds heard: unconfirmed BirdNET detections.",
                 {"seconds": {"type": "number", "minimum": 0, "maximum": 3600}}, ("seconds",)),
     tool_schema("nearby_species", "List recent iNaturalist species near GPS; narrow down description-based IDs before asking for confirmation.",
                 {"group": {"type": "string", "enum": GROUPS}}, ("group",)),
-    tool_schema("speak", "Request a spoken answer; no answer during routing.", {"reason": NAME}, ("reason",)),
-    tool_schema("ignore", "Speech not addressed to the assistant (chatter, noise): stay silent; call ONLY this tool."),
+    tool_schema("speak", "Request speech for general questions, greetings, or mic checks ('Can you hear me?'); not for questions needing checklist or recent-sound data. No answer during routing. Never for lone fillers/acknowledgements (Ah/Okay/Uh/Oh/Mm/Mm-hmm): ignore those.", {"reason": NAME}, ("reason",)),
+    tool_schema("ignore", 'Silently ignore chatter, unintelligible fragments, incomplete commands, and lone fillers/acknowledgements (Ah, Okay, Uh, Oh, Mm, Mm-hmm). With pending BirdNET suggestions or an unfinished prior request, never accept or dismiss on them. Exception: Okay/好的 accepts the latest investigation explanation offer via get_investigations(explain=true).'),
 ]
 INSTRUCTIONS = """You are a concise hands-free birding/naturalist companion with an open microphone.
 Reply in English by default; the user may speak Chinese: answer in the language of the question.
@@ -233,8 +246,6 @@ Only accept explicit user confirmation, never a BirdNET notification itself.
 For total count corrections use set_count; for deletion use remove_observation.
 Never claim to have logged anything without a successful tool call. Logging has an earcon,
 not speech. Never give delayed logging acknowledgements, including "I've logged X".
-For checklist questions call get_checklist; what just called: recent_sounds (unconfirmed).
-For other addressed birding questions call speak(reason); for local ID candidates use nearby_species.
 For "what's that?", "look again", or visual identification call look, NOT speak.
 Use the current focus snapshot for "add it", "two of them", "add them", or "log that":
 call confirm_observation with the count, NEVER add_observation/add_observations.
@@ -250,7 +261,7 @@ While investigations run, keep handling new questions and sightings normally.
 use get_investigations, NOT ask_expert. Select the requested R-number or first/latest/all.
 Progress/status questions use explain=false; never read a finished result automatically.
 "Explain R1", "Tell me the result", "讲一下第一个结果" use get_investigations(explain=true).
-After an investigation-ready offer, "yes", "go ahead", "好的，讲一下" accept that
+After an investigation-ready offer, "yes", "okay", "go ahead", "好的", "好的，讲一下" accept that
 explanation with get_investigations(explain=true), NOT ask_expert or accept_suggestions.
 "Not now" / "先不讲" after that offer uses ignore, NOT dismiss_suggestions.
 If several results were offered and no one is selected, ask which result to explain.
@@ -263,6 +274,11 @@ Never invent progress, percentages, results or completion times.
 For a different organism ("look at a different bird") call new_observation, even if
 an earlier focus exists. "Look again" keeps that focus with look. Discard unwanted IDs with discard_observation.
 Never invent sightings or identify from insufficient evidence; request camera evidence with look.
+Questions about birds heard, sounds, calls, or 'anything else' use recent_sounds(seconds=15). Only explicit questions about logged sightings/counts use get_checklist.
+Greetings, mic checks and general questions addressed to you use speak; sound/checklist questions use their read tools.
+For local ID candidates use nearby_species.
+Filler-only speech and unintelligible fragments (including "As for you, for me.") use ignore.
+Questions such as "Did you hear them?" never approve pending suggestions: use recent_sounds.
 """
 ROUTING = INSTRUCTIONS + """
 ROUTING PHASE ONLY: select exactly ONE function call with NO text or audio.
@@ -270,6 +286,7 @@ Chatter -> ignore; sighting -> add_observation; addressed question -> speak or a
 Earlier tool outputs are already handled. Do not invent sightings from questions.
 [TAP] means the next utterance is addressed to you.
 """
+ROUTING = 'HIGHEST-PRIORITY ROUTING RULE: If the latest assistant question is an investigation explanation offer, Okay/好的 explicitly accepts that offer: use get_investigations(explain=true), never accept_suggestions. Otherwise a turn consisting only of ah, okay, uh, oh, mm, or mm-hmm is ignore, even immediately after a pending-suggestion question or an unfinished earlier request. These fillers are NOT approval or dismissal. Yes/yeah/sure or an intelligible add command can approve BirdNET suggestions. Apply this before choosing any other tool.' + "\n" + ROUTING
 ANSWER = INSTRUCTIONS + """
 ANSWER PHASE: answer ONLY the latest addressed question in ONE short sentence. No tools.
 Use supplied tool results and checklist. Never acknowledge any earlier log or chatter;
@@ -288,12 +305,38 @@ ask_expert error without answer, ask the user to look at an organism first.
 SESSIONS = {}
 SESSION_TTL = 600
 FOCUS_TTL = 120
+ALLOWLIST_DIR = Path("/data/build/tmp")
+
+
+def scientific_species(name):
+    return bool(re.fullmatch(r"[A-Z][a-z]+ [a-z][a-z-]+", name or "")) and not (name or "").startswith("Human ")
+
+
+def eligible_detections(detections, allowed):
+    return [{**d, "unusual": False} for d in detections
+            if scientific_species(d.get("scientific_name"))
+            and d["scientific_name"] in allowed
+            and not re.match(r"^(human|dog|engine|siren|gun|power tools|fireworks|noise|environmental)\b",
+                             d.get("common_name", ""), re.I)
+            and float(d["confidence"]) >= .25]
 
 
 def valid_count(value):
     if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 100000:
         raise ValueError("count must be an integer between 1 and 100000")
     return value
+
+
+class TurnItems(set):
+    failed = False
+
+
+class TurnText(str):
+    """Transcript plus any already-committed audio item (never a newer turn)."""
+    def __new__(cls, text, item_ids=()):
+        obj = super().__new__(cls, text)
+        obj.item_ids = set(item_ids)
+        return obj
 
 
 class Session:
@@ -310,6 +353,17 @@ class Session:
         self.update_lock = asyncio.Lock()
         self.update_waiter = None
         self.response_waiter = None
+        self.awaited_response_id = None
+        self.conversation_ids = deque()
+        self.history_lock = asyncio.Lock()
+        self.turn_items = None
+        self.deleted_item_ids = deque(maxlen=500)
+        self.item_owners = {}
+        self.response_owners = {}
+        self.tools_executed = False
+        self.turn_task = None
+        self.turn_in_progress = False
+        self.epoch = 0
         self.phase = "route"
         self.work_ready = asyncio.Event()
         self.tap_at = 0.0
@@ -649,6 +703,8 @@ class Session:
 
     async def refusion(self, obs, touch=True):
         allowed = await asyncio.get_running_loop().run_in_executor(self.executor, self.allowed_species) if obs.group == "Aves" else None
+        if self.observations.get(obs.id) is not obs:
+            return  # reset/remove-all while the range lookup was in flight
         priors = getattr(self, "_prior_counts", {})
         obs.fused, obs.uncertain = fuse(obs.detections, allowed, priors)
         if touch:
@@ -765,6 +821,11 @@ class Session:
         return (self.playback_pending() or time.monotonic() < self.play_until
                 or (self.active and self.phase == "answer"))
 
+    @staticmethod
+    def filler_only(text):
+        words = re.sub(r"[^\w\s]", "", str(text).lower()).split()
+        return bool(words) and all(w in {"ah", "uh", "um", "oh", "hmm", "mm", "mmhmm", "mhm", "er", "erm"} for w in words)
+
     def remember_spoken(self, key, text):
         if not text.strip():
             return
@@ -800,7 +861,7 @@ class Session:
         return {"type": "state", "listening": self.mic_on,
                 "speaking": time.monotonic() < self.play_until,
                 "model": MODEL, "connected": self.connected, "echo_guard": self.echo_guard,
-                "session": self.id}
+                "session": self.id, "server_build": SERVER_BUILD}
 
     async def state(self):
         await self.phone_json(self.state_payload())
@@ -834,7 +895,9 @@ class Session:
                 "Speak only this text, with no additions, hints, translation or explanation. "
                 "Text to read: " + json.dumps(self.expert_readout, ensure_ascii=False))
         return {"output_modalities": ["text" if phase == "route" else "audio"],
-                "instructions": (ROUTING + "\nCurrent pending BirdNET suggestions (unconfirmed; latest turn only): "
+                "instructions": (ROUTING + "\nFresh state snapshot (context only; sounds are unconfirmed): "
+                                 + json.dumps(self.route_snapshot())
+                                 + "\nCurrent pending BirdNET suggestions (unconfirmed; latest turn only): "
                                  + json.dumps([r["en"] for r in self.suggestions.values()])
                                  + "\nCurrent focus snapshot (context only, not a new sighting): "
                                  + json.dumps(focus_context)
@@ -847,6 +910,33 @@ class Session:
                                  if phase == "route" else answer_instructions),
                 "tools": TOOLS if phase == "route" else [],
                 "tool_choice": "required" if phase == "route" else "none"}
+
+    def route_snapshot(self):
+        return {"checklist": [{"sci": r["sci"], "en": r["en"], "count": r["count"]} for r in self.items],
+                "pending": [r["en"] for r in self.suggestions.values()],
+                "last_heard": list(dict.fromkeys(d["en"] for _, d in reversed(self.history)))[:3],
+                "focus": ({"id": obs.id, "top3": obs.fused[:3], "uncertain": obs.uncertain,
+                           "hint": obs.hint} if (obs := self.observations.get(self.focus)) else None)}
+
+    async def prune_history(self):
+        async with self.history_lock:
+            # Function calls and outputs must survive until the whole turn (including
+            # its answer) completes, even if a reconnect toggles self.active.
+            if self.active or self.turn_in_progress or self.response_waiter is not None:
+                return
+            deleted = 0
+            while (len(self.conversation_ids) > 8 and not self.active
+                   and not self.turn_in_progress and self.response_waiter is None):
+                item_id = self.conversation_ids[0]
+                try:
+                    await self.rt_send({"type": "conversation.item.delete", "item_id": item_id})
+                except (ConnectionError, websockets.ConnectionClosed):
+                    return  # reconnect clears IDs; do not kill the turn worker
+                self.conversation_ids.popleft()
+                self.item_owners.pop(item_id, None)
+                deleted += 1
+            if deleted:
+                self.log("history_pruned", deleted=deleted, retained=len(self.conversation_ids))
 
     def session(self):
         return {"model": MODEL, **self.config("route"),
@@ -871,6 +961,23 @@ class Session:
             finally:
                 self.update_waiter = None
 
+    def own_item(self, item_id, owner=None):
+        owner = self.turn_items if owner is None else owner
+        if item_id and owner is not None:
+            owner.add(item_id)
+            self.item_owners[item_id] = owner
+
+    async def delete_items(self, items):
+        async with self.history_lock:
+            for item_id in list(items):
+                await self.rt_send({"type": "conversation.item.delete", "item_id": item_id})
+                if item_id in self.conversation_ids:
+                    self.conversation_ids.remove(item_id)
+                owner = self.item_owners.pop(item_id, None)
+                if owner is not None:
+                    owner.discard(item_id)
+                self.deleted_item_ids.append(item_id)
+
     async def generate(self, phase, *, guard=None):
         self.phase = phase
         await self.update_session(self.config(phase))
@@ -879,37 +986,48 @@ class Session:
         if guard is not None and not guard():
             return {"status": "deferred"}
         self.response_id = None
-        self.response_waiter = asyncio.get_running_loop().create_future()
         self.audio_allowed = phase == "answer" and self.may_speak()
         self.first_audio = False
-        try:
-            await self.rt_send({"type": "response.create"})
+        for attempt in range(2):
+            prior_items = set(self.turn_items or ())
+            self.response_waiter = asyncio.get_running_loop().create_future()
+            self.awaited_response_id = None
             try:
-                response = await asyncio.wait_for(asyncio.shield(self.response_waiter), 8 if phase == "route" else 25)
-            except asyncio.TimeoutError:
-                # Seen live 10/23: a route response.create got no response at all (no error, no done).
-                self.log("response_timeout", phase=phase)
-                if self.response_id:
-                    self.cancelled_ids.append(self.response_id)
-                self.audio_allowed = False
-                await self.rt_send({"type": "response.cancel"})
-                await self.end_audio()
-                if phase != "route" or getattr(self, "_retrying", False):
-                    raise
-                self._retrying = True
+                await self.rt_send({"type": "response.create"})
                 try:
-                    return await self.generate(phase)
-                finally:
-                    self._retrying = False
-            if response.get("status") == "failed":
-                raise RuntimeError("Upstream generation failed")
-            return response
-        finally:
-            self.response_waiter = None
+                    response = await asyncio.wait_for(asyncio.shield(self.response_waiter), 8 if phase == "route" else 25)
+                except asyncio.TimeoutError:
+                    self.log("response_timeout", phase=phase)
+                    if self.awaited_response_id:
+                        self.cancelled_ids.append(self.awaited_response_id)
+                    self.audio_allowed = False
+                    await self.rt_send({"type": "response.cancel"})
+                    await self.end_audio()
+                    if phase != "route" or attempt or self.tools_executed:
+                        raise
+                    await self.delete_items(set(self.turn_items or ()) - prior_items)
+                    continue
+                for item in response.get("output", []):
+                    self.own_item(item.get("id"))
+                if response.get("status") == "failed":
+                    if phase == "route" and not attempt and not self.tools_executed:
+                        self.log("route_retry", reason="failed")
+                        # A partial failed function call must not poison the retry.
+                        await self.delete_items(set(self.turn_items or ()) - prior_items)
+                        await asyncio.sleep(.3)
+                        continue
+                    raise RuntimeError("Upstream generation failed")
+                return response
+            finally:
+                self.response_waiter = None
 
     async def inject(self, text):
-        await self.rt_send({"type": "conversation.item.create", "item": {"type": "message", "role": "user",
+        item_id = "item_" + uuid.uuid4().hex[:24]
+        self.own_item(item_id)
+        await self.rt_send({"type": "conversation.item.create", "item": {"id": item_id,
+                            "type": "message", "role": "user",
                             "content": [{"type": "input_text", "text": text}]}})
+        return item_id
 
     def suggestions_payload(self):
         return {"type": "suggestions", "items": [
@@ -969,12 +1087,14 @@ class Session:
             if kind == "text" and stopped is not None:
                 # Merge consecutive queued utterances into one turn (backlog after a slow turn).
                 parts = [value]
+                merged_ids = set(getattr(value, "item_ids", ()))
                 while len(self.pending) > 1 and self.pending[1][0] == "text" and self.pending[1][2] is not None:
                     _, more, stopped = self.pending[1]
                     del self.pending[1]
                     parts.append(more)
+                    merged_ids.update(getattr(more, "item_ids", ()))
                 if len(parts) > 1:
-                    value = " ".join(parts)
+                    value = TurnText(" ".join(parts), merged_ids)
                     self.pending[0] = (kind, value, stopped)
                     self.log("turns_merged", n=len(parts))
             self.turn_stale = stopped is not None and time.monotonic() - stopped > 12
@@ -997,7 +1117,12 @@ class Session:
                     self.work_ready.set()
                     continue
             self.active = True
+            self.turn_in_progress = True
             self.turn_stopped_at = stopped if kind in ("text", "audio") else None
+            self.turn_items = TurnItems(getattr(value, "item_ids", ()))
+            for item_id in self.turn_items:
+                self.item_owners[item_id] = self.turn_items
+            self.tools_executed = False
             try:
                 if kind == "investigation":
                     job = self.investigations.jobs.get(value)
@@ -1022,28 +1147,72 @@ class Session:
                     if kind == "text":
                         self.turn_question = value
                         await self.inject(value)
+                    if self.filler_only(value):
+                        self.log("route_skipped_filler")
+                        await self.delete_items(self.turn_items)
+                        continue
                     response = await self.generate("route")
                     await self.finish_route(response)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 self.log("turn_failed", error_type=type(exc).__name__)
+                self.turn_items.failed = True
+                try:
+                    await self.delete_items(self.turn_items)
+                except (ConnectionError, websockets.ConnectionClosed):
+                    # No next route on unreconciled history: reconnect starts clean.
+                    self.connected = False
+                    if self.rt is not None:
+                        await self.rt.close()
                 if kind != "investigation":
                     await self.error("Turn failed; please try again.")
             finally:
+                self.turn_items = None
                 self.turn_question = ""
                 self.proactive_turn = False
                 self.active = False
+                self.turn_in_progress = False
                 self.transcripts.clear()
+                if self.connected:
+                    await self.prune_history()
                 await self.state()
                 if self.pending:
                     self.work_ready.set()
+
+    @staticmethod
+    def audit_args(arguments):
+        def clean(value):
+            if isinstance(value, dict):
+                return {k: ("[redacted]" if re.search(r"key|token|secret|password|authorization", k, re.I)
+                            else clean(v)) for k, v in value.items()}
+            if isinstance(value, list):
+                return [clean(v) for v in value]
+            if isinstance(value, str):
+                return re.sub(r"(?i)bearer\s+\S+|\bsk-[\w-]+", "[redacted]", value)
+            return value
+        try:
+            return json.dumps(clean(json.loads(arguments or "{}")), ensure_ascii=False, separators=(",", ":"))[:200]
+        except (ValueError, TypeError):
+            return "[invalid JSON]"
 
     async def finish_route(self, response):
         if response.get("status") != "completed":
             return
         calls = [i for i in response.get("output", []) if i.get("type") == "function_call"]
-        self.log("route_done", tools=[c["name"] for c in calls])
+        self.log("route_done", tools=[c["name"] for c in calls],
+                 arguments=[self.audit_args(c.get("arguments")) for c in calls])
+        if len(calls) == 2 and {c["name"] for c in calls} == {"remove_observation", "dismiss_suggestions"}:
+            remove = next(c for c in calls if c["name"] == "remove_observation")
+            try:
+                clear_all = json.loads(remove.get("arguments") or "{}").get("all") is True
+            except (ValueError, TypeError, AttributeError):
+                clear_all = False
+            if clear_all:
+                # The sole allowed compound route: dismiss before clearing outing.
+                for call in sorted(calls, key=lambda c: c["name"] != "dismiss_suggestions"):
+                    await self.finish_route({"status": "completed", "output": [call]})
+                return
         if len(calls) != 1:
             await self.error("Routing did not select one action; please try again.")
             return
@@ -1051,6 +1220,7 @@ class Session:
         name = call["name"]
         try:
             args = json.loads(call.get("arguments") or "{}")
+            self.tools_executed = True
             result = {"ok": True} if name == "ignore" else (
                 {"ready_to_answer": True, "reason": args.get("reason")} if name == "speak"
                 else await self.tool(name, args))
@@ -1069,7 +1239,7 @@ class Session:
         await self.rt_send({"type": "conversation.item.create", "item": {
             "type": "function_call_output", "call_id": call["call_id"],
             "output": json.dumps(result, ensure_ascii=False)}})
-        self.log("tool", name=name, ok=result.get("ok", True))
+        self.log("tool", name=name, arguments=self.audit_args(call.get("arguments")), ok=result.get("ok", True))
         if result.get("suppress_answer"):
             return
         if name in ("speak", "get_checklist", "recent_sounds", "nearby_species", "get_observation", "ask_expert", "describe", "get_investigations", "manage_investigation") and self.may_speak():
@@ -1098,6 +1268,12 @@ class Session:
                     self.rt = ws
                     self.active = False
                     self.response_id = None
+                    self.awaited_response_id = None
+                    self.user_speaking = self.awaiting_transcript = False
+                    self.conversation_ids.clear()
+                    self.deleted_item_ids.clear()
+                    self.item_owners.clear()
+                    self.response_owners.clear()
                     self.transcripts.clear()
                     # Higgs waits for the first update before emitting session.created.
                     await self.rt_send({"type": "session.update", "session": self.session()})
@@ -1110,6 +1286,7 @@ class Session:
                     self.connected = True
                     delay = 1
                     self.log("realtime_connected", model=MODEL, acknowledgement=event.get("type"))
+                    self.log("history_strategy", strategy="conversation.item.delete", keep=8)
                     summary = "; ".join(f"{r['count']} {r['en']} ({r.get('zh', '')})" for r in self.items) or "empty"
                     await self.rt_send({"type": "conversation.item.create", "item": {"type": "message", "role": "user",
                                         "content": [{"type": "input_text", "text": "Current confirmed checklist (context only; do not speak): " + summary[:3000]}]}})
@@ -1130,6 +1307,7 @@ class Session:
                         waiter.set_exception(ConnectionError("Realtime disconnected"))
                 self.rt = None
                 self.connected = False
+                self.user_speaking = self.awaiting_transcript = False
                 self.active = False
                 if not self.closed:
                     self.play_until = 0
@@ -1151,6 +1329,31 @@ class Session:
                         "response.output_audio_transcript.delta", "response.audio_transcript.delta",
                         "response.output_text.delta", "response.output_audio_transcript.done",
                         "response.audio_transcript.done", "response.output_text.done")
+        if ty in ("conversation.item.created", "conversation.item.added"):
+            item = event.get("item", {})
+            item_id = item.get("id")
+            if item_id in self.deleted_item_ids:
+                return  # delayed create acknowledgement after failed-turn deletion
+            # User audio may arrive while an older turn is routing. Its transcript
+            # assigns ownership later; never sweep it into the active turn.
+            if item.get("role") != "user" and item_id not in self.item_owners:
+                self.own_item(item_id)
+            owner = self.item_owners.get(item_id)
+            if owner is not None and getattr(owner, "failed", False):
+                await self.delete_items([item_id])
+                return
+            if item_id and item_id not in self.conversation_ids:
+                self.conversation_ids.append(item_id)
+            if not self.active:
+                await self.prune_history()
+            return
+        if ty == "response.output_item.added":
+            item_id = event.get("item", {}).get("id")
+            owner = self.response_owners.get(rid)
+            self.own_item(item_id, owner)
+            if owner is not None and getattr(owner, "failed", False) and item_id:
+                await self.delete_items([item_id])
+            return
         if ty == "session.updated":
             if self.update_waiter is not None and not self.update_waiter.done():
                 self.update_waiter.set_result(event.get("session", {}))
@@ -1211,7 +1414,7 @@ class Session:
                     await self.flush_pending()
                     return  # Stay listening; a stop command needs no spoken reply.
                 self.auto_speech_paused = False
-                self.pending.append(("text", text, self.speech_stopped_at))  # transcript as text; audio buffer is cleared
+                self.pending.append(("text", TurnText(text, [event["item_id"]] if event.get("item_id") else []), self.speech_stopped_at))  # transcript as text; audio buffer is cleared
                 await self.flush_pending()
         elif ty == "conversation.item.input_audio_transcription.failed":
             self.awaiting_transcript = False
@@ -1220,6 +1423,12 @@ class Session:
         elif ty == "response.created":
             self.active = True
             self.response_id = event["response"]["id"]
+            if self.turn_items is not None:
+                self.response_owners[self.response_id] = self.turn_items
+                while len(self.response_owners) > 100:
+                    del self.response_owners[next(iter(self.response_owners))]
+            if self.response_id not in self.cancelled_ids and self.response_waiter is not None:
+                self.awaited_response_id = self.response_id
         elif ty in ("response.output_audio.delta", "response.audio.delta"):
             if rid in self.cancelled_ids or not self.audio_allowed:
                 return
@@ -1259,12 +1468,16 @@ class Session:
                                        "text": event.get("transcript", event.get("text", "")), "final": True})
         elif ty == "response.done":
             response = event["response"]
-            if response.get("id") is not None and response["id"] != self.response_id:
+            expected = self.awaited_response_id or self.response_id
+            if expected is not None and response.get("id") != expected:
                 return
             self.log("response_done", status=response.get("status"), phase=self.phase)
             if self.phase == "answer" and self.first_audio:
                 await self.end_audio()
-            if self.response_waiter is not None and not self.response_waiter.done():
+            if (self.response_waiter is not None and not self.response_waiter.done()
+                    and response.get("id") == expected):
+                # A matching cancelled response releases the worker for the next
+                # question. Cancelled PCM remains blocked by cancelled_ids.
                 self.response_waiter.set_result(response)
 
     async def find_item(self, name):
@@ -1418,6 +1631,9 @@ class Session:
                 await self.broadcast_suggestions()
             return {"ok": True, "items": rows, "item": rows[0],
                     "observation": self.observations[self.focus].payload()}
+        if name == "remove_observation" and args.get("all") is True:
+            await self.clear_outing()
+            return {"ok": True, "items": []}
         if name in ("remove_observation", "set_count"):
             count = valid_count(args.get("count")) if name == "set_count" else None
             item_id = await self.find_item(args["name"])
@@ -1433,50 +1649,75 @@ class Session:
         from birdnetlib.analyzer import Analyzer
         if self.analyzer is None:
             self.analyzer = Analyzer()
-        # Run unfiltered, then apply our own range filter: BirdNET's eBird-based season list
-        # misses locally recorded species (e.g. Red-necked Grebe in Toronto, Oct), so allow
-        # the union of BirdNET's list and recent iNat records; anything else needs high
-        # confidence and is flagged "unusual" (possible rarity) instead of being dropped.
         rec = RecordingBuffer(self.analyzer, samples, SR, min_conf=0.25)
         rec.analyze()
-        allowed = self.allowed_species()
-        out = []
-        for d in rec.detections:
-            sci = d.get("scientific_name") or d["common_name"]
-            if allowed and sci not in allowed:
-                if float(d["confidence"]) < 0.7:
-                    continue
-                d = {**d, "unusual": True}
-            out.append(d)
-        return out
+        return eligible_detections(rec.detections, self.allowed_species())
 
     def allowed_species(self):
-        key = (round(self.lat, 1), round(self.lng, 1), date.today().isoformat())
-        if getattr(self, "_allowed_key", None) == key:
+        region = (round(self.lat, 1), round(self.lng, 1))
+        key = (*region, date.today().isoformat())
+        now = time.monotonic()
+        if getattr(self, "_allowed_key", None) == key and now < self._allowed_retry:
             return self._allowed
-        allowed = set()
+        cache = ALLOWLIST_DIR / f"allowlist-{region[0]:.1f}_{region[1]:.1f}.json"
+        previous = set()
+        try:
+            previous = {n for n in json.loads(cache.read_text())["species"] if scientific_species(n)}
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        if getattr(self, "_allowed_region", None) == region:
+            previous |= getattr(self, "_allowed", set())
         try:
             from birdnetlib.species import SpeciesList
-            allowed |= {x["scientific_name"] for x in SpeciesList().return_list(
-                lon=self.lng, lat=self.lat, date=datetime.now(), threshold=0.03)}
+            allowed = {x["scientific_name"] for x in SpeciesList().return_list(
+                lon=self.lng, lat=self.lat, date=datetime.now(), threshold=0.001)}
+            params = {"iconic_taxa": "Aves", "verifiable": "true", "rank": "species", "per_page": 500}
+            if 41.7 <= self.lat <= 56.9 and -95.2 <= self.lng <= -74.3:
+                params["place_id"] = 6883
+            else:
+                params.update(lat=self.lat, lng=self.lng, radius=100)
+            page = 1
+            priors = {}
+            while True:
+                result = inat("observations/species_counts", **params, page=page)
+                rows = result["results"]
+                priors.update({r["taxon"]["name"]: r.get("count", 0) for r in rows})
+                allowed.update(r["taxon"]["name"] for r in rows
+                               if r["taxon"].get("rank") == "species"
+                               and r["taxon"].get("iconic_taxon_name") == "Aves")
+                if len(rows) < 500:
+                    break
+                page += 1
+            allowed = {n for n in allowed if scientific_species(n)}
+            if not allowed:
+                raise ValueError("Empty allowlist")
         except Exception as exc:
-            self.log("species_list_failed", error_type=type(exc).__name__)
-        try:
-            since = (date.today() - timedelta(days=120)).isoformat()
-            r = inat("observations/species_counts", lat=self.lat, lng=self.lng, radius=25,
-                     d1=since, iconic_taxa="Aves", per_page=500)
-            allowed |= {t["taxon"]["name"] for t in r.get("results", [])}
-            self._prior_counts = {t["taxon"]["name"]: t["count"] for t in r.get("results", [])}
-        except Exception as exc:
-            self.log("inat_species_failed", error_type=type(exc).__name__)
-        self._allowed_key, self._allowed = key, allowed
+            allowed = previous
+            self.log("allowlist_unavailable", error_type=type(exc).__name__,
+                     fallback=len(allowed), suppress=not bool(allowed))
+            retry = now + 60
+        else:
+            self._prior_counts = priors
+            retry = float("inf")
+            try:
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                temp = cache.with_suffix(".tmp")
+                temp.write_text(json.dumps({"date": key[2], "species": sorted(allowed)}))
+                temp.replace(cache)
+            except OSError as exc:
+                self.log("allowlist_cache_failed", error_type=type(exc).__name__)
+        self._allowed_key, self._allowed_region = key, region
+        self._allowed, self._allowed_retry = allowed, retry
         self.log("allowed_species", n=len(allowed))
         return allowed
 
     async def bird_window(self, samples, end):
         try:
+            epoch = self.epoch
             start = time.monotonic()
             detections = await asyncio.get_running_loop().run_in_executor(self.executor, self.analyze, samples)
+            if epoch != self.epoch:
+                return
             self.log("bird_window", stream_s=round(end / SR, 2), count=len(detections),
                      compute_ms=round((time.monotonic() - start) * 1000))
             sound_candidates = []
@@ -1487,31 +1728,34 @@ class Session:
                         taxon = await asyncio.to_thread(resolve, sci, "Aves")
                     except Exception:
                         taxon = None
+                    if epoch != self.epoch:
+                        return
                     self.names[sci] = taxon or {"sci": sci, "en": d["common_name"], "zh": d["common_name"]}
                 names = {k: self.names[sci].get(k, "") for k in ("sci", "en", "zh", "photo")}
                 confidence = round(float(d["confidence"]), 4)
                 sound_candidates.append({**names, "p": confidence})
-                first = confidence >= 0.5 and sci not in self.seen
-                if confidence >= 0.5:
-                    self.seen.add(sci)
-                heard = {"type": "heard", **names, "conf": confidence, "t": now_iso(), "new": first,
-                         "lat": self.lat, "lng": self.lng, "unusual": bool(d.get("unusual"))}
-                self.history.append((time.monotonic(), {k: v for k, v in heard.items() if k != "type"}))
-                await self.phone_json(heard)
-                self.log("bird_detection", **names, conf=confidence, stream_s=round(end / SR, 2))
-                if first:
-                    await self.phone_json({"type": "earcon", "kind": "heard"})
                 hits = self.windows[sci]
                 while hits and end - hits[0] > 10 * SR:
                     hits.popleft()
-                if confidence >= 0.5 and (not hits or hits[-1] != end):
+                if confidence >= .5 and (not hits or hits[-1] != end):
                     hits.append(end)
+                qualified = confidence >= .7 or (confidence >= .5 and len(hits) >= 2)
+                first = qualified and sci not in self.seen
+                heard = {"type": "heard", **names, "conf": confidence, "t": now_iso(), "new": first,
+                         "lat": self.lat, "lng": self.lng, "unusual": False}
+                self.history.append((time.monotonic(), {k: v for k, v in heard.items() if k != "type"}))
+                if qualified:
+                    self.seen.add(sci)
+                    await self.phone_json(heard)
+                self.log("bird_detection", **names, conf=confidence, stream_s=round(end / SR, 2))
+                if first:
+                    await self.phone_json({"type": "earcon", "kind": "heard"})
                 now = time.monotonic()
                 if sci in self.suggestions:
                     r = self.suggestions[sci]
                     r.update(conf=max(r["conf"], confidence), last_heard=now, t=heard["t"])
                     await self.broadcast_suggestions()
-                elif confidence >= .5 and len(hits) >= 2 and sci not in self.notified and not any(r["sci"] == sci for r in self.items):
+                elif qualified and sci not in self.notified and not any(r["sci"] == sci for r in self.items):
                     self.notified.add(sci)
                     best = max((h["conf"] for t, h in self.history if t >= now - 10 and h["sci"] == sci), default=confidence)
                     self.suggestions[sci] = {**names, "conf": best, "t": heard["t"],
@@ -1621,14 +1865,22 @@ class Session:
             await self.state()
             await self.flush_pending()
             return
-        if ty == "hello":
-            if client is not None:
+        if ty == "reset":
+            await self.reset()
+            return
+        if ty in ("hello", "location"):
+            if ty == "location" and (event.get("lat") is None or event.get("lng") is None):
+                raise ValueError("location requires lat and lng")
+            if ty == "hello" and client is not None:
                 client.playback_protocol = 1 if event.get("playback_protocol") == 1 else 0
             if event.get("lat") is not None and event.get("lng") is not None:
                 lat, lng = float(event["lat"]), float(event["lng"])
                 if not (-90 <= lat <= 90 and -180 <= lng <= 180):
                     raise ValueError("Invalid GPS coordinates")
                 self.lat, self.lng = lat, lng
+            if ty == "location":
+                await self.state()
+                return
             self.lang = str(event.get("lang", "en"))[:32]
             await self.state()
             await self.phone_json({"type": "checklist", "items": [dict(r) for r in self.items]})
@@ -1722,6 +1974,81 @@ class Session:
         else:
             raise ValueError("Unknown message type")
 
+    async def clear_outing(self):
+        # Checklist is derived: mutating self.items would only clear a temporary list.
+        self.epoch += 1
+        self.input_revision += 1  # invalidate in-flight expert/frame work
+        async with self.item_lock:
+            self.observations.clear()
+            self.focus = None
+            self.frames.clear()
+            self.sound_windows.clear()
+            self.suggestions.clear()
+        for rows in (self.history, self.windows, self.seen, self.notified):
+            rows.clear()
+        self.pending = deque(p for p in self.pending if p[0] not in ("notify", "vision"))
+        self.last_proactive = float("-inf")
+        await self.phone_json({"type": "reset"})
+        await self.broadcast_checklist()
+        await self.broadcast_suggestions()
+        await self.phone_json(self.investigations.payload())
+
+    async def reset(self):
+        self.epoch += 1
+        if self.turn_task is not None:
+            self.turn_task.cancel()
+            await asyncio.gather(self.turn_task, return_exceptions=True)
+            self.tasks.remove(self.turn_task)
+            self.turn_task = None
+        await self.investigations.close()
+        self.investigations = InvestigationQueue(self.run_investigation,
+            lambda event: self.phone_json(event), self.investigation_finished,
+            settings=self.investigations.settings)
+        self.investigation_offer_ids.clear()
+        self.auto_speech_paused = False
+        self.expert_readout = None
+        self.turn_question = ""
+        self.turn_in_progress = False
+        try:
+            await self.cancel_speech()
+        except (ConnectionError, websockets.ConnectionClosed):
+            pass
+        self.connected = False
+        await self.clear_outing()
+        for rows in (self.history, self.windows, self.seen, self.notified, self.pending,
+                     self.spoken, self.transcripts, self.conversation_ids):
+            rows.clear()
+        self.last_proactive = float("-inf")
+        self.user_speaking = self.awaiting_transcript = self.active = False
+        self.response_id = self.awaited_response_id = None
+        self.turn_items = None
+        self.deleted_item_ids.clear()
+        self.item_owners.clear()
+        self.response_owners.clear()
+        self.tools_executed = False
+        self.play_until = self.echo_estimate = self.tap_at = 0
+        self.ring.fill(0)
+        self.echo_ring.fill(False)
+        self.position, self.next_window = 0, 3 * SR
+        self.filter_state.fill(0)
+        self.decimation_phase = 0
+        while not self.audio_queue.empty():
+            self.audio_queue.get_nowait()
+            self.audio_queue.task_done()
+        for client in self.clients:
+            client.playback_active = False
+            client.playback_end = 0
+        if self.rt is not None:
+            await self.rt.close()
+        if self.tasks:
+            self.turn_task = asyncio.create_task(self.turn_worker())
+            self.tasks.append(self.turn_task)
+        await self.phone_json({"type": "flush"})
+        await self.broadcast_checklist()
+        await self.broadcast_suggestions()
+        await self.state()
+        self.log("reset")
+
     async def cancel_speech(self):
         if self.response_id:
             self.cancelled_ids.append(self.response_id)
@@ -1733,8 +2060,9 @@ class Session:
         await self.state()
 
     def start(self):
+        self.turn_task = asyncio.create_task(self.turn_worker())
         self.tasks = [asyncio.create_task(self.realtime_loop()),
-                      asyncio.create_task(self.audio_sender()), asyncio.create_task(self.turn_worker()),
+                      asyncio.create_task(self.audio_sender()), self.turn_task,
                       asyncio.create_task(self.focus_watch()),
                       asyncio.create_task(self.suggestion_loop())]
 
@@ -1811,7 +2139,7 @@ class Client:
                         event = json.loads(packet["text"])
                         if not isinstance(event, dict):
                             raise ValueError("JSON message must be an object")
-                        if self.role == "display" and event.get("type") not in ("hello", "text", "edit", "delete", "tap", "suggestion_action", "playback", "look", "observation_action", "investigation_action"):
+                        if self.role == "display" and event.get("type") not in ("hello", "text", "edit", "delete", "tap", "suggestion_action", "playback", "look", "observation_action", "investigation_action", "reset"):
                             raise ValueError("Display cannot control microphone or mode")
                         if event.get("type") == "hello" and self.role == "display":
                             await self.send_json(s.state_payload())

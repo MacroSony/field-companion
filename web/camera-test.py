@@ -39,8 +39,9 @@ def serve(port):
 
         def start(self):
             self.connected = True
+            self.turn_task = asyncio.create_task(self.turn_worker())
             self.tasks = [asyncio.create_task(self.focus_watch()),
-                          asyncio.create_task(self.turn_worker()), asyncio.create_task(self.suggestion_loop())]
+                          self.turn_task, asyncio.create_task(self.suggestion_loop())]
 
         async def ingest_audio(self, pcm):
             pass  # The test deliberately makes no BirdNET or voice API request.
@@ -177,7 +178,8 @@ async def test(port, cdp):
             } else stream=await gum(constraints);
             window.__streams.push(stream); return stream;
           };
-          navigator.geolocation.getCurrentPosition = callback => { window.__gps = callback; };
+          navigator.geolocation.watchPosition = callback => { window.__gps = callback; return 1; };
+          navigator.geolocation.clearWatch = () => {};
           const fetchOriginal = window.fetch.bind(window);
           window.fetch = async (url, options) => {
             if (String(url).includes('/api/frame?')) {
@@ -319,7 +321,7 @@ async def test(port, cdp):
         count = await js("window.__sockets.length")
         async with connect(f"ws://127.0.0.1:{port}/ws?session={session}&role=mic") as second:
             await second.send(json.dumps({"type": "hello"}))
-            await until("document.getElementById('notice').textContent.includes('Another phone')")
+            await until("!document.getElementById('reconnect').hidden")
             await asyncio.sleep(2)
             assert await js("window.__sockets.length") == count
         results["replacementStopsReconnect"] = True
@@ -336,6 +338,12 @@ async def test(port, cdp):
         await call("Emulation.setDeviceMetricsOverride", width=1920, height=1080, deviceScaleFactor=1, mobile=False)
         assert not await js("document.documentElement.scrollWidth > innerWidth || document.documentElement.scrollHeight > innerHeight")
         results["display1920Layout"] = True
+        await js("window.__sockets[0].send(JSON.stringify({type:'reset'}))")
+        await until("document.getElementById('active-observation').hidden && document.querySelectorAll('.observation').length === 0")
+        assert await js("document.querySelectorAll('#observation-evidence img').length === 0")
+        results["resetClearsObservationEvidence"] = True
+        await until("document.querySelectorAll('.investigation').length === 0 && !document.getElementById('display-status').textContent.includes('R3')")
+        results["resetClearsInvestigations"] = True
         errors = [e for e in events if e.get("method") == "Runtime.exceptionThrown"]
         assert not errors, errors
         results["runtimeErrors"] = 0
