@@ -28,6 +28,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPExcept
 from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from expert import NaturalistExpert, revision as expert_revision
+from investigations import ACTIVE, InvestigationQueue, QueueFull
 
 MODEL = "higgs-realtime-1.5-preview"
 SR = 48000
@@ -176,6 +177,7 @@ def tool_schema(name, description, properties=None, required=()):
 VISION_URL = os.environ.get("VISION_URL", "http://127.0.0.1:8795")
 NAME = {"type": "string"}
 COUNT = {"type": "integer", "minimum": 1}
+TASK_SELECTOR = {"id": NAME, "selection": {"type": "string", "enum": ["first", "latest", "all"]}}
 SUGGEST_DEBOUNCE = 3.5
 SUGGEST_INTERVAL = 25
 SUGGEST_STALE = 60
@@ -193,7 +195,10 @@ TOOLS = [
     tool_schema("discard_observation", "Discard the focus; do not log it."),
     tool_schema("new_observation", "Look at a different organism: start a new focus and request camera frames.", {"group": {"type": "string", "enum": GROUPS}}),
     tool_schema("describe", "Attach a user description to the focus; resolve only explicit species names.", {"text": NAME, "name": NAME}, ("text",)),
-    tool_schema("ask_expert", "Reason about the current focus: candidate comparisons, 'could it be X?', conflicting evidence, diet, habitat or behaviour. Read-only; never log.", {"question": NAME}, ("question",)),
+    tool_schema("ask_expert", "Start a background investigation about the current focus: comparisons, conflicting evidence, diet, habitat or behaviour. Returns immediately; never log.", {"question": NAME}, ("question",)),
+    tool_schema("get_investigations", "Check investigation progress or read a completed result, without starting a new investigation. Use id (R1 etc.) or first/latest/all.", TASK_SELECTOR),
+    tool_schema("manage_investigation", "Cancel or retry an investigation. Retry uses its ORIGINAL question and evidence, even after changing focus. Use id or first/latest/all; default latest active for cancel.",
+                {**TASK_SELECTOR, "action": {"type": "string", "enum": ["cancel", "retry"]}}, ("action",)),
     tool_schema("accept_suggestions", "Confirm pending BirdNET suggestions. Yes/both/all = all pending; just X = subset. Silent.",
                 {"species": SPECIES, "counts": {"type": "object", "additionalProperties": COUNT}}),
     tool_schema("dismiss_suggestions", "Decline pending suggestions. No = all; optional subset. Silent.", {"species": SPECIES}),
@@ -237,6 +242,14 @@ Pronouns refer to the focus. For species comparisons ('could it be a Cooper's
 Hawk?'), uncertain identification, diet ('what does it eat?'), habitat or behaviour
 call ask_expert with the complete latest question, NOT speak or get_observation.
 get_observation only reads evidence; it does not supply species facts.
+ask_expert schedules work; its immediate answer is an acknowledgement, not research findings.
+While investigations run, keep handling new questions and sightings normally.
+"How is the first investigation going?", "Any results?", "刚才查得怎么样？"
+use get_investigations, NOT ask_expert. Select the requested R-number or first/latest/all.
+"Cancel the first investigation" / "取消第一个调查" uses manage_investigation(action=cancel).
+"Try R1 again" / "继续查第一个" uses manage_investigation(action=retry).
+An explicit request to start another investigation uses ask_expert, not a status read.
+Never invent progress, percentages, results or completion times.
 For a different organism ("look at a different bird") call new_observation, even if
 an earlier focus exists. "Look again" keeps that focus with look. Discard unwanted IDs with discard_observation.
 Never invent sightings or identify from insufficient evidence; request camera evidence with look.
@@ -340,68 +353,172 @@ class Session:
         self.total_audio_out = 0
         self.expert = NaturalistExpert()
         self.input_revision = 0
+        self.investigations = InvestigationQueue(self.run_investigation,
+            lambda event: self.phone_json(event), self.investigation_finished)
 
-    async def ask_expert(self, question, obs):
-        snapshot = obs.payload()
-        version = expert_revision(snapshot)
-        input_revision = self.input_revision
-        result = await self.expert.answer(question, snapshot)
-        await self.expire_focus()
-        if (self.closed or self.focus != obs.id or obs.status == "discarded"
-                or self.input_revision != input_revision
-                or expert_revision(obs.payload()) != version):
-            self.log("expert_stale", observation=obs.id)
-            return {"ok": False, "status": "stale", "suppress_answer": True}
-        if result.get("action") == "request_more_evidence" and result.get("hint") and obs.status == "open":
+    @staticmethod
+    def chinese(text):
+        return any("\u3400" <= c <= "\u9fff" for c in text)
+
+    async def run_investigation(self, question, snapshot, progress):
+        return await self.expert.answer(question, snapshot,
+            timeout=self.investigations.settings.request_timeout, on_progress=progress)
+
+    async def ask_expert(self, question, obs, *, origin="question"):
+        if not self.expert.available:
+            from expert import fallback
+            return fallback(question, "not_configured")
+        try:
+            job = await self.investigations.submit(question, obs.payload(), origin=origin)
+        except QueueFull:
+            return {"ok": False, "status": "queue_full", "answer":
+                "调查队列已满，请取消一项或等一项完成。" if self.chinese(question) else
+                "The investigation queue is full; cancel a task or wait for one to finish."}
+        ahead = sum(j.status in ACTIVE for j in self.investigations.jobs.values()
+                    if int(j.id[1:]) < int(job.id[1:]))
+        answer = (f"已安排调查 {job.id}，" + (f"前面还有 {ahead} 项；" if ahead else "")
+                  + "你可以继续提问，有结果我会通知你。" if self.chinese(question) else
+                  f"Investigation {job.id} is scheduled. "
+                  + (("There is 1 task ahead. " if ahead == 1 else f"There are {ahead} tasks ahead. ") if ahead else "")
+                  + "You can keep talking; I will let you know when it is ready.")
+        return {"ok": True, "status": "scheduled", "investigation_id": job.id,
+                "answer": answer, "investigation": job.payload()}
+
+    def investigation_answer(self, job, *, chinese=None, include_result=True):
+        zh = self.chinese(job.question) if chinese is None else chinese
+        target = job.payload()["species"]
+        prefix = (f"调查 {job.id}" + (f"（关于 {target}）" if target else "") if zh else
+                  f"Investigation {job.id}" + (f", about {target}," if target else ""))
+        if job.status == "completed" and include_result:
+            return prefix + ("：" if zh else ": ") + job.result["answer"]
+        statuses = {"queued": ("正在排队", "is queued"),
+                    "running": (("正在检索资料" if job.stage == "retrieving" else "正在分析证据"),
+                                ("is retrieving sources" if job.stage == "retrieving" else "is analyzing evidence")),
+                    "completed": ("已完成", "is complete"), "cancelled": ("已取消", "is cancelled"),
+                    "timed_out": ("达到本次时限，已保留问题和证据，可以重新调查", "reached its time limit; its question and evidence are saved for a retry"),
+                    "failed": ("暂时未能完成，问题和证据已保留，可以重试", "could not finish; its question and evidence are saved for a retry")}
+        words = statuses[job.status][0 if zh else 1]
+        if job.status == "queued":
+            queued = [j.id for j in self.investigations.jobs.values() if j.status == "queued"]
+            position = queued.index(job.id) + 1
+            words += f"，排第 {position} 位" if zh else f", position {position}"
+        return prefix + ("" if zh else " ") + words + ("。" if zh else ".")
+
+    async def investigation_finished(self, job):
+        result = job.result or {}
+        obs = self.observations.get(job.observation["id"])
+        # Ordinary conversation never invalidates research. A capture hint may
+        # update only the exact, still-current observation snapshot it describes.
+        if (job.status == "completed" and result.get("action") == "request_more_evidence"
+                and result.get("hint") and obs and obs.status == "open"
+                and self.focus == obs.id and expert_revision(obs.payload()) == expert_revision(job.observation)):
             obs.hint = result["hint"]
-            version = expert_revision(obs.payload())
             await self.broadcast_observation(obs)
-        if (self.focus != obs.id or self.input_revision != input_revision
-                or expert_revision(obs.payload()) != version):
-            return {"ok": False, "status": "stale", "suppress_answer": True}
-        result["context"] = {"observation_id": obs.id, "revision": version, "input_revision": input_revision}
-        self.log("expert_done", status=result.get("status"), action=result.get("action"))
-        return result
+        if job.status in ("completed", "failed", "timed_out"):
+            self.pending.append(("investigation", job.id, None))
+            await self.flush_pending()
+        self.log("investigation_done", id=job.id, status=job.status)
 
-    def expert_result_current(self, result):
-        context = result.get("context", {})
-        obs = self.observations.get(context.get("observation_id"))
-        return (obs is not None and self.focus == obs.id and obs.status != "discarded"
-                and self.input_revision == context.get("input_revision")
-                and expert_revision(obs.payload()) == context.get("revision"))
+    async def investigation_notice(self, job):
+        if job.announced or job.status not in ("completed", "failed", "timed_out"):
+            return
+        revision = self.input_revision
+        job.announced = True  # A barge-in ends the notice; the result stays readable.
+        await self.investigations.emit()
+        async def defer_if_interrupted():
+            if (self.closed or self.quiet or self.user_speaking or self.awaiting_transcript
+                    or self.input_revision != revision):
+                job.announced = False
+                if not self.closed:
+                    self.pending.append(("investigation", job.id, None))
+                return True
+            return False
+        if await defer_if_interrupted():
+            return
+        try:
+            job.notice_attempts += 1
+            await self.inject("[INVESTIGATION_RESULT] " + json.dumps({
+                "id": job.id, "question": job.question,
+                "observation_id": job.observation["id"],
+                "answer": self.investigation_answer(job)}, ensure_ascii=False))
+            if await defer_if_interrupted():
+                return
+            await self.speak_expert(self.investigation_answer(job))
+        except Exception:
+            job.announced = False
+            if job.notice_attempts < 2:
+                self.pending.append(("investigation", job.id, time.monotonic() + 5))
+            await self.investigations.emit()
+            raise
+
+    async def investigation_tool(self, name, args):
+        zh = self.chinese(self.turn_question) if self.turn_question else self.lang.startswith("zh")
+        if name == "get_investigations":
+            jobs = self.investigations.select(args.get("id"), args.get("selection"))
+            if not args.get("id") and not args.get("selection"):
+                jobs = [j for j in jobs if j.status in ACTIVE] or jobs[-1:]
+            if not jobs:
+                answer = "目前没有调查任务。" if zh else "There are no investigations yet."
+            else:
+                answer = " ".join(self.investigation_answer(j, chinese=zh) for j in jobs[:3])
+                if len(jobs) > 3:
+                    answer += f" 另有 {len(jobs) - 3} 项可在屏幕查看。" if zh else f" There are {len(jobs) - 3} more on screen."
+                if self.may_speak():
+                    for job in jobs[:3]:
+                        if job.status not in ACTIVE:
+                            job.announced = True
+                    await self.investigations.emit()
+            return {"ok": True, "answer": answer, "investigations": [j.payload() for j in jobs]}
+        action = args.get("action")
+        if action not in ("cancel", "retry"):
+            raise ValueError("Investigation action must be cancel or retry")
+        jobs = self.investigations.select(args.get("id"), args.get("selection") or "latest",
+            active=action == "cancel" and not args.get("id") and not args.get("selection"))
+        if not jobs:
+            return {"ok": False, "answer": "没有匹配的调查任务。" if zh else "There is no matching investigation."}
+        if action == "cancel":
+            cancelled = [j.id for j in jobs if await self.investigations.cancel(j)]
+            answer = (("已取消调查 " + "、".join(cancelled) + "。") if zh else
+                      "Cancelled investigation " + ", ".join(cancelled) + ".") if cancelled else (
+                      "这些调查已结束。" if zh else "Those investigations have already ended.")
+            return {"ok": True, "answer": answer, "cancelled": cancelled}
+        if len(jobs) != 1:
+            raise ValueError("Retry one investigation at a time")
+        old = jobs[0]
+        if old.status in ACTIVE:
+            return {"ok": True, "answer": self.investigation_answer(old, chinese=zh)}
+        if not self.expert.available:
+            from expert import fallback
+            return fallback(self.turn_question or old.question, "not_configured")
+        job = await self.investigations.submit(old.question, old.observation, parent_id=old.id)
+        return {"ok": True, "investigation_id": job.id,
+                "answer": f"已用原问题和原观察证据重新安排调查 {job.id}。" if zh else
+                          f"Investigation {job.id} is scheduled using the original question and evidence."}
 
     async def speak_expert(self, answer):
         # Keep metadata/hints out of the speech task; a general answer prompt
         # otherwise encourages Higgs to elaborate or translate the decision.
         self.expert_readout = answer
         try:
-            await self.generate("answer")
+            return await self.generate("answer")
         finally:
             self.expert_readout = None
 
     async def answer_vision(self, observation_id):
         obs = self.observations.get(observation_id)
         input_revision = self.input_revision
-        if not obs or obs.status != "open" or self.focus != obs.id or not self.may_speak():
+        if not obs or obs.status != "open" or self.focus != obs.id:
             return
         if obs.uncertain and self.expert.available:
-            # Give a short capture burst time to land; snapshot validation below
-            # also rejects frames arriving during the model call.
-            await asyncio.sleep(1)
-            if (self.focus != obs.id or obs.status != "open"
-                    or self.input_revision != input_revision or not self.may_speak()):
-                return
             question = "根据现有证据，这是什么？不确定时告诉我还需要拍什么。" if self.lang.startswith("zh") else (
                 "What is this organism, based on the evidence? If uncertain, what should I capture next?")
-            result = await self.ask_expert(question, obs)
-            if result.get("suppress_answer") and self.input_revision != input_revision:
-                return
-            # An unavailable expert must not prevent the existing BioCLIP answer.
+            try:
+                result = await self.ask_expert(question, obs, origin="vision")
+            except ValueError:
+                result = {"ok": False}  # A full research queue preserves basic Look.
             if result.get("ok"):
-                if self.may_speak():
-                    await self.inject("[EXPERT] " + json.dumps(result, ensure_ascii=False))
-                    if self.expert_result_current(result):
-                        await self.speak_expert(result["answer"])
+                if self.may_speak() and self.input_revision == input_revision and self.focus == obs.id:
+                    await self.speak_expert(result["answer"])
                 return
         if (self.focus == obs.id and obs.status == "open" and self.may_speak()
                 and self.input_revision == input_revision):
@@ -613,6 +730,10 @@ class Session:
                                  + json.dumps([r["en"] for r in self.suggestions.values()])
                                  + "\nCurrent focus snapshot (context only, not a new sighting): "
                                  + json.dumps(focus_context)
+                                 + "\nInvestigations (context only; never invent progress): "
+                                 + json.dumps([{**{k: row[k] for k in ("id", "species", "status", "stage")},
+                                                "question": row["question"][:200]}
+                                               for row in self.investigations.payload()["items"][-8:]])
                                  if phase == "route" else answer_instructions),
                 "tools": TOOLS if phase == "route" else [],
                 "tool_choice": "required" if phase == "route" else "none"}
@@ -720,6 +841,11 @@ class Session:
             if user is not None:
                 self.pending.remove(user)
                 self.pending.appendleft(user)
+            else:
+                vision = next((p for p in self.pending if p[0] == "vision"), None)
+                if vision is not None:
+                    self.pending.remove(vision)
+                    self.pending.appendleft(vision)
             kind, value, stopped = self.pending[0]
             if kind == "text" and stopped is not None:
                 # Merge consecutive queued utterances into one turn (backlog after a slow turn).
@@ -737,6 +863,11 @@ class Session:
                                      or time.monotonic() < self.play_until
                                      or time.monotonic() - self.last_proactive < SUGGEST_INTERVAL):
                 continue
+            if kind == "investigation" and (self.awaiting_transcript or self.quiet
+                    or time.monotonic() < self.play_until
+                    or any(c.playback_active for c in self.playback_clients())
+                    or self.echo_blocked() or (stopped is not None and time.monotonic() < stopped)):
+                continue
             self.pending.popleft()
             if kind == "notify":
                 batch = self.suggestion_batch()
@@ -744,9 +875,13 @@ class Session:
                     self.work_ready.set()
                     continue
             self.active = True
-            self.turn_stopped_at = stopped
+            self.turn_stopped_at = stopped if kind in ("text", "audio") else None
             try:
-                if kind == "vision":
+                if kind == "investigation":
+                    job = self.investigations.jobs.get(value)
+                    if job is not None:
+                        await self.investigation_notice(job)
+                elif kind == "vision":
                     await self.answer_vision(value)
                 elif kind == "notify":
                     self.proactive_turn = True
@@ -771,7 +906,8 @@ class Session:
                 raise
             except Exception as exc:
                 self.log("turn_failed", error_type=type(exc).__name__)
-                await self.error("Turn failed; please try again.")
+                if kind != "investigation":
+                    await self.error("Turn failed; please try again.")
             finally:
                 self.turn_question = ""
                 self.proactive_turn = False
@@ -814,14 +950,12 @@ class Session:
         self.log("tool", name=name, ok=result.get("ok", True))
         if result.get("suppress_answer"):
             return
-        if name == "ask_expert" and result.get("context") and not self.expert_result_current(result):
-            return
-        if name in ("speak", "get_checklist", "recent_sounds", "nearby_species", "get_observation", "ask_expert", "describe") and self.may_speak():
+        if name in ("speak", "get_checklist", "recent_sounds", "nearby_species", "get_observation", "ask_expert", "describe", "get_investigations", "manage_investigation") and self.may_speak():
             if (getattr(self, "turn_stale", False) or (self.turn_stopped_at is not None
                     and time.monotonic() - self.turn_stopped_at > 12)):
                 self.log("stale_answer_skipped")  # answering a question asked >12 s ago is confusing
                 return
-            if name == "ask_expert" and result.get("answer"):
+            if name in ("ask_expert", "get_investigations", "manage_investigation") and result.get("answer"):
                 await self.speak_expert(result["answer"])
             else:
                 await self.generate("answer")
@@ -1030,6 +1164,8 @@ class Session:
         return next(dict(r) for r in self.items if r["sci"] == taxon["sci"])
 
     async def tool(self, name, args):
+        if name in ("get_investigations", "manage_investigation"):
+            return await self.investigation_tool(name, args)
         if name == "look":
             return await self.request_look(args.get("hint", ""), args.get("group"))
         if name == "new_observation":
@@ -1351,6 +1487,12 @@ class Session:
             await self.state()
             await self.phone_json({"type": "checklist", "items": [dict(r) for r in self.items]})
             await self.broadcast_suggestions()
+            await self.phone_json(self.investigations.payload())
+        elif ty == "investigation_action":
+            result = await self.investigation_tool("manage_investigation", {
+                "id": event["id"], "action": event["action"]})
+            if not result.get("ok"):
+                raise ValueError(result.get("answer", "Investigation action failed"))
         elif ty == "suggestion_action":
             action = event.get("action")
             if action not in ("accept", "dismiss"):
@@ -1445,6 +1587,7 @@ class Session:
 
     async def close(self):
         self.closed = True
+        await self.investigations.close()
         tasks = self.tasks + [t for t in (self.bird_task, self.playback_task) if t is not None]
         for task in tasks:
             task.cancel()
@@ -1497,6 +1640,7 @@ class Client:
             for obs in list(s.observations.values()):
                 await self.send_json({"type": "observation", **obs.payload(), "focus": s.focus == obs.id})
             await self.send_json(s.suggestions_payload())
+            await self.send_json(s.investigations.payload())
             while True:
                 packet = await self.phone.receive()
                 if packet["type"] == "websocket.disconnect":
@@ -1511,7 +1655,7 @@ class Client:
                         event = json.loads(packet["text"])
                         if not isinstance(event, dict):
                             raise ValueError("JSON message must be an object")
-                        if self.role == "display" and event.get("type") not in ("hello", "text", "edit", "delete", "tap", "suggestion_action", "playback", "look", "observation_action"):
+                        if self.role == "display" and event.get("type") not in ("hello", "text", "edit", "delete", "tap", "suggestion_action", "playback", "look", "observation_action", "investigation_action"):
                             raise ValueError("Display cannot control microphone or mode")
                         if event.get("type") == "hello" and self.role == "display":
                             await self.send_json(s.state_payload())

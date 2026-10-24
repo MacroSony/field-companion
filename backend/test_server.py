@@ -80,7 +80,7 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_hello_and_vad(self):
         await self.c.handle_phone({"type": "hello", "lang": "zh"})
-        self.assertEqual([e["type"] for e in self.phone.events], ["state", "checklist", "suggestions"])
+        self.assertEqual([e["type"] for e in self.phone.events], ["state", "checklist", "suggestions", "investigations"])
         vad = self.c.session()["audio"]["input"]["turn_detection"]
         self.assertFalse(vad["create_response"])
         self.assertFalse(vad["interrupt_response"])  # manual barge-in only
@@ -376,10 +376,14 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         confirmed = [o for o in self.c.observations.values() if o.status == "confirmed"]
         self.assertEqual(len(confirmed), 2)
         self.assertTrue(all(o.detections[0].kind == "sound" for o in confirmed))
+        self.c.expert = SimpleNamespace(available=True, answer=AsyncMock())
         with patch.object(self.c.expert, "answer", new=AsyncMock(return_value={
                 "ok": True, "status": "completed", "action": "clarify", "answer": "Please look closer."})) as expert:
             await self.c.tool("ask_expert", {"question": "What is it?"})
-        self.assertEqual(expert.call_args.args[1]["id"], focus.id)
+            async with asyncio.timeout(2):
+                while not expert.await_count:
+                    await asyncio.sleep(.005)
+            self.assertEqual(expert.call_args.args[1]["id"], focus.id)
 
     async def test_sound_and_voice_records_share_derived_checklist_edits(self):
         self.seed_suggestions(1)
@@ -641,16 +645,16 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         obs.fused = [candidate]
         obs.detections = [s.Detection("photo-evidence", "image", s.now_iso(), [candidate])]
         context = self.c.config("route")["instructions"].split("\nCurrent focus snapshot (context only, not a new sighting): ")[1]
-        snapshot = json.loads(context)
+        snapshot = json.loads(context.splitlines()[0])
         self.assertEqual(snapshot["id"], obs.id)
         self.assertEqual(snapshot["top3"][0]["sci"], "Cyanocitta cristata")
         self.assertEqual(snapshot["image_detections"], 1)
         await self.c.tool("confirm_observation", {"count": 2})
         context = self.c.config("route")["instructions"].split("\nCurrent focus snapshot (context only, not a new sighting): ")[1]
-        self.assertEqual(json.loads(context)["status"], "confirmed")
+        self.assertEqual(json.loads(context.splitlines()[0])["status"], "confirmed")
         await self.c.tool("discard_observation", {})
         context = self.c.config("route")["instructions"].split("\nCurrent focus snapshot (context only, not a new sighting): ")[1]
-        self.assertIsNone(json.loads(context))
+        self.assertIsNone(json.loads(context.splitlines()[0]))
 
     async def test_checklist_aggregation_maps_edits_to_observations(self):
         a = self.seed(count=2)

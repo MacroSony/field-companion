@@ -6,12 +6,14 @@ jobs. Ordinary sightings, count changes and checklist queries do not call GPT.
 
 ## Entry points
 
-- Higgs calls `ask_expert(question)` for candidate comparisons, alternative-ID
-  questions and species facts about the focus (diet, habitat, behaviour).
+- Higgs calls `ask_expert(question)` to schedule a background investigation for
+  candidate comparisons, alternative-ID questions and species facts about the
+  focus (diet, habitat, behaviour). The tool returns an acknowledgement/task ID
+  immediately; the voice worker continues handling subsequent turns.
   The turn worker supplies the original typed/STT question, so a router rewrite
   cannot silently translate it or add a species hypothesis.
-- An uncertain visual response calls the expert once for the current observation,
-  after a short capture-burst delay. A confident visual response uses the existing
+- An uncertain visual response schedules an investigation for the current
+  observation. A confident visual response uses the existing
   BioCLIP answer. There is no GPT request per uploaded frame.
 - Missing focus prompts the user to look first. Disabled/unavailable GPT preserves
   the basic visual path; explicit expert questions get a brief unavailable answer.
@@ -73,12 +75,14 @@ capture loop or new frontend protocol message.
 - The expert cannot replace `fused`, select a different confirmed species, count
   organisms or log observations. Alternative-ID conflicts require more evidence
   or clarification. Confirmation still uses the current fusion top candidate.
-- Results are discarded when focus, evidence/status or user input changes during
-  a request. A late-frame result can fall back to the newest basic vision answer;
-  a new user question suppresses the previous answer entirely.
-- The total expert deadline defaults to seven seconds, including source lookup
-  (at most two seconds). No automatic OpenAI request retry. HTTP 429 starts a
-  bounded cooldown (Retry-After or 15 seconds). Existing quiet-mode rules apply.
+- Background results remain attached to their original evidence, even after
+  another question or focus change. A capture hint updates the live observation
+  only if it still matches that snapshot. Completion speech yields to the user
+  and waits in Quiet mode; the result remains on its task card.
+- Background calls default to 120 seconds, with a 180-second outer task budget.
+  Direct standalone provider calls still default to seven seconds. Source lookup
+  remains bounded to two seconds. No automatic OpenAI request retry. HTTP 429
+  starts a bounded cooldown (Retry-After or 15 seconds).
 - Logs contain only safe status, exception type, latency and model metadata.
 
 ## Configuration and verification
@@ -113,3 +117,5 @@ evaluation and an actual phone → camera → BioCLIP → GPT → Higgs field te
 separate acceptance checks.
 See [LOOK_EXPERT_TESTING.md](LOOK_EXPERT_TESTING.md) for the latest Look/expert
 validation, reproduced handoff bugs, fixes and remaining combined-field checks.
+See [INVESTIGATIONS.md](INVESTIGATIONS.md) for the newer background queue,
+progress/cancel/retry controls, time limits, session retention and live test.

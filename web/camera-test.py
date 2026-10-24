@@ -10,6 +10,7 @@ import io
 import json
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 import uuid
 from urllib.request import urlopen
 
@@ -31,16 +32,47 @@ def serve(port):
             super().__init__(session_id)
             self.expert = NaturalistExpert(settings=Settings(enabled=False))
             self.names = {"Turdus migratorius": {"sci": "Turdus migratorius", "en": "American Robin"}}
+            self.research_release = asyncio.Event()
 
         def allowed_species(self):
             return set()
 
         def start(self):
             self.connected = True
-            self.tasks = [asyncio.create_task(self.focus_watch())]
+            self.tasks = [asyncio.create_task(self.focus_watch()),
+                          asyncio.create_task(self.turn_worker()), asyncio.create_task(self.suggestion_loop())]
 
         async def ingest_audio(self, pcm):
             pass  # The test deliberately makes no BirdNET or voice API request.
+
+        async def rt_send(self, event):
+            pass  # Model transport is a fixture too, including result injection.
+
+        async def generate(self, phase):
+            if phase == "answer" and self.expert_readout:
+                await self.phone_json({"type": "transcript", "role": "assistant",
+                                       "text": self.expert_readout, "final": True})
+            return {"status": "completed", "output": []}
+
+        async def fixture_expert(self, question, observation, *, on_progress, **kwargs):
+            await on_progress("analyzing")
+            await self.research_release.wait()
+            return {"ok": True, "status": "completed", "action": "answer",
+                    "answer": "Fixture result for the original bird.", "hint": "", "sources": []}
+
+        async def handle_phone(self, event, client=None):
+            text = event.get("text", "")
+            if event.get("type") == "text" and text.startswith("fixture:"):
+                if text == "fixture:finish":
+                    self.research_release.set()
+                elif text == "fixture:checklist":
+                    await self.phone_json({"type": "transcript", "role": "assistant",
+                                           "text": "Fixture checklist is still responsive.", "final": True})
+                else:
+                    self.expert = SimpleNamespace(available=True, answer=self.fixture_expert)
+                    await self.tool("ask_expert", {"question": text})
+                return
+            return await super().handle_phone(event, client)
 
     def classify(jpeg, crop, allowed):
         image = Image.open(io.BytesIO(jpeg))
@@ -55,6 +87,15 @@ def serve(port):
 
 async def test(port, cdp):
     OUT.mkdir(parents=True, exist_ok=True)
+    # The hidden server can still be importing dependencies when Chrome starts.
+    async with asyncio.timeout(30):
+        while True:
+            try:
+                response = await asyncio.to_thread(urlopen, f"http://localhost:{port}/", timeout=1)
+                response.close()
+                break
+            except OSError:
+                await asyncio.sleep(.2)
     targets = json.load(urlopen(f"http://127.0.0.1:{cdp}/json/list"))
     target = next(t for t in targets if t["type"] == "page")
     pending, events, sequence = {}, [], 0
@@ -114,7 +155,22 @@ async def test(port, cdp):
             window.__requests.push(constraints);
             if ((constraints.video && window.__denyCamera) || (constraints.audio && window.__denyMic))
               throw new DOMException('Synthetic permission denial', 'NotAllowedError');
-            const stream = await gum(constraints); window.__streams.push(stream); return stream;
+            let stream;
+            if (constraints.video) {
+              // A deterministic video MediaStream exercises real video/canvas
+              // capture without Windows fake-camera placeholder-frame races.
+              const canvas = document.createElement('canvas'); canvas.width=1920; canvas.height=1080;
+              const ctx = canvas.getContext('2d'); let frame=0;
+              const draw = () => {
+                ctx.fillStyle='#254d35'; ctx.fillRect(0,0,1920,1080);
+                ctx.fillStyle='#b9d98a'; ctx.fillRect(700+(frame++%5)*2,300,400,450);
+                for(let x=0;x<1920;x+=80){ctx.fillStyle=x%160?'#366849':'#172e20';ctx.fillRect(x,0,16,1080);}
+              };
+              draw(); stream=canvas.captureStream(20);
+              const timer=setInterval(draw,50), track=stream.getVideoTracks()[0], stop=track.stop.bind(track);
+              track.stop=()=>{clearInterval(timer);stop();};
+            } else stream=await gum(constraints);
+            window.__streams.push(stream); return stream;
           };
           navigator.geolocation.getCurrentPosition = callback => { window.__gps = callback; };
           const fetchOriginal = window.fetch.bind(window);
@@ -156,6 +212,7 @@ async def test(port, cdp):
         results["permissionAndMicIsolation"] = True
         await js("window.__denyCamera=false; document.getElementById('camera-toggle').click()")
         await until("!document.getElementById('camera-shutter').disabled")
+        await until("document.getElementById('camera-preview').videoWidth >= 64 && document.getElementById('camera-preview').videoHeight >= 64")
         await js("document.getElementById('camera-zoom').value='2'; document.getElementById('camera-zoom').dispatchEvent(new Event('input')); document.getElementById('camera-viewport').dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true}))")
         await js("document.getElementById('camera-shutter').click()")
         await until("document.querySelectorAll('#observation-evidence img').length === 1 && !document.getElementById('camera-shutter').disabled")
@@ -219,6 +276,37 @@ async def test(port, cdp):
         results["latePermissionReleased"] = True
         await js("navigator.mediaDevices.getUserMedia=window.__gumSaved; document.getElementById('start').click()")
         await until("document.getElementById('connection').classList.contains('online')")
+        async def typed(text):
+            await js("document.getElementById('text-input').value=" + json.dumps(text) + "; document.getElementById('text-form').requestSubmit()")
+        await typed("fixture:research-one")
+        await until("document.querySelector('[data-id=R1] .investigation-status')?.textContent === 'Analyzing evidence'")
+        await typed("fixture:research-two")
+        await until("document.querySelector('[data-id=R2] .investigation-status')?.textContent.includes('Queued')")
+        await typed("fixture:checklist")
+        await until("document.getElementById('assistant-caption').textContent.includes('still responsive')")
+        results["investigationDoesNotBlockConversation"] = True
+        await js("document.querySelector('[data-id=R2]').open=true; document.querySelector('[data-id=R2] button[data-action=cancel]').click()")
+        await until("document.querySelector('[data-id=R2] .investigation-status')?.textContent === 'Cancelled'")
+        sockets_before_reconnect = await js("window.__sockets.length")
+        await js("window.__sockets.at(-1).close()")
+        await until("window.__sockets.length > " + str(sockets_before_reconnect) + " && window.__sockets.at(-1).readyState === 1 && document.getElementById('connection').classList.contains('online') && document.querySelector('[data-id=R1] .investigation-status')?.textContent === 'Analyzing evidence'")
+        results["investigationReconnectSnapshot"] = True
+        await js("document.getElementById('quiet').click()")
+        await typed("fixture:finish")
+        await until("document.querySelector('[data-id=R1] .investigation-status')?.textContent === 'Ready'")
+        assert not await js("document.getElementById('assistant-caption').textContent.includes('Investigation R1')")
+        assert await js("document.querySelector('[data-id=R1] .investigation-answer').textContent.includes('original bird')")
+        await js("document.getElementById('quiet').click()")
+        await until("document.getElementById('assistant-caption').textContent.includes('Investigation R1')")
+        await js("document.querySelector('[data-id=R2]').open=true; document.querySelector('[data-id=R2] button[data-action=retry]').click()")
+        await until("document.querySelector('[data-id=R3] .investigation-status')?.textContent === 'Ready'")
+        assert await js("document.querySelector('[data-id=R3] .investigation-question').textContent === 'fixture:research-two'")
+        results["investigationCancelRetryQuietAndCompletion"] = True
+        shot = await call("Page.captureScreenshot", format="png", captureBeyondViewport=True)
+        (OUT / "investigations-phone.png").write_bytes(base64.b64decode(shot["data"]))
+        await js("document.getElementById('stop').click()")
+        await js("navigator.mediaDevices.getUserMedia=window.__gumSaved; document.getElementById('start').click()")
+        await until("document.getElementById('connection').classList.contains('online')")
         count = await js("window.__sockets.length")
         async with connect(f"ws://127.0.0.1:{port}/ws?session={session}&role=mic") as second:
             await second.send(json.dumps({"type": "hello"}))
@@ -230,6 +318,8 @@ async def test(port, cdp):
         await call("Page.navigate", url=origin + "/?display=1&session=" + session)
         await until("document.getElementById('connection').classList.contains('online') && !document.getElementById('active-observation').hidden")
         assert await js("window.__requests.length") == 0
+        assert await js("document.getElementById('display-status').textContent.includes('R3 ready')")
+        assert await js("document.getElementById('investigations-section').offsetParent === null")
         assert not await js("document.documentElement.scrollWidth > innerWidth || document.documentElement.scrollHeight > innerHeight")
         shot = await call("Page.captureScreenshot", format="png", captureBeyondViewport=False)
         (OUT / "display.png").write_bytes(base64.b64decode(shot["data"]))

@@ -8,7 +8,7 @@
   document.body.classList.toggle('display-mode', displayMode);
   const state = {
     running: false, starting: false, connected: false, paused: false, quiet: false,
-    listening: false, speaking: false, items: [], heard: [], coords: null,
+    listening: false, speaking: false, items: [], heard: [], investigations: [], coords: null,
     startedAt: null, endedAt: null, model: '', retry: 0
   };
   let earphones = false, firstAudioTip = true;
@@ -73,8 +73,14 @@
     const connection = $('connection');
     connection.className = `connection ${state.connected ? 'online' : state.running ? 'connecting' : ''}`;
     connection.lastElementChild.textContent = state.connected ? 'Connected' : state.running ? 'Connecting' : 'Offline';
-    if ($('display-status')) $('display-status').textContent = `${state.connected ? '● Live' : '○ Connecting'} · ${playing ? 'Assistant speaking' : 'Session ' + session}`;
-    document.querySelectorAll('.counter button, .delete-button').forEach(button => { button.disabled = !state.connected; });
+    if ($('display-status')) {
+      const job = state.investigations.find(item => item.status === 'running')
+        || state.investigations.find(item => item.status === 'queued')
+        || state.investigations[state.investigations.length - 1];
+      const status = {running: 'investigating', queued: 'queued', completed: 'ready', cancelled: 'cancelled', failed: 'failed', timed_out: 'time limit'};
+      $('display-status').textContent = `${state.connected ? '● Live' : '○ Connecting'} · ${playing ? 'Assistant speaking' : 'Session ' + session}${job ? ` · ${job.id} ${status[job.status] || ''}` : ''}`;
+    }
+    document.querySelectorAll('.counter button, .delete-button, .investigation-actions button').forEach(button => { button.disabled = !state.connected; });
   }
 
   function saveMic(deviceId, label) {
@@ -404,6 +410,9 @@
         break;
       case 'heard': renderHeard(message); break;
       case 'suggestions': if (Array.isArray(message.items)) renderSuggestions(message.items); break;
+      case 'investigations':
+        if (Array.isArray(message.items)) { state.investigations = message.items; renderInvestigations(); updateControls(); }
+        break;
       case 'transcript': {
         const target = message.role === 'user' ? $('user-caption') : message.role === 'assistant' ? $('assistant-caption') : null;
         if (target && typeof message.text === 'string') {
@@ -427,6 +436,55 @@
     if (className) node.className = className;
     if (text !== undefined) node.textContent = text;
     return node;
+  }
+  function renderInvestigations() {
+    const list = $('investigations'), section = $('investigations-section');
+    if (!list || !section) return;
+    const previous = new Map([...list.children].map(node => [node.dataset.id, {open: node.open, status: node.dataset.status}]));
+    list.replaceChildren();
+    section.hidden = !state.investigations.length;
+    const active = state.investigations.filter(job => ['queued', 'running'].includes(job.status)).length;
+    $('investigations-count').textContent = active ? `${active} active` : 'Up to date';
+    for (const job of [...state.investigations].reverse()) {
+      const card = element('details', 'investigation');
+      card.dataset.id = job.id; card.dataset.status = job.status;
+      const old = previous.get(job.id);
+      card.open = old?.status === job.status ? old.open : job.status === 'completed';
+      const summary = element('summary');
+      summary.append(element('strong', '', `${job.id}${job.species ? ` · ${job.species}` : ''}`));
+      const labels = {queued: `Queued · ${job.queue_position || 1}`, retrieving: 'Checking sources',
+        analyzing: 'Analyzing evidence', completed: 'Ready', failed: 'Could not finish',
+        timed_out: 'Time limit reached', cancelled: 'Cancelled'};
+      const status = element('span', 'investigation-status', labels[job.stage] || labels[job.status] || 'Working');
+      status.setAttribute('role', 'status'); summary.append(status); card.append(summary);
+      card.append(element('p', 'investigation-question', job.question));
+      if (job.result?.answer && job.status === 'completed') card.append(element('p', 'investigation-answer', job.result.answer));
+      if (['failed', 'timed_out'].includes(job.status)) card.append(element('p', 'investigation-answer',
+        'Your question and original evidence are saved. You can investigate again.'));
+      if (Array.isArray(job.result?.sources)) {
+        const sources = element('div', 'investigation-sources');
+        for (const source of job.result.sources.slice(0, 4)) {
+          let url;
+          try { url = new URL(source.url); } catch (_) { continue; }
+          if (!['https:', 'http:'].includes(url.protocol)) continue;
+          const link = element('a', '', source.title || source.sci || 'Source');
+          link.href = url.href; link.target = '_blank'; link.rel = 'noopener noreferrer'; sources.append(link);
+        }
+        card.append(sources);
+      }
+      if (!displayMode) {
+        const actions = element('div', 'investigation-actions');
+        const running = ['queued', 'running'].includes(job.status);
+        const button = element('button', 'look-button', running ? 'Cancel investigation' : 'Investigate again');
+        button.type = 'button'; button.disabled = !state.connected;
+        button.dataset.action = running ? 'cancel' : 'retry';
+        button.addEventListener('click', () => {
+          if (send({type: 'investigation_action', id: job.id, action: button.dataset.action})) button.disabled = true;
+        });
+        actions.append(button); card.append(actions);
+      }
+      list.append(card);
+    }
   }
   const icons = {
     voice: '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M6 10v2a6 6 0 0 0 12 0v-2M12 18v4M9 22h6"/></svg>',

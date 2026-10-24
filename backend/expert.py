@@ -19,7 +19,7 @@ from typing import Literal
 from urllib.parse import quote
 
 from dotenv import dotenv_values
-from openai import AsyncOpenAI, APIStatusError
+from openai import AsyncOpenAI, APIStatusError, APITimeoutError
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model
 import requests
 
@@ -227,7 +227,7 @@ class NaturalistExpert:
     def available(self):
         return self.settings.enabled and bool(self.settings.api_key)
 
-    async def answer(self, question, observation):
+    async def answer(self, question, observation, *, timeout=None, on_progress=None):
         if not isinstance(question, str) or not question.strip() or len(question) > 2000:
             raise ValueError("expert question must contain 1–2000 characters")
         if not self.available:
@@ -237,15 +237,20 @@ class NaturalistExpert:
         start = time.monotonic()
         chinese_question = bool(re.search(r"[\u3400-\u9fff]", question))
         language = "Chinese" if chinese_question else "English"
+        deadline = self.settings.timeout if timeout is None else timeout
         try:
-            async with asyncio.timeout(self.settings.timeout):
+            async with asyncio.timeout(deadline):
+                if on_progress:
+                    await on_progress("retrieving")
                 try:
                     sources = await asyncio.wait_for(self.knowledge.sources(observation), 2)
                 except TimeoutError:
                     sources = []
                 evidence = compact_observation(observation)
+                if on_progress:
+                    await on_progress("analyzing")
                 async with self.client_factory(api_key=self.settings.api_key,
-                                               max_retries=0, timeout=self.settings.timeout) as client:
+                                               max_retries=0, timeout=deadline) as client:
                     response = await client.responses.parse(
                         model=self.settings.model, instructions=PROMPT + "\nRequired response language: " + language + ".",
                         input=json.dumps({"question": question, "observation": evidence,
@@ -289,7 +294,7 @@ class NaturalistExpert:
                         "model": self.settings.model,
                         "sources": [{k: v for k, v in s.items() if k != "extract"}
                                     for s in sources if s["id"] in decision.source_ids]}
-        except TimeoutError:
+        except (TimeoutError, APITimeoutError):
             return fallback(question, "timeout")
         except asyncio.CancelledError:
             raise

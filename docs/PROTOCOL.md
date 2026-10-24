@@ -20,6 +20,8 @@ One WebSocket per phone: `wss://<host>/ws`. The backend also serves the web app 
   - `{"type":"mode","quiet":true|false}`: quiet mode. Logging still works, but the assistant only speaks after a tap.
   - `{"type":"tap"}`: push-to-talk / "talk to me now". The next utterance is treated as addressed.
   - `{"type":"text","text":"..."}`: typed input (debug fallback).
+  - `{"type":"investigation_action","id":"R1","action":"cancel"|"retry"}`:
+    manage a background investigation; retry uses its original question/evidence.
   - `{"type":"edit","id":"<obs id>","count":3}` / `{"type":"delete","id":"<obs id>"}`: manual checklist edits from the UI.
 
 ## Backend → phone
@@ -33,6 +35,10 @@ One WebSocket per phone: `wss://<host>/ws`. The backend also serves the web app 
   - `{"type":"candidates","items":[{"sci":"...","en":"...","zh":"...","photo":"https://...","why":"..."}]}`: identification candidates to show as cards (describe-to-ID / photo ID).
   - `{"type":"state","listening":true,"speaking":false,"model":"higgs-realtime-1.5-preview","connected":true,"echo_guard":true,"session":"demo"}`: status for the UI indicator. `echo_guard` describes the selected policy, not whether input is currently being dropped.
   - `{"type":"error","message":"..."}`
+  - `{"type":"investigations","items":[{"id":"R1","question":"...","observation_id":"ob3","species":"Blue Jay","status":"running","stage":"analyzing","queue_position":0,"announced":false,"result":null}],"capacity":5,"timeout_seconds":180}`:
+    full investigation state on connect/hello and task changes. Completed results
+    contain the existing expert decision, final answer and cited source metadata.
+    See [INVESTIGATIONS.md](INVESTIGATIONS.md) for all states and retention rules.
 
 ## Notes
 - Audio direction asymmetry is intentional: 48 kHz in (BirdNET needs it), 24 kHz out (Higgs output).

@@ -154,6 +154,16 @@ class ExpertProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "timeout")
         self.assertEqual(len(self.bodies), 1)
 
+    async def test_background_deadline_override_and_real_progress_callbacks(self):
+        provider = self.provider(settings=e.Settings(api_key="test", timeout=.01), delay=.05)
+        stages = []
+        async def progress(stage):
+            stages.append(stage)
+        result = await provider.answer("What is it?", observation(), timeout=1, on_progress=progress)
+        self.assertTrue(result["ok"])
+        self.assertEqual(stages, ["retrieving", "analyzing"])
+        self.assertEqual(len(self.bodies), 1)
+
     async def test_service_error_does_not_log_exception_contents(self):
         provider = self.provider()
         provider.client_factory = Mock(side_effect=RuntimeError("SECRET-MARKER"))
@@ -244,6 +254,9 @@ class ExpertSessionTests(unittest.IsolatedAsyncioTestCase):
         self.c.mic = SimpleNamespace(send_json=AsyncMock())
         fused = deepcopy(self.obs.fused)
         await self.route("ask_expert", {"question": "Could it be a Hairy?"})
+        async with asyncio.timeout(2):
+            while self.c.investigations.jobs["R1"].status != "completed":
+                await asyncio.sleep(.005)
         self.c.expert.answer.assert_awaited_once()
         self.assertEqual(self.obs.hint, "Zoom on the head")
         self.assertEqual(self.obs.fused, fused)
@@ -286,42 +299,7 @@ class ExpertSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.c.expert_readout)
         self.assertEqual(self.c.config("answer"), normal)
 
-    async def test_focus_changes_evidence_changes_and_new_questions_drop_results(self):
-        async def change_focus(*args):
-            await self.c.new_focus()
-            return {"ok": True, **decision()}
-        self.c.expert.answer.side_effect = change_focus
-        await self.route("ask_expert", {"question": "What is it?"})
-        self.c.generate.assert_not_awaited()
-        self.assertEqual(self.obs.hint, "")
-
-        for mutation in (lambda: self.obs.detections.append(s.Detection("d2", "image", s.now_iso())),
-                         lambda: setattr(self.c, "input_revision", self.c.input_revision + 1)):
-            self.c.focus = self.obs.id
-            self.obs.status = "open"
-            async def mutate(*args):
-                mutation()
-                return {"ok": True, **decision()}
-            self.c.expert.answer.side_effect = mutate
-            result = await self.c.tool("ask_expert", {"question": "What is it?"})
-            self.assertTrue(result["suppress_answer"])
-            self.assertEqual(self.obs.hint, "")
-
-    async def test_focus_change_during_hint_broadcast_suppresses_speech(self):
-        async def change_focus(event):
-            self.c.focus = "other"
-        self.c.phone_json.side_effect = change_focus
-        await self.route("ask_expert", {"question": "What is it?"})
-        self.c.generate.assert_not_awaited()
-
-    async def test_new_input_during_tool_output_suppresses_speech(self):
-        async def new_input(event):
-            self.c.input_revision += 1
-        self.c.rt_send.side_effect = new_input
-        await self.route("ask_expert", {"question": "What is it?"})
-        self.c.generate.assert_not_awaited()
-
-    async def test_speaker_echo_keeps_expert_context_but_real_barge_in_invalidates(self):
+    async def test_speaker_echo_and_barge_in_preserve_background_investigation(self):
         client = s.Client(SimpleNamespace(send_json=AsyncMock()), self.c)
         self.c.clients.add(client)
         self.c.mic = client
@@ -329,13 +307,11 @@ class ExpertSessionTests(unittest.IsolatedAsyncioTestCase):
             client.earphones = earphones
             self.c.play_until = s.time.monotonic() + 2
             self.c.user_speaking = self.c.awaiting_transcript = False
-            async def incoming_audio(*args):
-                await self.c.handle_rt({"type": "input_audio_buffer.speech_started"})
-                return {"ok": True, "status": "completed", **decision()}
-            self.c.expert.answer.side_effect = incoming_audio
-            result = await self.c.tool("ask_expert", {"question": "What is it?"})
-            self.assertEqual(bool(result.get("suppress_answer")), earphones)
+            result = await self.c.tool("ask_expert", {"question": f"Question {earphones}?"})
+            await self.c.handle_rt({"type": "input_audio_buffer.speech_started"})
+            self.assertEqual(result["status"], "scheduled")
             self.assertEqual(self.c.user_speaking, earphones)
+            self.assertIn(result["investigation_id"], self.c.investigations.jobs)
 
     async def test_simple_checklist_and_count_paths_never_call_expert(self):
         self.obs.status, self.obs.count = "confirmed", 2
@@ -358,37 +334,35 @@ class ExpertSessionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_visual_expert_only_for_uncertain_observation(self):
         await self.c.answer_vision(self.obs.id)
+        async with asyncio.timeout(2):
+            while not self.c.expert.answer.await_count:
+                await asyncio.sleep(.005)
         self.c.expert.answer.assert_awaited_once()
-        self.assertIn("[EXPERT]", self.c.rt_send.call_args.args[0]["item"]["content"][0]["text"])
+        self.assertEqual(self.c.investigations.jobs["R1"].origin, "vision")
         self.c.expert.answer.reset_mock()
         self.obs.uncertain = False
         await self.c.answer_vision(self.obs.id)
         self.c.expert.answer.assert_not_awaited()
         self.assertIn("[VISION]", self.c.rt_send.call_args.args[0]["item"]["content"][0]["text"])
 
-    async def test_visual_expert_failure_uses_original_vision_path(self):
-        self.c.expert.answer.return_value = e.fallback("What is it?", "timeout")
+    async def test_visual_expert_disabled_uses_original_vision_path(self):
+        self.c.expert.available = False
         await self.c.answer_vision(self.obs.id)
         self.assertIn("[VISION]", self.c.rt_send.call_args.args[0]["item"]["content"][0]["text"])
         self.c.generate.assert_awaited_once_with("answer")
+        self.assertEqual(self.c.investigations.jobs, {})
 
-    async def test_late_frame_uses_latest_vision_without_old_expert_answer(self):
-        async def late_frame(*args):
-            self.obs.detections.append(s.Detection("d2", "image", s.now_iso()))
-            return {"ok": True, **decision(answer="OLD EXPERT ANSWER")}
-        self.c.expert.answer.side_effect = late_frame
+    async def test_full_research_queue_keeps_basic_visual_answer(self):
+        self.c.investigations.submit = AsyncMock(side_effect=ValueError("Full"))
         await self.c.answer_vision(self.obs.id)
         content = self.c.rt_send.call_args.args[0]["item"]["content"][0]["text"]
         self.assertIn("[VISION]", content)
-        self.assertNotIn("OLD EXPERT ANSWER", content)
 
-    async def test_new_question_during_vision_suppresses_all_old_speech(self):
-        async def new_question(*args):
-            self.c.input_revision += 1
-            return {"ok": True, **decision()}
-        self.c.expert.answer.side_effect = new_question
+    async def test_old_focus_pending_vision_cannot_start_wrong_investigation(self):
+        await self.c.new_focus()
         await self.c.answer_vision(self.obs.id)
         self.c.generate.assert_not_awaited()
+        self.assertEqual(self.c.investigations.jobs, {})
 
 
 if __name__ == "__main__":
