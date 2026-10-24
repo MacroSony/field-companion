@@ -453,7 +453,7 @@ class Session:
                 "audio": {"input": {"format": {"type": "audio/pcm", "rate": 24000},
                                     "turn_detection": {"type": "server_vad", "threshold": 0.5,
                                                        "prefix_padding_ms": 300, "silence_duration_ms": 600,
-                                                       "create_response": False, "interrupt_response": True},
+                                                       "create_response": False, "interrupt_response": False},
                                     "transcription": {"model": "higgs-stt-3.1"}},
                           "output": {"format": {"type": "audio/pcm", "rate": 24000}}}}
 
@@ -479,7 +479,19 @@ class Session:
         self.first_audio = False
         try:
             await self.rt_send({"type": "response.create"})
-            response = await asyncio.wait_for(self.response_waiter, 45)
+            try:
+                response = await asyncio.wait_for(asyncio.shield(self.response_waiter), 8 if phase == "route" else 25)
+            except asyncio.TimeoutError:
+                # Seen live 10/23: a route response.create got no response at all (no error, no done).
+                self.log("response_timeout", phase=phase)
+                await self.rt_send({"type": "response.cancel"})
+                if phase != "route" or getattr(self, "_retrying", False):
+                    raise
+                self._retrying = True
+                try:
+                    return await self.generate(phase)
+                finally:
+                    self._retrying = False
             if response.get("status") == "failed":
                 raise RuntimeError("Upstream generation failed")
             return response
@@ -504,6 +516,18 @@ class Session:
                 self.pending.remove(user)
                 self.pending.appendleft(user)
             kind, value, stopped = self.pending[0]
+            if kind == "text" and stopped is not None:
+                # Merge consecutive queued utterances into one turn (backlog after a slow turn).
+                parts = [value]
+                while len(self.pending) > 1 and self.pending[1][0] == "text" and self.pending[1][2] is not None:
+                    _, more, stopped = self.pending[1]
+                    del self.pending[1]
+                    parts.append(more)
+                if len(parts) > 1:
+                    value = " ".join(parts)
+                    self.pending[0] = (kind, value, stopped)
+                    self.log("turns_merged", n=len(parts))
+            self.turn_stale = stopped is not None and time.monotonic() - stopped > 12
             if kind == "notify" and (self.awaiting_transcript or not self.may_speak()
                                      or time.monotonic() < self.play_until):
                 continue
@@ -571,6 +595,9 @@ class Session:
             "output": json.dumps(result, ensure_ascii=False)}})
         self.log("tool", name=name, ok=result.get("ok", True))
         if name in ("speak", "get_checklist", "recent_sounds", "nearby_species", "get_observation", "ask_expert", "describe") and self.may_speak():
+            if getattr(self, "turn_stale", False):
+                self.log("stale_answer_skipped")  # answering a question asked >12 s ago is confusing
+                return
             await self.generate("answer")
 
     def latency(self, target):

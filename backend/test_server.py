@@ -81,7 +81,7 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([e["type"] for e in self.phone.events], ["state", "checklist"])
         vad = self.c.session()["audio"]["input"]["turn_detection"]
         self.assertFalse(vad["create_response"])
-        self.assertTrue(vad["interrupt_response"])
+        self.assertFalse(vad["interrupt_response"])  # manual barge-in only
         self.assertEqual(self.c.config("route")["tool_choice"], "required")
         self.assertEqual(self.c.config("answer")["tools"], [])
 
