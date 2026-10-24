@@ -69,6 +69,15 @@ def serve(port):
                 return {"status": "completed", "output": [{"type": "function_call",
                     "name": "look", "call_id": "fixture-look-" + uuid.uuid4().hex,
                     "arguments": "{}"}]}
+            if phase == "route" and self.turn_question == "I saw another animal.":
+                return {"status": "completed", "output": [{"type": "function_call",
+                    "name": "new_observation", "call_id": "fixture-new-subject-" + uuid.uuid4().hex,
+                    "arguments": "{}"}]}
+            if phase == "route" and self.turn_question == "Take the photo for me.":
+                await self.phone_json({"type": "fixture_polite_photo_routed"})
+                return {"status": "completed", "output": [{"type": "function_call",
+                    "name": "look", "call_id": "fixture-photo-" + uuid.uuid4().hex,
+                    "arguments": "{}"}]}
             if phase == "route" and self.turn_question == "What do you think?":
                 return {"status": "completed", "output": [{"type": "function_call",
                     "name": "get_observation", "call_id": "fixture-progress", "arguments": "{}"}]}
@@ -101,6 +110,10 @@ def serve(port):
                 elif text == "fixture:new-subject":
                     await self.handle_rt({"type": "conversation.item.input_audio_transcription.completed",
                         "transcript": "I found another animal. Could you help me check it out?",
+                        "item_id": "voice-" + uuid.uuid4().hex})
+                elif text in ("fixture:bare-new-subject", "fixture:take-photo"):
+                    await self.handle_rt({"type": "conversation.item.input_audio_transcription.completed",
+                        "transcript": "I saw another animal." if text == "fixture:bare-new-subject" else "Take the photo for me.",
                         "item_id": "voice-" + uuid.uuid4().hex})
                 elif text == "fixture:classify-robin":
                     self.fixture_species = "Turdus migratorius"
@@ -569,6 +582,54 @@ async def test(port, cdp):
         assert await js("document.querySelector('.counter output').value") == "1"
         assert not await js("document.getElementById('observation-candidates').textContent.includes('Bald Eagle')")
         results["newSubjectVoiceClearsOldPhotoAndWaitsForStart"] = True
+        await js("document.getElementById('stop').click()")
+        await until("window.__streams.every(s=>s.getTracks().every(t=>t.readyState==='ended'))")
+        # A bare new-animal notice is enough to prepare its own camera. Once
+        # that camera really is ready, a polite photo request confirms locally.
+        bare_session = "new-subject-bare-" + uuid.uuid4().hex[:8]
+        await call("Page.navigate", url=origin + "/?session=" + bare_session)
+        await until("document.readyState === 'complete' && typeof FieldCamera === 'function'")
+        await js("document.getElementById('start').click()")
+        await until("document.getElementById('connection').classList.contains('online')")
+        await js("if(document.getElementById('audio-mode').getAttribute('aria-pressed')!=='true')document.getElementById('audio-mode').click()")
+        await voice_input("fixture:voice-look", earphones=True)
+        await until("window.__messages.some(e=>e.text==='Camera ready. Say start to take a photo.') && !document.getElementById('camera-shutter').disabled")
+        await voice_input("fixture:voice-start", earphones=True)
+        await until("document.querySelectorAll('#observation-evidence img').length === 1 && document.getElementById('observation-candidates').textContent.includes('Bald Eagle') && !document.getElementById('camera-shutter').disabled")
+        old_bare_subject = await js("window.__messages.filter(e=>e.type==='observation' && e.focus).at(-1).id")
+        bare_marker = await js("window.__messages.length")
+        bare_uploads = await js("window.__uploads.length")
+        bare_encodes = await js("window.__encodes.length")
+        await voice_input("fixture:bare-new-subject", earphones=True)
+        await until("window.__messages.slice(" + str(bare_marker) + ").some(e=>e.text==='Camera ready. Say start to take a photo.') && !document.getElementById('camera-shutter').disabled")
+        bare_subject = await js("window.__messages.filter(e=>e.type==='observation' && e.focus).at(-1)")
+        assert bare_subject["id"] != old_bare_subject
+        assert bare_subject["fused"] == [] and bare_subject["detections"] == [] and bare_subject["image_revision"] == 0
+        assert await js("document.querySelectorAll('#observation-evidence img').length === 0 && document.querySelectorAll('#observation-candidates li').length === 0")
+        assert not await js("document.getElementById('observation-candidates').textContent.includes('Bald Eagle')")
+        assert await js("window.__uploads.length") == bare_uploads
+        assert await js("window.__encodes.length") == bare_encodes
+        assert await js("window.__messages.slice(" + str(bare_marker) + ").filter(e=>e.type==='camera_prepare').length") == 1
+        assert not await js("window.__messages.slice(" + str(bare_marker) + ").some(e=>e.type==='capture')")
+        results["bareNewAnimalNoticePreparesFreshCameraWithoutCapture"] = True
+        await js("window.__sockets[0].send(JSON.stringify({type:'text',text:'fixture:classify-robin'}))")
+        polite_marker = await js("window.__messages.length")
+        polite_network_marker = len(events)
+        await voice_input("fixture:take-photo", earphones=True)
+        await until("document.querySelectorAll('#observation-evidence img').length === 1 && document.getElementById('observation-candidates').textContent.includes('American Robin') && !document.getElementById('camera-shutter').disabled")
+        polite_messages = await js("window.__messages.slice(" + str(polite_marker) + ")")
+        assert not any(e.get("type") in ("fixture_polite_photo_routed", "camera_prepare") for e in polite_messages)
+        assert sum(e.get("type") == "capture" for e in polite_messages) == 1
+        feedback_before_capture(polite_network_marker)
+        polite_photo = await js("window.__messages.filter(e=>e.type==='observation' && e.focus).at(-1)")
+        assert polite_photo["id"] == bare_subject["id"] and polite_photo["image_revision"] == 1
+        assert len(polite_photo["detections"]) == 1
+        assert await js("window.__uploads.length") == bare_uploads + 1
+        assert bare_subject["id"] in await js("window.__uploads.at(-1).url")
+        await js("document.getElementById('observation-confirm').click()")
+        await until("document.getElementById('observation-status').textContent === 'Added to checklist'")
+        assert await js("document.querySelector('.counter output').value") == "1"
+        results["politePhotoRequestConfirmsReadyCameraWithoutModelRouting"] = True
         await js("document.getElementById('stop').click()")
         await until("window.__streams.every(s=>s.getTracks().every(t=>t.readyState==='ended'))")
         errors = [e for e in events if e.get("method") == "Runtime.exceptionThrown"]

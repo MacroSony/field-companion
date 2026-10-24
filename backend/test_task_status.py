@@ -342,7 +342,41 @@ class TaskStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(obs.analysis_request_id, "original-photo")
         self.assertIsNone(self.c.camera_request)
         self.assert_no_camera_commands()
-        self.assertTrue(result.get("ok", True))
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["suppress_answer"])
+        self.assertTrue(result["requires_clarification"])
+        self.assertTrue(any(p[0] == "feedback" and p[1]["kind"] == "clarify" for p in self.c.pending))
+        self.c.generate.assert_not_awaited()
+
+    async def test_unproven_new_observation_route_clarifies_without_reading_old_species(self):
+        obs = await self.photo()
+        await self.route("What is that?", "new_observation")
+        self.assertEqual(self.c.focus, obs.id)
+        self.assertEqual(obs.analysis_status, "ready")
+        self.assertEqual(obs.image_revision, 1)
+        self.assertIsNone(self.c.camera_request)
+        self.assert_no_camera_commands()
+        self.assertTrue(any(p[0] == "feedback" and p[1]["kind"] == "clarify" for p in self.c.pending))
+        self.c.generate.assert_not_awaited()
+        self.c.speak_expert.assert_not_awaited()
+
+    async def test_start_without_a_pending_camera_clarifies_instead_of_reading_old_identity(self):
+        obs = await self.photo()
+        for wrong_tool in ("get_observation", "speak", "new_observation"):
+            with self.subTest(wrong_tool=wrong_tool):
+                before = len([p for p in self.c.pending if p[0] == "feedback"
+                              and p[1]["kind"] == "clarify"])
+                await self.route("Start.", wrong_tool, {"reason": "Start requested"} if wrong_tool == "speak" else {})
+                self.assertEqual(self.c.focus, obs.id)
+                self.assertEqual(obs.analysis_status, "ready")
+                self.assertIsNone(self.c.camera_request)
+                self.assert_no_camera_commands()
+                self.assertFalse(self.c.items)
+                after = len([p for p in self.c.pending if p[0] == "feedback"
+                             and p[1]["kind"] == "clarify"])
+                self.assertGreater(after, before)
+        self.c.generate.assert_not_awaited()
+        self.c.speak_expert.assert_not_awaited()
 
     async def test_status_wording_cannot_explain_a_completed_result_even_if_router_requests_it(self):
         job = self.research("R1", status="completed", stage="completed")
@@ -386,6 +420,71 @@ class TaskStatusTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(request["phase"], "capturing")
                 self.assertEqual(len([e for e in self.phone.events if e.get("type") == "capture"]), 1)
                 self.assertEqual(fresh.fused, [])
+
+    async def test_bare_generic_new_animal_notice_cannot_reuse_the_previous_photo(self):
+        for chosen_tool in ("new_observation", "look", "get_observation"):
+            with self.subTest(chosen_tool=chosen_tool):
+                old = await self.photo()
+                old.hint = "Old chicken on the previous screen"
+                await self.route("I saw another animal.", chosen_tool)
+                self.assert_fresh_subject(old)
+                self.assertEqual(old.status, "discarded")
+                self.assertEqual(old.image_revision, 1)
+        self.c.generate.assert_not_awaited()
+        self.c.speak_expert.assert_not_awaited()
+
+    async def test_split_new_animal_notice_then_photo_confirmation_captures_the_fresh_subject(self):
+        for confirmation in ("Take the photo for me.", "Take photo for me.", "Start."):
+            with self.subTest(confirmation=confirmation):
+                old = await self.photo()
+                old.hint = "Previously identified animal"
+                await self.route("I saw another animal.", "new_observation")
+                fresh = self.assert_fresh_subject(old)
+                request = self.c.camera_request
+                await self.c.camera_ready({"request_id": request["id"]})
+                self.assertEqual(request["phase"], "ready")
+                self.assertFalse(any(e.get("type") == "capture" for e in self.phone.events))
+                await self.c.handle_phone({"type": "text", "text": confirmation}, self.client)
+                captures = [e for e in self.phone.events if e.get("type") == "capture"]
+                self.assertEqual(len(captures), 1)
+                self.assertEqual((captures[0]["obs"], captures[0]["request_id"]),
+                                 (fresh.id, request["id"]))
+                self.assertEqual(request["phase"], "capturing")
+                self.assertFalse(any(p[0] == "text" and str(p[1]) == confirmation for p in self.c.pending))
+        self.c.generate.assert_not_awaited()
+
+    async def test_polite_photo_confirmation_does_not_latch_before_preview_is_ready(self):
+        old = await self.photo()
+        old.hint = "Previous subject"
+        await self.route("I saw another animal.", "new_observation")
+        request = self.c.camera_request
+        self.assertIsNotNone(request)
+        await self.c.camera_confirmation("Take the photo for me.")
+        self.assertFalse(request["confirmed"])
+        self.assertFalse(any(e.get("type") == "capture" for e in self.phone.events))
+        await self.c.camera_ready({"request_id": request["id"]})
+        self.assertEqual(request["phase"], "ready")
+        self.assertFalse(request["confirmed"])
+        self.assertFalse(any(e.get("type") == "capture" for e in self.phone.events))
+        await self.c.camera_confirmation("Take the photo for me.")
+        self.assertEqual(request["phase"], "capturing")
+        self.assertEqual(len([e for e in self.phone.events if e.get("type") == "capture"]), 1)
+
+    async def test_direct_photo_request_on_ready_result_prepares_retake_without_old_identity_answer(self):
+        for text in ("Take a photo for me.", "Take the photo for me.", "Take photo for me."):
+            for wrong_tool in ("look", "get_observation", "speak"):
+                with self.subTest(text=text, wrong_tool=wrong_tool):
+                    old = await self.photo()
+                    await self.route(text, wrong_tool, {"reason": "Photo requested"} if wrong_tool == "speak" else {})
+                    self.assertEqual(self.c.focus, old.id)
+                    self.assertIsNotNone(self.c.camera_request)
+                    self.assertNotEqual(self.c.camera_request["id"], "original-photo")
+                    self.assertEqual(self.c.camera_request["phase"], "opening")
+                    self.assertEqual(old.analysis_status, "awaiting_confirmation")
+                    self.assertTrue(any(e.get("type") == "camera_prepare" for e in self.phone.events))
+                    self.assertFalse(any(e.get("type") == "capture" for e in self.phone.events))
+        self.c.generate.assert_not_awaited()
+        self.c.speak_expert.assert_not_awaited()
 
     async def test_new_subject_preserves_a_previously_confirmed_checklist_observation(self):
         old = await self.photo()

@@ -5,11 +5,14 @@ from task_status import explicit_retake, new_subject_request, parse_status_query
 
 
 class TaskStatusParserTests(unittest.TestCase):
-    def test_narrative_new_subject_requires_visual_request(self):
+    def test_new_unknown_notice_is_distinct_from_named_logging(self):
         for text in (
                 "I found another animal. Could you help me check it out?",
                 "I saw another animal, could you help me checked it out?",
                 "我又发现一个动物，帮我看看是什么",
+                "I saw another animal.", "I found another bird.", "I see a new plant.",
+                "There is another animal.", "There's a new bird here.", "我又看到一只动物",
+                "我们又发现一株植物。", "我发现另一只鸟。",
                 "Look at another bird.", "Identify a different animal.",
                 "New subject.", "Switch to a different subject."):
             with self.subTest(text=text):
@@ -18,6 +21,8 @@ class TaskStatusParserTests(unittest.TestCase):
                 self.assertIsNone(parse_status_query(text))
         for text in (
                 "I saw another bald eagle.", "What does another animal eat?",
+                "I saw two other birds.", "I saw another two birds.", "I saw another bird called a Bald Eagle.",
+                "我又看到一只白头海雕", "我又看到两只鸟",
                 "I haven't found another animal. Could you help me check it out?",
                 "Don't check another animal.", "If I find another animal, could you help me check it out?",
                 "Could this be another species?", "Add another bird.",
@@ -25,6 +30,7 @@ class TaskStatusParserTests(unittest.TestCase):
                 "我又发现一个动物，帮我看看它吃什么",
                 "I found another animal, what's R1's progress?",
                 "Look again.", "Take another photo of the same bird.",
+                "Take the photo for me.", "Take a photo.", "Please photograph it.", "Can you take a picture?",
                 "我没有发现另一个动物，帮我看看", "如果我又发现一个动物，帮我看看是什么"):
             with self.subTest(text=text):
                 self.assertFalse(new_subject_request(text))
@@ -82,6 +88,7 @@ class TaskStatusParserTests(unittest.TestCase):
 
     def test_retake_requires_camera_action_not_new_topic(self):
         for text in ("Take another photo.", "Can you take a new picture?", "Can you retake the photo?", "Look again.",
+                     "Take the photo for me.", "Take a photo.", "Please photograph it.", "Can you take a picture?",
                      "Look at it again.", "Switch to a different subject.", "New subject.",
                      "Look at another animal.", "Check out another bird.", "Identify a different animal.",
                      "Look at a different bird.", "Look at another plant.",
@@ -94,6 +101,8 @@ class TaskStatusParserTests(unittest.TestCase):
                      "Do not identify another animal.", "不要换一个动物",
                      "Retake is not needed.", "No need for a retake.", "No retake needed.", "重拍没必要",
                      "Do I need to retake the photo?", "Should I look again?", "Does this need a new photo?",
+                     "Do I need to take a photo?", "Should I take a picture?", "Can I take a photo?",
+                     "Don't take the photo for me.", "Please do not photograph it.",
                      "调查不同物种的食性", "换一种识别方法"):
             with self.subTest(text=text):
                 self.assertFalse(explicit_retake(text))

@@ -32,10 +32,11 @@ def _text(text):
 
 
 def new_subject_request(text):
-    """Require both a new organism and a positive visual request.
+    """Recognize a new unknown target, rather than a named/count sighting.
 
-    A sighting report alone remains a logging input. Retaking the same subject
-    is a separate camera action and must not create a new observation.
+    A bare generic notice can prepare a preview, but never authorizes capture.
+    Named species reports remain logging input. Retaking the same subject is a
+    separate camera action and must not create a new observation.
     """
     value = _text(text)
     if re.search(r"\b(?:if|when)\s+(?:i|we|you)\b|\b(?:suppose|imagine)\b|"
@@ -56,6 +57,21 @@ def new_subject_request(text):
                     r"switch\s+to\s+the\s+other\s+one)[.!?]*", value):
         return True
     organism = r"(?:animal|bird|organism|subject|plant|insect|flower|tree|mammal|fish|reptile|spider|mushroom|butterfly)"
+    # Generic singular targets convey an unresolved new subject. Restrict the
+    # whole notice so counts, species names and added comparison/status clauses
+    # cannot be silently converted from logging/other intent into camera work.
+    if re.fullmatch(
+            r"(?:(?:i|we)(?:'ve|\s+have)?\s+(?:just\s+)?(?:saw|found|see|spotted|noticed)|"
+            r"there(?:'s|\s+is))\s+(?:another|a\s+new|a\s+different)\s+" + organism +
+            r"(?:\s+(?:here|nearby|over\s+there))?[.!?]*", value):
+        return True
+    zh_organism = r"(?:动物|鸟|植物|昆虫|花|树|鱼|蜘蛛|蘑菇|蝴蝶|(?:观察)?对象)"
+    if re.fullmatch(
+            r"(?:我|我们)?(?:刚刚|刚才|现在)?(?:"
+            r"又(?:看到|发现|找到|遇到|看见)了?一?(?:个|只|株|棵)|"
+            r"(?:看到|发现|找到|遇到|看见)了?另(?:一)?(?:个|只|株|棵))" + zh_organism +
+            r"[？?。.!！]*", value):
+        return True
     fresh = bool(re.search(r"\b(?:another|new|different)\s+" + organism + r"\b", value))
     visual = bool(re.search(
         r"\b(?:can|could|would|will)\s+you\s+(?:please\s+)?(?:help\s+(?:me|us)\s+)?"
@@ -97,6 +113,11 @@ def explicit_retake(text):
                  r"(?:重拍|再拍|重新拍).{0,4}(?:不需要|没必要|不用|不必)", value):
         return False
     return bool(re.search(
+        r"^(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?"
+        r"(?:take|capture|shoot|get|grab)\s+(?:(?:me|us)\s+)?"
+        r"(?:(?:a|the|this|that|another|new|fresh)\s+)?(?:photo|picture|shot|frame|image)\b|"
+        r"^(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?"
+        r"photograph\s+(?:it|this|that|the\s+(?:subject|animal|bird))\b|"
         r"\b(?:retake|re-take)\b|\blook\s+(?:at\s+(?:it|this|that)\s+)?again\b|"
         r"\btake\s+another\s+look\b|"
         r"\b(?:take|capture|shoot|get|grab|use)\s+(?:(?:me|a|an|the)\s+)*"

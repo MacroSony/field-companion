@@ -17,6 +17,8 @@ unread result. The backend implements this with canonical task snapshots and
 | “Tell me the result.” / “Explain R1.” / acceptance of an actual explanation offer | Follow the existing result/explanation path, not a progress check. |
 | “Look again.” / “Take another photo.” / “Identify a different animal.” | Keep explicit camera intent; prepare another capture using the normal confirmation rules. |
 | “I found another animal. Could you help me check it out?” | Create a fresh subject, prepare the camera and wait for Start; never answer from the previous animal's evidence. |
+| “I saw another animal.” / “我又看到一只动物。” | A generic unresolved new target prepares a fresh preview; it does not take or log a photo. Named species/count reports keep their logging path. |
+| “Take the photo for me.” | With a genuinely ready request, confirm capture. Without one, prepare the preview and wait for confirmation; an early command is never saved for later. |
 | Manual **Identify this subject** / **Look again** / **New subject** | Keep the button's explicit camera authorization. |
 
 The parser in `backend/task_status.py` is conservative. It recognizes clear
@@ -104,9 +106,16 @@ New-subject inspection requests are resolved before old-photo reuse protection.
 The backend corrects a mistaken `look`, evidence-read or speech selection to a
 new observation with empty image evidence, candidates and hints. Existing
 confirmed sightings and investigation snapshots remain intact. A retake stays
-with the same observation; a plain sighting/count report or a species comparison
+with the same observation; a named sighting/count report or a species comparison
 does not authorize a camera switch. Both new-subject and retake previews retain
 the separate Start/Identify confirmation.
+
+An unproven model-selected new-subject action asks for clarification; it never
+falls back to announcing the old species. Direct photo requests cannot turn into
+evidence reads merely because the model selected the wrong tool. A bare Start
+without an active camera request also clarifies without reading an old identity.
+General answer instructions receive the actual camera request state: a completed
+photo is not permission to claim that a camera preview is ready.
 
 ## Verification and limits
 

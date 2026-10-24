@@ -1050,8 +1050,12 @@ class Session:
         if words in ("cancel", "never mind", "not now", "取 消", "先 不 拍", "算 了", "不 要 拍"):
             await self.cancel_camera_request()
             return True
-        if words not in ("start", "start please", "take a photo", "take the photo",
-                         "开 始", "开 始 吧", "拍 吧", "开 始 拍 照", "可 以 拍 了"):
+        photo_command = re.fullmatch(
+            r"(?:(?:can|could|would|will) you )?(?:please )?(?:"
+            r"(?:take|capture|shoot) (?:(?:a|the) )?(?:photo|picture)|photograph (?:it|this|that))"
+            r"(?: for me)?(?: please)?", words)
+        if not photo_command and words not in ("start", "start please", "take a photo", "take the photo",
+                                               "开 始", "开 始 吧", "拍 吧", "开 始 拍 照", "可 以 拍 了"):
             return False
         obs = self.observations.get(request["obs"])
         if not obs or obs.status != "open" or self.focus != obs.id:
@@ -1451,7 +1455,9 @@ class Session:
                           "uncertain": focus.uncertain,
                           "image_detections": sum(d.kind == "image" for d in focus.detections)}
                          if focus and focus.status != "discarded" else None)
-        answer_instructions = ANSWER
+        actual_camera = {"phase": self.camera_request["phase"]} if self.camera_request else None
+        answer_instructions = (ANSWER + "\nActual camera request state: " + json.dumps(actual_camera)
+            + "\nOnly this current backend state establishes camera readiness. Never claim Camera ready or tell the user to say Start when it is null; an old photo's ready result is not a ready camera.")
         if self.expert_readout is not None:
             answer_instructions = ("Read the following naturalist answer aloud verbatim. "
                 "Preserve its original language and every species identifier. "
@@ -1893,7 +1899,14 @@ class Session:
         call = calls[0]
         name = call["name"]
         selector = self.status_selector(self.turn_question)
-        if new_subject_request(str(self.turn_question)):
+        words = " ".join(self.normalized_words(str(self.turn_question)))
+        idle_start = (not self.camera_request and words in ("start", "start please", "开 始", "开 始 吧"))
+        if idle_start:
+            self.log("camera_guard", requested_tool=name, reason="no_pending_capture")
+            self.queue_feedback("clarify")
+            call = {**call, "name": "ignore", "arguments": "{}"}
+            name = "ignore"
+        elif new_subject_request(str(self.turn_question)):
             # New-target intent must be checked before protecting the previous
             # photo. Preserve only a valid category, never its old hint/evidence.
             try:
@@ -1908,11 +1921,12 @@ class Session:
             self.log("task_status_query", source="route_guard", requested_tool=name, selector=selector)
             call = {**call, "name": "get_task_status", "arguments": json.dumps(selector)}
             name = "get_task_status"
-        elif name == "new_observation" and explicit_retake(str(self.turn_question)):
-            # A retake keeps the current subject's accumulated evidence.
+        elif explicit_retake(str(self.turn_question)):
+            # Direct photo/retake requests execute camera control even if the
+            # model selected a read or speech tool. They keep this subject.
             call = {**call, "name": "look"}
             name = "look"
-        elif name in ("look", "new_observation") and not explicit_retake(str(self.turn_question)):
+        elif name == "look":
             obs = self.observations.get(self.focus)
             if obs and obs.analysis_status == "ready" and obs.image_revision > 0:
                 # A finished photo remains the current subject, including while
@@ -1920,9 +1934,6 @@ class Session:
                 self.log("photo_reuse_guard", requested_tool=name, observation_id=obs.id)
                 call = {**call, "name": "get_observation", "arguments": "{}"}
                 name = "get_observation"
-            elif name == "new_observation" and obs and obs.analysis_status in ("capturing", "analyzing", "awaiting_confirmation"):
-                call = {**call, "name": "get_task_status", "arguments": '{"scope":"camera"}'}
-                name = "get_task_status"
         try:
             args = json.loads(call.get("arguments") or "{}")
             if not isinstance(args, dict):
@@ -2343,7 +2354,10 @@ class Session:
             if (obs and obs.analysis_request_id
                     and obs.analysis_status in ("ready", "awaiting_confirmation", "capturing", "analyzing")
                     and not (explicit_retake(str(self.turn_question)) or new_subject_request(str(self.turn_question)))):
-                return await self.task_status({"scope": "camera"})
+                # Unclear target changes need clarification, not an answer
+                # using the old animal's evidence or a fictional camera state.
+                self.queue_feedback("clarify")
+                return {"ok": False, "suppress_answer": True, "requires_clarification": True}
             group = args.get("group", "Aves")
             if group not in GROUPS:
                 raise ValueError("invalid iconic group")
