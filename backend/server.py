@@ -29,6 +29,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPExcept
 from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from expert import NaturalistExpert, revision as expert_revision
+from template_answers import SpeechStream, build_answer
 
 MODEL = "higgs-realtime-1.5-preview"
 SR = 48000
@@ -332,6 +333,8 @@ class Session:
         self.closed = False
         self.mic_on = True
         self.quiet = False
+        self.tts = None
+        self.tts_active = False
         self.lang = "en"
         self.lat, self.lng = 43.66, -79.39
         self.active = False
@@ -863,7 +866,72 @@ class Session:
                     and time.monotonic() - self.turn_stopped_at > 12)):
                 self.log("stale_answer_skipped")  # answering a question asked >12 s ago is confusing
                 return
+            if os.environ.get("TEMPLATE_ANSWERS") == "1" and name in ("recent_sounds", "get_checklist"):
+                if await self.template_answer(name, result):
+                    return
             await self.generate("answer")
+
+    async def template_answer(self, name, result):
+        sent = False
+        self.tts_active = True
+        self.phase = "answer"
+        self.audio_allowed = self.may_speak()
+        self.first_audio = False
+        try:
+            text = build_answer(name, result)
+            if not text:
+                return False
+            if self.tts is None:
+                self.tts = SpeechStream()
+            async for pcm in self.tts.chunks(text, api_key(), os.environ.get("TEMPLATE_TTS_VOICE", "default")):
+                if not self.audio_allowed or not self.connected or self.user_speaking:
+                    self.log("template_cancelled")
+                    return True  # interruption is not a synthesis failure
+                if not sent:
+                    if (self.turn_stopped_at is not None and time.monotonic() - self.turn_stopped_at > 12):
+                        self.log("stale_answer_skipped")
+                        return True
+                    self.remember_spoken(("template", self.input_revision), text)
+                await self.send_answer_audio(pcm)
+                sent = True
+            if not sent:
+                raise ValueError("Empty TTS stream")
+            await self.rt_send({"type": "conversation.item.create", "item": {
+                "type": "message", "role": "assistant", "content": [{"type": "text", "text": text}]}})
+            await self.phone_json({"type": "transcript", "role": "assistant", "text": text, "final": True})
+            self.log("template_done", tool=name)
+            return True
+        except Exception as exc:
+            if not self.audio_allowed or self.user_speaking or not self.connected:
+                return True
+            self.log("template_fallback", error_type=type(exc).__name__, partial=sent)
+            if sent:
+                self.play_until = 0
+                await self.phone_json({"type": "flush"})
+                await self.state()
+            return False
+        finally:
+            self.tts_active = False
+
+    async def send_answer_audio(self, pcm):
+        was_speaking = time.monotonic() < self.play_until
+        # Shared PCM16 mono 24 kHz path for Realtime and REST TTS.
+        self.play_until = max(time.monotonic(), self.play_until) + len(pcm) / 48000
+        self.echo_estimate = self.play_until
+        if not self.first_audio:
+            for client in self.playback_clients():
+                client.playback_end = 0.0
+        await self.phone_audio(pcm)
+        self.total_audio_out += len(pcm)
+        if not self.first_audio:
+            self.first_audio = True
+            if self.proactive_turn:
+                self.last_proactive = time.monotonic()
+            self.latency("first_audio")
+        if not was_speaking:
+            await self.state()
+        if self.playback_task is None or self.playback_task.done():
+            self.playback_task = asyncio.create_task(self.playback_finished())
 
     def latency(self, target):
         if self.turn_stopped_at is not None:
@@ -970,6 +1038,8 @@ class Session:
                 self.log("vad_ignored", reason="assistant_playback")
                 return
             self.input_revision += 1
+            if self.tts_active:
+                self.audio_allowed = False
             self.user_speaking = True
             self.awaiting_transcript = True
             if time.monotonic() < self.play_until:
@@ -1013,24 +1083,7 @@ class Session:
             if rid in self.cancelled_ids or not self.audio_allowed:
                 return
             pcm = base64.b64decode(event["delta"])
-            was_speaking = time.monotonic() < self.play_until
-            # Close the gate BEFORE sending audio: mic ingestion runs concurrently.
-            self.play_until = max(time.monotonic(), self.play_until) + len(pcm) / 48000
-            self.echo_estimate = self.play_until
-            if not self.first_audio:
-                for client in self.playback_clients():
-                    client.playback_end = 0.0
-            await self.phone_audio(pcm)
-            self.total_audio_out += len(pcm)
-            if not self.first_audio:
-                self.first_audio = True
-                if self.proactive_turn:
-                    self.last_proactive = time.monotonic()
-                self.latency("first_audio")
-            if not was_speaking:
-                await self.state()
-            if self.playback_task is None or self.playback_task.done():
-                self.playback_task = asyncio.create_task(self.playback_finished())
+            await self.send_answer_audio(pcm)
         elif ty in ("response.output_audio_transcript.delta", "response.audio_transcript.delta", "response.output_text.delta"):
             if rid in self.cancelled_ids or not self.audio_allowed:
                 return
@@ -1602,6 +1655,8 @@ class Session:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         self.executor.shutdown(wait=False, cancel_futures=True)
+        if self.tts is not None:
+            self.tts.close()
 
     async def expire(self):
         await asyncio.sleep(SESSION_TTL)
