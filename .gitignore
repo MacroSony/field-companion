@@ -7,3 +7,4 @@ out/
 .env
 *.key
 node_modules/
+backend/*.log
