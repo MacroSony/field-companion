@@ -35,3 +35,25 @@ Status: **recorded, not fixed**. Code under test = branch `feat/batched-suggesti
 ## D. Process
 - Frontend deployed (live reload) before backend restart → confusing mixed state for the tester. Restart backend together with frontend changes, and announce.
 - Complexity grew fast (suggestions, echo guard, playback reports, mic picker…). Feature freeze until the issues above are triaged.
+
+## E. Found by code review (Oct 23 night, read-only reviewers; not reproduced live unless noted)
+- E1 Conversation history in the Realtime session is never pruned (transcripts, NOTIFY, function outputs) → cost/latency growth; may contribute to repeated checklist readouts.
+- E2 One-action-per-turn drops compound intents ("Yeah, add it. Did you hear anything else?" → only accept, 23:05:40, proven); merging queued utterances makes it worse.
+- E3 Response completion isn't correlated by response id: a late `response.done` (e.g. from a cancelled/timed-out response) can satisfy a newer waiter. Reconnect doesn't reset `user_speaking`/`awaiting_transcript`.
+- E4 Allowed-species list fails open: if both sources fail, filtering is disabled and cached for the day.
+- E5 Earphones + display audio=1: Realtime is guarded but BirdNET windows aren't masked (masking requires speaker mode).
+- E6 Playback "active" report without a later "inactive" (e.g. AudioContext suspended) keeps the mic gated indefinitely.
+- E7 Web: late GPS fix never sent to backend (backend stays at Toronto default); two phones on session `demo` evict each other forever (auto-reconnect after replacement); mic switch stops the old track before the new one succeeds; >30 s queued audio can overlap after the clock-reset guard.
+- E8 Stale frontend vs backend: no version handshake (SW is network-first, but an open page keeps old JS).
+- E9 Protocol/docs drift: PROTOCOL.md documents Look/observation messages that only exist in PR #1; `candidates` has no producer; echo-filter and tail values in docs don't match code.
+- E10 PR #1 (observation model) and PR #2 (suggestions/echo) both rewrote router tools, finish_route and the checklist model → high semantic merge difficulty. Concepts to unify: Detection = evidence, Suggestion = pending proposal referencing evidence, Observation = organism record; checklist derived from confirmed observations.
+
+## Review recommendations (ranked; full reviews in subagent reports of Oct 23)
+1. Router wording (A1–A6): replacement texts drafted — low risk.
+2. BirdNET eligibility: one allowlist = BirdNET geo @0.001 ∪ iNat Ontario all-time (place_id 6883); drop the ≥0.7 rare lane and all non-bird labels; Heard strip shows only ≥2 windows or ≥0.7; fail closed/last-good list — low–medium risk.
+3. Small web bugs E7 — low risk.
+4. Bound conversation history; stop merging unrelated intents — medium.
+5. Tools 11 → 6 (add_observations, set_count, remove_observations incl. all, resolve_suggestions, speak, ignore) — low–medium.
+6. Settings/debug drawer (mic picker, capture line, model id, text input, speaker/earphones, headset button); clearer labels for Quiet vs Speaker/Earphones vs Pause vs Tap — low.
+7. Decide Look scope before merging PR #1/#2; if in scope: PR #1 model first, port PR #2 deliberately.
+8. Later: retire transcript-echo heuristic after physical validation; split server.py into modules (1–2 days, not before demo).
