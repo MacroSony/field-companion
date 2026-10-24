@@ -8,7 +8,8 @@ import requests, websockets, numpy as np
 KEY = os.environ.get("BOSON_API_KEY") or pathlib.Path("~/.config/boson/api_key").expanduser().read_text().strip()
 H = {"Authorization": f"Bearer {KEY}"}
 API = "https://api.boson.ai/v1"
-WS = "wss://api.boson.ai/v1/realtime?model=higgs-realtime"
+MODEL = os.environ.get("HIGGS_MODEL", "higgs-realtime-1.5-preview")
+WS_BASE = "wss://api.boson.ai/v1/realtime?model="
 OUT = pathlib.Path(__file__).parent / "out"; OUT.mkdir(exist_ok=True)
 SR = 24000
 RESULTS = {}
@@ -28,9 +29,10 @@ def tts(text, voice="default"):
     r.raise_for_status()
     return b"".join(r.iter_content(4096))
 
-async def connect(session):
-    ws = await websockets.connect(WS, additional_headers=H, max_size=None)
-    await ws.send(json.dumps({"type": "session.update", "session": {"model": "higgs-realtime", **session}}))
+async def connect(session, model=None):
+    model = model or MODEL  # URL and session.model must match (session.model overrides the URL)
+    ws = await websockets.connect(WS_BASE + model, additional_headers=H, max_size=None)
+    await ws.send(json.dumps({"type": "session.update", "session": {"model": model, **session}}))
     return ws
 
 async def collect(ws, until=("response.done",), timeout=60, t0=None, n_done=1, on=None):
