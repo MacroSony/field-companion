@@ -1,5 +1,8 @@
 # Field Companion backend (protocol v0.2)
 
+The optional [GPT Naturalist expert path](../docs/EXPERT.md) handles complex
+comparisons and species-fact follow-ups without changing the logging fast path.
+
 ```bash
 source /data/build/birding-demo/.venv/bin/activate
 # BOSON_API_KEY, or the existing ~/.config/boson/api_key; never copy into the repo

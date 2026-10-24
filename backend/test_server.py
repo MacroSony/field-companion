@@ -13,6 +13,7 @@ from PIL import Image
 
 import numpy as np
 import server as s
+from expert import Settings
 
 
 class FakePhone:
@@ -56,6 +57,7 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.phone = FakePhone()
         self.c = s.Session("test")
+        self.c.expert = s.NaturalistExpert(settings=Settings(enabled=False))
         self.client = s.Client(self.phone, self.c)
         self.c.clients.add(self.client)
         self.c.rt_send = AsyncMock()
@@ -210,11 +212,11 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         await self.c.handle_rt({"type": "session.updated", "session": config})
         await task
 
-    async def test_transcription_enqueues_route(self):
+    async def test_transcription_clears_audio_and_enqueues_text(self):
         await self.c.handle_rt({"type": "input_audio_buffer.speech_stopped"})
         await self.c.handle_rt({"type": "conversation.item.input_audio_transcription.completed", "transcript": "two birds"})
-        self.assertEqual(self.c.pending[0][0], "text")
-        self.assertIn("input_audio_buffer.clear", [c.args[0]["type"] for c in self.c.rt_send.call_args_list])
+        self.c.rt_send.assert_awaited_once_with({"type": "input_audio_buffer.clear"})
+        self.assertEqual(self.c.pending[0][:2], ("text", "two birds"))
         self.assertIsNotNone(self.c.pending[0][2])
 
     async def test_realtime_reconnect_reinjects_checklist(self):
@@ -358,7 +360,7 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         await self.c.bird_window(np.zeros(1), 4 * s.SR)
         self.assertEqual(len(obs.detections), 1)
 
-    async def test_confirm_focus_and_expert_stub(self):
+    async def test_confirm_focus_and_unconfigured_expert(self):
         obs = self.seed()
         obs.status = "open"
         self.c.focus = obs.id
@@ -367,7 +369,9 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.c.items[0]["count"], 2)
         self.assertIn({"type": "earcon", "kind": "logged"}, self.phone.events)
         result = await self.c.tool("ask_expert", {"question": "bill?"})
-        self.assertEqual(result, {"answer": None, "note": "expert provider not configured"})
+        self.assertEqual(result["status"], "not_configured")
+        self.assertEqual(result["action"], "abstain")
+        self.assertTrue(result["answer"])
         await self.c.handle_phone({"type": "observation_action", "id": obs.id, "action": "discard"})
         self.assertFalse(self.c.items)
 

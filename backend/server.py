@@ -26,6 +26,7 @@ import websockets
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
 from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
+from expert import NaturalistExpert, revision as expert_revision
 
 MODEL = "higgs-realtime-1.5-preview"
 SR = 48000
@@ -151,11 +152,6 @@ def fuse(detections, allowed=None, priors=None):
     return fused, fused[0]["p"] < .5 or margin < .2
 
 
-def expert_answer(question, observation_dict) -> str | None:
-    """Pluggable provider: replace this function; never required for core ID."""
-    return None
-
-
 def classify_frame(jpeg, crop, candidates):
     try:
         response = requests.post(VISION_URL + "/classify", json={
@@ -186,7 +182,7 @@ TOOLS = [
     tool_schema("discard_observation", "Discard the focus; do not log it."),
     tool_schema("new_observation", "Start a different organism as a new focus.", {"group": {"type": "string", "enum": GROUPS}}),
     tool_schema("describe", "Attach a user description to the focus; resolve only explicit species names.", {"text": NAME, "name": NAME}, ("text",)),
-    tool_schema("ask_expert", "Ask the pluggable expert about the focus.", {"question": NAME}, ("question",)),
+    tool_schema("ask_expert", "Reason about the current focus: candidate comparisons, 'could it be X?', conflicting evidence, diet, habitat or behaviour. Read-only; never log.", {"question": NAME}, ("question",)),
     tool_schema("add_observation", "Log a user-confirmed sighting; increases existing count. No spoken acknowledgement.",
                 {"name": NAME, "group": {"type": "string", "enum": GROUPS}, "count": COUNT,
                  "notes": {"type": "string"}}, ("name", "group", "count", "notes")),
@@ -213,7 +209,10 @@ For checklist questions call get_checklist; what just called: recent_sounds (unc
 For other addressed birding questions call speak(reason); for local ID candidates use nearby_species.
 For "what's that?", "look again", or visual identification call look, NOT speak.
 For "add it", "two of them", or "log that" call confirm_observation with the count.
-Pronouns refer to the focus; for follow-up facts call get_observation.
+Pronouns refer to the focus. For species comparisons ('could it be a Cooper's
+Hawk?'), uncertain identification, diet ('what does it eat?'), habitat or behaviour
+call ask_expert with the complete latest question, NOT speak or get_observation.
+get_observation only reads evidence; it does not supply species facts.
 For a different organism call new_observation; discard unwanted IDs with discard_observation.
 Never invent sightings or identify from insufficient evidence; request camera evidence with look.
 """
@@ -233,6 +232,10 @@ event: briefly ask whether to add the heard species, in English; NEVER claim it 
 <species>"; if uncertain say "Not sure — <top two>; can you zoom in?". Use hint when
 present to request a discriminating close-up. If top3 is empty, say you cannot identify
 it yet and ask for a closer frame. Never claim a vision ID is logged.
+[EXPERT] or an ask_expert tool result contains final wording in answer. Speak
+that answer exactly, preserving uncertainty and questions; do not add facts,
+reinterpret the ranking, promise a capture, or acknowledge logging. For an
+ask_expert error without answer, ask the user to look at an organism first.
 """
 SESSIONS = {}
 SESSION_TTL = 600
@@ -302,6 +305,66 @@ class Session:
         self.transcripts = {}
         self.total_audio_in = 0
         self.total_audio_out = 0
+        self.expert = NaturalistExpert()
+        self.input_revision = 0
+
+    async def ask_expert(self, question, obs):
+        snapshot = obs.payload()
+        version = expert_revision(snapshot)
+        input_revision = self.input_revision
+        result = await self.expert.answer(question, snapshot)
+        await self.expire_focus()
+        if (self.closed or self.focus != obs.id or obs.status == "discarded"
+                or self.input_revision != input_revision
+                or expert_revision(obs.payload()) != version):
+            self.log("expert_stale", observation=obs.id)
+            return {"ok": False, "status": "stale", "suppress_answer": True}
+        if result.get("action") == "request_more_evidence" and result.get("hint") and obs.status == "open":
+            obs.hint = result["hint"]
+            version = expert_revision(obs.payload())
+            await self.broadcast_observation(obs)
+        if (self.focus != obs.id or self.input_revision != input_revision
+                or expert_revision(obs.payload()) != version):
+            return {"ok": False, "status": "stale", "suppress_answer": True}
+        result["context"] = {"observation_id": obs.id, "revision": version, "input_revision": input_revision}
+        self.log("expert_done", status=result.get("status"), action=result.get("action"))
+        return result
+
+    def expert_result_current(self, result):
+        context = result.get("context", {})
+        obs = self.observations.get(context.get("observation_id"))
+        return (obs is not None and self.focus == obs.id and obs.status != "discarded"
+                and self.input_revision == context.get("input_revision")
+                and expert_revision(obs.payload()) == context.get("revision"))
+
+    async def answer_vision(self, observation_id):
+        obs = self.observations.get(observation_id)
+        input_revision = self.input_revision
+        if not obs or obs.status != "open" or self.focus != obs.id or not self.may_speak():
+            return
+        if obs.uncertain and self.expert.available:
+            # Give a short capture burst time to land; snapshot validation below
+            # also rejects frames arriving during the model call.
+            await asyncio.sleep(1)
+            if (self.focus != obs.id or obs.status != "open"
+                    or self.input_revision != input_revision or not self.may_speak()):
+                return
+            question = "根据现有证据，这是什么？不确定时告诉我还需要拍什么。" if self.lang.startswith("zh") else (
+                "What is this organism, based on the evidence? If uncertain, what should I capture next?")
+            result = await self.ask_expert(question, obs)
+            if result.get("suppress_answer") and self.input_revision != input_revision:
+                return
+            # An unavailable expert must not prevent the existing BioCLIP answer.
+            if result.get("ok"):
+                if self.may_speak():
+                    await self.inject("[EXPERT] " + json.dumps(result, ensure_ascii=False))
+                    if self.expert_result_current(result):
+                        await self.generate("answer")
+                return
+        if (self.focus == obs.id and obs.status == "open" and self.may_speak()
+                and self.input_revision == input_revision):
+            await self.inject("[VISION] " + json.dumps({"top3": obs.fused[:3], "uncertain": obs.uncertain, "hint": obs.hint}))
+            await self.generate("answer")
 
     @property
     def items(self):
@@ -539,10 +602,7 @@ class Session:
             self.turn_stopped_at = stopped
             try:
                 if kind == "vision":
-                    obs = self.observations.get(value)
-                    if obs and obs.status == "open" and self.focus == obs.id and self.may_speak():
-                        await self.inject("[VISION] " + json.dumps({"top3": obs.fused[:3], "uncertain": obs.uncertain, "hint": obs.hint}))
-                        await self.generate("answer")
+                    await self.answer_vision(value)
                 elif kind == "notify":
                     await self.inject("[NOTIFY] BirdNET heard " + value["en"])
                     await self.generate("answer")
@@ -594,8 +654,13 @@ class Session:
             "type": "function_call_output", "call_id": call["call_id"],
             "output": json.dumps(result, ensure_ascii=False)}})
         self.log("tool", name=name, ok=result.get("ok", True))
+        if result.get("suppress_answer"):
+            return
+        if name == "ask_expert" and result.get("context") and not self.expert_result_current(result):
+            return
         if name in ("speak", "get_checklist", "recent_sounds", "nearby_species", "get_observation", "ask_expert", "describe") and self.may_speak():
-            if getattr(self, "turn_stale", False):
+            if (getattr(self, "turn_stale", False) or (self.turn_stopped_at is not None
+                    and time.monotonic() - self.turn_stopped_at > 12)):
                 self.log("stale_answer_skipped")  # answering a question asked >12 s ago is confusing
                 return
             await self.generate("answer")
@@ -689,6 +754,7 @@ class Session:
                         waiter.set_exception(RuntimeError("Realtime request rejected"))
                 await self.error("Realtime request failed (" + str(code)[:100] + ").")
         elif ty == "input_audio_buffer.speech_started":
+            self.input_revision += 1
             self.user_speaking = True
             self.awaiting_transcript = True
             if time.monotonic() < self.play_until:
@@ -711,6 +777,7 @@ class Session:
             await self.phone_json({"type": "transcript", "role": "user", "text": text, "final": True})
             self.log("user_transcript", text=text)
             if text.strip():
+                self.input_revision += 1
                 self.pending.append(("text", text, self.speech_stopped_at))  # transcript as text; audio buffer is cleared
                 await self.flush_pending()
         elif ty == "conversation.item.input_audio_transcription.failed":
@@ -776,8 +843,7 @@ class Session:
             if name == "get_observation":
                 return {"observation": obs.payload()}
             if name == "ask_expert":
-                answer = await asyncio.to_thread(expert_answer, str(args["question"]), obs.payload())
-                return {"answer": answer, "note": "expert provider not configured" if answer is None else "expert provider"}
+                return await self.ask_expert(args["question"], obs)
             if name == "discard_observation":
                 obs.status = "discarded"
                 obs.awaiting_answer = False
@@ -1020,6 +1086,7 @@ class Session:
             await self.state()
             await self.flush_pending()
         elif ty == "tap":
+            self.input_revision += 1
             self.tap_at = time.monotonic()
             await self.cancel_speech()
             if self.connected:
@@ -1028,9 +1095,11 @@ class Session:
             text = event.get("text", "")
             if not isinstance(text, str) or not text.strip() or len(text) > 8000:
                 raise ValueError("text must contain 1–8000 characters")
+            self.input_revision += 1
             self.pending.append(("text", text, None))
             await self.flush_pending()
         elif ty == "look":
+            self.input_revision += 1
             await self.request_look(event.get("hint", ""), event.get("group"))
         elif ty == "observation_action":
             obs = self.observations.get(event.get("id"))

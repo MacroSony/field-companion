@@ -5,6 +5,7 @@ out/
 *.pcm
 *.src
 .env
+.env.local
 *.key
 node_modules/
 backend/*.log
