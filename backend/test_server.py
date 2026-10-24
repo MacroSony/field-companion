@@ -879,6 +879,7 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
 
         target.hint = "Old target's bill"
         self.phone.events.clear()
+        self.c.turn_question = "Look at a different plant."
         await self.route("new_observation", {"group": "Plantae"})
         next_target = self.c.observations[self.c.focus]
         self.assertEqual(target.status, "discarded")

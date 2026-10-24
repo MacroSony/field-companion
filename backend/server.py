@@ -32,6 +32,7 @@ from expert import NaturalistExpert, revision as expert_revision
 from investigations import ACTIVE, InvestigationQueue, QueueFull
 from tool_feedback import TOOLS as FEEDBACK_TOOLS, recording as feedback_recording
 from route_safety import route_guard
+from task_status import parse_status_query, explicit_retake
 
 MODEL = "higgs-realtime-1.5-preview"
 SR = 48000
@@ -121,11 +122,16 @@ class Observation:
     touched: float = field(default_factory=time.monotonic, repr=False)
     awaiting_answer: bool = field(default=False, repr=False)
     analysis_status: str = "idle"
+    analysis_stage: str = "idle"
     analysis_request_id: str | None = None
+    analysis_created_at: str | None = None
     image_revision: int = 0
+    analysis_started: float | None = field(default=None, repr=False)
+    analysis_finished: float | None = field(default=None, repr=False)
 
     def payload(self):
-        return {k: v for k, v in asdict(self).items() if k not in ("touched", "awaiting_answer")}
+        return {k: v for k, v in asdict(self).items()
+                if k not in ("touched", "awaiting_answer", "analysis_started", "analysis_finished")}
 
 
 def fuse(detections, allowed=None, priors=None):
@@ -220,12 +226,14 @@ WRITE_TOOLS = ("add_observation", "add_observations", "accept_suggestions",
 TOOLS = [
     tool_schema("look", "Prepare the camera for visual identification ('what is that?'). The phone opens a preview and asks the user to say start; no photo before confirmation. Set group for nonbirds.", {"hint": NAME, "group": {"type": "string", "enum": GROUPS}}),
     tool_schema("get_observation", "Read focus evidence for pronouns and follow-up naturalist questions."),
+    tool_schema("get_task_status", "Read actual photo identification or expert investigation progress without restarting work or explaining results. Use for identification process, status, progress, is it done; select a task when ambiguous.",
+                {**TASK_SELECTOR, "scope": {"type": "string", "enum": ["auto", "camera", "investigations", "all"]}}),
     tool_schema("confirm_observation", "Add it / log it / two of them: confirm the focus, not a new named sighting. No speech.", {"count": COUNT, "notes": NAME}),
     tool_schema("discard_observation", "Discard the focus; do not log it."),
     tool_schema("new_observation", "Look at a different organism: start a new focus and request camera frames.", {"group": {"type": "string", "enum": GROUPS}}),
     tool_schema("describe", "Attach a user description to the focus; resolve only explicit species names.", {"text": NAME, "name": NAME}, ("text",)),
     tool_schema("ask_expert", "Start a background investigation about the current focus: comparisons, conflicting evidence, diet, habitat or behaviour. Returns immediately; never log.", {"question": NAME}, ("question",)),
-    tool_schema("get_investigations", "Check progress. Set explain=true ONLY when the user asks to hear/explain a result or accepts the latest explanation offer. Status checks never read results. Use id (R1 etc.) or first/latest/all.",
+    tool_schema("get_investigations", "Read investigations or explain a requested result. Prefer get_task_status for progress. Set explain=true ONLY when the user asks to hear/explain a result or accepts the latest explanation offer. Use id (R1 etc.) or first/latest/all.",
                 {**TASK_SELECTOR, "explain": {"type": "boolean"}}),
     tool_schema("manage_investigation", "Cancel or retry an investigation. Retry uses its ORIGINAL question and evidence, even after changing focus. Use id or first/latest/all; default latest active for cancel.",
                 {**TASK_SELECTOR, "action": {"type": "string", "enum": ["cancel", "retry"]}}, ("action",)),
@@ -263,6 +271,11 @@ For total count corrections use set_count; for deletion use remove_observation.
 Never claim to have logged anything without a successful tool call. Logging has an earcon,
 not speech. Never give delayed logging acknowledgements, including "I've logged X".
 For "what's that?", "look again", or visual identification call look, NOT speak.
+For task progress/status, including "Check out the identification process", use
+get_task_status. This reads the existing photo/investigation; never call look,
+new_observation or ask_expert to check progress. Completion is still an existing
+task, including before its result is spoken. Only an explicit request for a new
+photo, look again, retake or different subject may restart photo preparation.
 If the latest camera photo is still being captured/analyzed, read get_observation
 for its status instead of starting over, unless the user explicitly asks to retake.
 Look prepares the camera; it never takes a photo until the camera is ready and
@@ -279,8 +292,9 @@ get_observation only reads evidence; it does not supply species facts.
 ask_expert schedules work; its immediate answer is an acknowledgement, not research findings.
 While investigations run, keep handling new questions and sightings normally.
 "How is the first investigation going?", "Any results?", "刚才查得怎么样？"
-use get_investigations, NOT ask_expert. Select the requested R-number or first/latest/all.
-Progress/status questions use explain=false; never read a finished result automatically.
+use get_task_status, NOT ask_expert. Select the requested R-number or first/latest/all;
+use scope=investigations for explicit research, camera for photos, auto if unspecified.
+Progress/status questions never read a finished result automatically.
 "Explain R1", "Tell me the result", "讲一下第一个结果" use get_investigations(explain=true).
 After an investigation-ready offer, "yes", "okay", "go ahead", "好的", "好的，讲一下" accept that
 explanation with get_investigations(explain=true), NOT ask_expert or accept_suggestions.
@@ -407,6 +421,7 @@ class Session:
         self.last_assistant_text = ""
         self.expert_readout = None
         self.investigation_offer_ids = []
+        self.task_status_offer = None
         self.first_audio = False
         self.audio_playback_id = None
         self.rt_lock = asyncio.Lock()
@@ -660,6 +675,170 @@ class Session:
         finally:
             self.expert_readout = None
 
+    def task_status_snapshot(self):
+        """Read canonical work state; never copy findings or change task ownership."""
+        queued = [j.id for j in self.investigations.jobs.values() if j.status == "queued"]
+        rows = [{"id": j.id, "kind": "investigation", "observation_id": j.observation["id"],
+                 "status": j.status, "stage": j.stage, "created_at": j.created_at,
+                 "queue_position": queued.index(j.id) + 1 if j.id in queued else 0}
+                for j in self.investigations.jobs.values()]
+        obs = self.observations.get(self.focus)
+        if obs and obs.status != "discarded" and obs.analysis_request_id:
+            stage = obs.analysis_stage
+            if stage == "idle":  # Compatibility with observations made by older clients/tests.
+                stage = {"awaiting_confirmation": "awaiting_confirmation", "analyzing": "recognizing"}.get(
+                    obs.analysis_status, obs.analysis_status)
+            status = {"awaiting_confirmation": "waiting", "capturing": "running",
+                      "analyzing": "running", "ready": "completed"}.get(obs.analysis_status, obs.analysis_status)
+            linked = [j for j in self.investigations.jobs.values() if j.origin == "vision"
+                      and j.observation["id"] == obs.id
+                      and j.observation.get("image_revision") == obs.image_revision
+                      and j.observation.get("analysis_request_id") == obs.analysis_request_id]
+            pending = (obs.id, obs.image_revision) not in self.vision_answered
+            if obs.analysis_status == "ready":
+                if linked:
+                    job = linked[-1]
+                    stage, status = "expert_" + job.stage, job.status
+                    pending = pending or (job.status == "completed" and not job.announced)
+                elif pending and obs.uncertain and self.expert.available and any(
+                        p[0] == "vision" and isinstance(p[1], dict) and p[1].get("obs") == obs.id
+                        and p[1].get("image_revision") == obs.image_revision for p in self.pending):
+                    stage, status = "awaiting_expert", "queued"
+            finished = obs.analysis_finished or time.monotonic()
+            rows.append({"id": "photo:" + obs.analysis_request_id, "kind": "camera",
+                         "observation_id": obs.id, "request_id": obs.analysis_request_id,
+                         "image_revision": obs.image_revision, "status": status, "stage": stage,
+                         "created_at": obs.analysis_created_at or obs.t_start,
+                         "elapsed_seconds": round(max(0, finished - obs.analysis_started), 1)
+                             if obs.analysis_started is not None else None,
+                         "pending_result": pending if obs.analysis_status == "ready" else False,
+                         "queue_position": queued.index(linked[-1].id) + 1 if linked and linked[-1].id in queued else 0,
+                         "related_investigation_ids": [j.id for j in linked]})
+        return sorted(rows, key=lambda r: datetime.fromisoformat(r["created_at"]).timestamp())
+
+    @staticmethod
+    def task_status_sentence(row, zh=False):
+        if row["kind"] == "investigation":
+            words = {"queued": ("正在排队", "is queued"), "retrieving": ("正在检索资料", "is retrieving sources"),
+                     "analyzing": ("正在分析证据", "is analyzing evidence"),
+                     "completed": ("已完成，结果已就绪", "is complete; its result is ready"),
+                     "failed": ("未能完成，可以重试", "could not finish; it can be retried"),
+                     "timed_out": ("已达到时限，可以重试", "reached its time limit; it can be retried"),
+                     "cancelled": ("已取消", "is cancelled")}
+            stage = row["stage"] if row["stage"] in words else row["status"]
+            label = words.get(stage, ("正在处理", "is running"))[0 if zh else 1]
+            if stage == "queued":
+                label += (f"，排第 {row.get('queue_position', 0)} 位" if zh else
+                          f", position {row.get('queue_position', 0)}")
+            return f"调查 {row['id']}{label}。" if zh else f"Investigation {row['id']} {label}."
+        stage = row["stage"]
+        if stage.startswith("expert_"):
+            expert = {"kind": "investigation", "id": row["related_investigation_ids"][-1],
+                      "status": row["status"], "stage": stage[7:], "queue_position": row.get("queue_position", 0)}
+            return ("图片识别已完成；" if zh else "Image recognition is complete; ") + Session.task_status_sentence(expert, zh)
+        words = {
+            "camera_opening": ("相机正在打开，还没有拍照。", "The camera is opening; no photo has been taken yet."),
+            "awaiting_confirmation": ("相机已就绪，正在等你说 Start 或点击 Identify 后拍照。", "The camera is ready, waiting for Start or Identify before taking a photo."),
+            "capturing": ("正在拍摄并上传照片。", "The camera is taking and uploading the photo."),
+            "range_lookup": ("照片已收到，正在查询本地可能出现的物种。", "The photo has been received; I'm checking local species."),
+            "recognizing": ("照片已收到，图像模型正在识别。", "The photo has been received; the image model is identifying the subject."),
+            "resolving_species": ("图像识别已结束，正在整理候选物种资料。", "Image recognition has finished; I'm matching the candidates with species information."),
+            "fusing": ("正在综合图片、地点和声音证据。", "I'm combining the image results with local and sound evidence."),
+            "awaiting_expert": ("图片识别已完成，专家分析正在等待启动。", "Image recognition is complete; expert analysis is waiting to start."),
+            "ready": ("照片识别已完成，结果已就绪。", "Photo identification is complete; the result is ready."),
+            "failed": ("照片识别未能完成，可以重新尝试。", "Photo identification could not finish; you can request a retry."),
+            "cancelled": ("照片识别已取消。", "Photo identification was cancelled.")}
+        return words.get(stage, ("照片任务正在处理。", "The photo task is being processed."))[0 if zh else 1]
+
+    async def task_status(self, args):
+        scope = args.get("scope", "auto")
+        selection = args.get("selection")
+        if scope not in ("auto", "camera", "investigations", "all") or selection not in (None, "first", "latest", "all"):
+            raise ValueError("Invalid task selection")
+        rows = self.task_status_snapshot()
+        task_id = str(args.get("id") or "").upper()
+        if task_id:
+            rows = [r for r in rows if r["id"].upper() == task_id]
+        elif scope == "camera":
+            rows = [r for r in rows if r["kind"] == "camera"]
+        elif scope == "investigations":
+            rows = [r for r in rows if r["kind"] == "investigation"]
+        elif scope == "auto":
+            linked = {i for r in rows if r["kind"] == "camera" for i in r["related_investigation_ids"]}
+            rows = [r for r in rows if r["id"] not in linked]
+            if selection is None:
+                active = [r for r in rows if r["status"] in ("running", "queued", "waiting")]
+                rows = active or rows[-1:]
+        if selection == "first":
+            rows = rows[:1]
+        elif selection == "latest":
+            rows = rows[-1:]
+        zh = self.chinese(self.turn_question) if self.turn_question else self.lang.startswith("zh")
+        if not rows:
+            return {"ok": True, "tasks": [], "answer": ("没有匹配的拍照识别或调查任务。" if zh else
+                    "There is no matching photo identification or investigation task.")}
+        ambiguous = len(rows) > 1 and scope not in ("all",) and selection != "all"
+        if ambiguous:
+            names = [("照片识别" if zh else "photo identification") if r["kind"] == "camera" else
+                     (f"调查 {r['id']}" if zh else f"investigation {r['id']}") for r in rows[:3]]
+            answer = ("你想查询哪一项：" + "、".join(names) + "？" if zh else
+                      "Which task do you mean: " + ", ".join(names) + "?")
+        else:
+            answer = " ".join(self.task_status_sentence(r, zh) for r in rows[:3])
+            if len(rows) > 3:
+                answer += f" 另有 {len(rows) - 3} 项可在屏幕查看。" if zh else f" There are {len(rows) - 3} more tasks."
+        return {"ok": True, "answer": answer, "tasks": rows, "requires_selection": ambiguous}
+
+    def status_selector(self, text):
+        selector = parse_status_query(str(text))
+        if selector is not None:
+            self.task_status_offer = None
+            return selector
+        offer = self.task_status_offer
+        if (offer and time.monotonic() - offer["at"] <= 30
+                and self.normalized_words(self.last_assistant_text) == self.normalized_words(offer["question"])):
+            value = re.sub(r"\br\s+(\d+)\b", r"r\1", " ".join(self.normalized_words(str(text))))
+            rows = offer["tasks"]
+            if re.fullmatch(r"(?:the )?(?:photo|camera|identification|photo identification)|照 片|相 机|照 片 识 别", value):
+                return {"scope": "camera"}
+            if value in ("all", "both", "all of them", "全 部", "都 要"):
+                return {"scope": "all"}
+            for row in rows:
+                if value in (row["id"].lower(), "investigation " + row["id"].lower(),
+                             "调 查 " + row["id"].lower()):
+                    return {"id": row["id"]}
+            if value in ("first", "the first", "the first one", "第 一 个"):
+                return {"id": rows[0]["id"]}
+            if value in ("last", "the last one", "latest", "最 后 一 个"):
+                return {"id": rows[-1]["id"]}
+        # A different user turn or a newer assistant offer ends this clarification.
+        self.task_status_offer = None
+        return None
+
+    async def speak_task_status(self, args):
+        revision = self.input_revision
+        for _ in range(2):
+            result = await self.task_status(args)
+            if not self.may_speak():
+                return result
+            fingerprint = lambda: [{k: v for k, v in r.items() if k != "elapsed_seconds"}
+                                   for r in self.task_status_snapshot()]
+            snapshot = fingerprint()
+            # Recheck after the model's setup wait: progress may finish while
+            # preparing speech. Re-read instead of speaking an obsolete stage.
+            guard = lambda: self.input_revision == revision and fingerprint() == snapshot
+            response = await self.speak_expert(result["answer"], guard=guard)
+            if self.input_revision != revision or not response or response.get("status") != "deferred":
+                if (self.input_revision == revision and response and response.get("status") == "completed"
+                        and result.get("requires_selection")):
+                    self.task_status_offer = {"question": result["answer"], "tasks": result["tasks"],
+                                              "at": time.monotonic()}
+                return result
+        self.pending.append(("task_status", {"args": dict(args), "revision": revision,
+                                            "question": str(self.turn_question)}, None))
+        await self.flush_pending()
+        return result
+
     async def answer_vision(self, observation_id):
         expected = observation_id if isinstance(observation_id, dict) else None
         observation_id = expected["obs"] if expected else observation_id
@@ -770,6 +949,8 @@ class Session:
             obs.awaiting_answer = False
             if obs.analysis_status != "ready":
                 obs.analysis_status = "cancelled"
+                obs.analysis_stage = "cancelled"
+                obs.analysis_finished = time.monotonic()
         self.pending = deque(p for p in self.pending if p[0] not in ("camera_ready", "camera_start", "camera_photo"))
         if request and self.mic:
             try:
@@ -788,6 +969,9 @@ class Session:
         obs.hint = str(hint or obs.hint)[:500]
         obs.awaiting_answer = False
         obs.analysis_status = "awaiting_confirmation"
+        obs.analysis_stage = "camera_opening"
+        obs.analysis_started = obs.analysis_finished = None
+        obs.analysis_created_at = now_iso()
         obs.touched = time.monotonic()
         request = self.camera_request = {"id": uuid.uuid4().hex, "obs": obs.id,
             "phase": "opening", "confirmed": confirmed, "open_id": open_id,
@@ -798,6 +982,25 @@ class Session:
             await self.mic.send_json({"type": "camera_prepare", "obs": obs.id,
                 "request_id": request["id"], "hint": obs.hint, "open_id": open_id})
         return {"ok": True, "observation": obs.payload(), "waiting_for_confirmation": True}
+
+    async def photo_stage(self, obs, request, stage):
+        if self.camera_request is not request or self.focus != obs.id or obs.status != "open":
+            return False
+        obs.analysis_stage = stage
+        self.log("photo_stage", request_id=request["id"], observation_id=obs.id, stage=stage)
+        await self.broadcast_observation(obs)
+        return self.camera_request is request and self.focus == obs.id and obs.status == "open"
+
+    async def photo_failed(self, obs, request):
+        if self.camera_request is request and self.focus == obs.id and obs.status == "open":
+            request["phase"], request["confirmed"] = "ready", False
+            obs.awaiting_answer = False
+            obs.analysis_status = obs.analysis_stage = "failed"
+            obs.analysis_finished = time.monotonic()
+            await self.broadcast_observation(obs)
+        if self.camera_feedback_request is request:
+            self.camera_feedback_request = None
+            self.pending = deque(p for p in self.pending if p[0] != "camera_photo")
 
     async def camera_ready(self, event):
         request = self.camera_request
@@ -810,6 +1013,11 @@ class Session:
         if not request or event["request_id"] != request["id"] or request["phase"] != "opening":
             return
         request["phase"] = "ready"
+        if obs := self.observations.get(request["obs"]):
+            obs.analysis_stage = "awaiting_confirmation"
+            await self.broadcast_observation(obs)
+        if self.camera_request is not request:
+            return
         if request["confirmed"]:
             await self.queue_camera_start(request)
         else:
@@ -872,6 +1080,9 @@ class Session:
         obs.touched = time.monotonic()
         obs.awaiting_answer = True
         obs.analysis_status = "capturing"
+        obs.analysis_stage = "capturing"
+        obs.analysis_started = time.monotonic()
+        obs.analysis_finished = None
         if not request.get("start_acknowledged"):
             await self.play_feedback("camera-taking", language=request["language"],
                 guard=lambda: self.camera_request is request and request["phase"] == "starting")
@@ -1252,6 +1463,8 @@ class Session:
                                  + json.dumps(focus_context)
                                  + "\nCamera confirmation state (start takes a photo ONLY after ready): "
                                  + json.dumps(self.camera_request)
+                                 + "\nCurrent task status (authoritative stages, no findings; never restart to check progress): "
+                                 + json.dumps(self.task_status_snapshot())
                                  + "\nLatest investigation explanation offer (accept only if it is the latest assistant question): "
                                  + json.dumps(self.investigation_offer_ids)
                                  + "\nInvestigations (context only; never invent progress): "
@@ -1519,13 +1732,13 @@ class Session:
                     self.pending[0] = (kind, value, stopped)
                     self.log("turns_merged", n=len(parts))
             self.turn_stale = stopped is not None and time.monotonic() - stopped > 12
-            if kind in ("notify", "investigation", "camera_ready", "camera_photo", "vision", "feedback") and self.auto_speech_paused:
+            if kind in ("notify", "investigation", "camera_ready", "camera_photo", "vision", "feedback", "task_status") and self.auto_speech_paused:
                 continue
             start_acknowledged = (kind == "camera_start" and self.camera_request
                                   and self.camera_request.get("start_acknowledged"))
-            if kind in ("notify", "investigation", "camera_ready", "camera_start", "camera_photo", "vision", "feedback") and self.playback_pending() and not start_acknowledged:
+            if kind in ("notify", "investigation", "camera_ready", "camera_start", "camera_photo", "vision", "feedback", "task_status") and self.playback_pending() and not start_acknowledged:
                 continue
-            if kind in ("camera_start", "camera_photo", "vision", "feedback") and (self.awaiting_transcript
+            if kind in ("camera_start", "camera_photo", "vision", "feedback", "task_status") and (self.awaiting_transcript
                     or (time.monotonic() < self.play_until and not start_acknowledged)):
                 continue
             if kind == "camera_ready" and (self.awaiting_transcript or not self.may_speak()
@@ -1576,6 +1789,10 @@ class Session:
                         await self.investigation_notice(job)
                 elif kind == "vision":
                     await self.answer_vision(value)
+                elif kind == "task_status":
+                    if value["revision"] == self.input_revision:
+                        self.turn_question = value["question"]
+                        await self.speak_task_status(value["args"])
                 elif kind == "notify":
                     self.proactive_turn = True
                     self.last_proactive = time.monotonic()
@@ -1597,8 +1814,13 @@ class Session:
                         self.log("route_skipped_filler")
                         await self.delete_items(self.turn_items)
                         continue
-                    response = await self.generate("route")
-                    await self.finish_route(response)
+                    selector = self.status_selector(self.turn_question)
+                    if selector is not None:
+                        self.log("task_status_query", source="direct", selector=selector)
+                        await self.speak_task_status(selector)
+                    else:
+                        response = await self.generate("route")
+                        await self.finish_route(response)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -1667,6 +1889,22 @@ class Session:
             return
         call = calls[0]
         name = call["name"]
+        selector = self.status_selector(self.turn_question)
+        if selector is not None:
+            self.log("task_status_query", source="route_guard", requested_tool=name, selector=selector)
+            call = {**call, "name": "get_task_status", "arguments": json.dumps(selector)}
+            name = "get_task_status"
+        elif name in ("look", "new_observation") and not explicit_retake(str(self.turn_question)):
+            obs = self.observations.get(self.focus)
+            if obs and obs.analysis_status == "ready" and obs.image_revision > 0:
+                # A finished photo remains the current subject, including while
+                # its automatic answer or linked expert task waits for speech.
+                self.log("photo_reuse_guard", requested_tool=name, observation_id=obs.id)
+                call = {**call, "name": "get_observation", "arguments": "{}"}
+                name = "get_observation"
+            elif name == "new_observation" and obs and obs.analysis_status in ("capturing", "analyzing", "awaiting_confirmation"):
+                call = {**call, "name": "get_task_status", "arguments": '{"scope":"camera"}'}
+                name = "get_task_status"
         try:
             args = json.loads(call.get("arguments") or "{}")
             if not isinstance(args, dict):
@@ -1727,12 +1965,17 @@ class Session:
         self.log("tool", name=name, arguments=self.audit_args(call.get("arguments")), ok=result.get("ok", True))
         if result.get("suppress_answer"):
             return
-        if name in ("speak", "get_checklist", "recent_sounds", "nearby_species", "get_observation", "ask_expert", "describe", "get_investigations", "manage_investigation") and self.may_speak():
+        if name == "get_task_status" and not result.get("ok"):
+            self.queue_feedback("clarify")
+            return
+        if name in ("speak", "get_checklist", "recent_sounds", "nearby_species", "get_observation", "ask_expert", "describe", "get_investigations", "manage_investigation", "get_task_status") and self.may_speak():
             if (getattr(self, "turn_stale", False) or (self.turn_stopped_at is not None
                     and time.monotonic() - self.turn_stopped_at > 12)):
                 self.log("stale_answer_skipped")  # answering a question asked >12 s ago is confusing
                 return
-            if name in ("ask_expert", "get_investigations", "manage_investigation") and result.get("answer"):
+            if name == "get_task_status":
+                await self.speak_task_status(args)
+            elif name in ("ask_expert", "get_investigations", "manage_investigation") and result.get("answer"):
                 await self.speak_expert(result["answer"])
             else:
                 read_identity = (result.get("observation", {}).get("id"),
@@ -2062,15 +2305,25 @@ class Session:
         return next(dict(r) for r in self.items if r["sci"] == taxon["sci"])
 
     async def tool(self, name, args):
+        if name == "get_task_status":
+            return await self.task_status(args)
         if name in ("get_investigations", "manage_investigation"):
             return await self.investigation_tool(name, args)
         if name == "look":
             if (self.camera_request and self.camera_request["phase"] in ("capturing", "classifying")
-                    and not re.search(r"look again|another photo|retake|different|new subject|再拍|重拍|重新|换一个|再看", self.turn_question, re.I)):
+                    and not explicit_retake(str(self.turn_question))):
                 return {"ok": True, "analysis_pending": True,
                         "analysis_status": self.observations[self.focus].analysis_status}
+            obs = self.observations.get(self.focus)
+            if obs and obs.analysis_status == "ready" and obs.image_revision > 0 and not explicit_retake(str(self.turn_question)):
+                return await self.task_status({"scope": "camera"})
             return await self.request_look(args.get("hint", ""), args.get("group"))
         if name == "new_observation":
+            obs = self.observations.get(self.focus)
+            if (obs and obs.analysis_request_id
+                    and obs.analysis_status in ("ready", "awaiting_confirmation", "capturing", "analyzing")
+                    and not explicit_retake(str(self.turn_question))):
+                return await self.task_status({"scope": "camera"})
             group = args.get("group", "Aves")
             if group not in GROUPS:
                 raise ValueError("invalid iconic group")
@@ -2594,6 +2847,7 @@ class Session:
             lambda event: self.phone_json(event), self.investigation_finished,
             settings=self.investigations.settings)
         self.investigation_offer_ids.clear()
+        self.task_status_offer = None
         self.auto_speech_paused = False
         self.expert_readout = None
         self.turn_question = ""
@@ -2828,6 +3082,7 @@ async def post_frame(request: Request, session: str, obs: str, x: float | None =
     camera["phase"] = "classifying"
     camera["uploaded_at"] = time.monotonic()
     observation.analysis_status = "analyzing"
+    observation.analysis_stage = "range_lookup" if observation.group == "Aves" else "recognizing"
     await s.broadcast_observation(observation)
     if s.camera_request is not camera:
         raise HTTPException(409, "Capture cancelled before classification")
@@ -2837,17 +3092,14 @@ async def post_frame(request: Request, session: str, obs: str, x: float | None =
     s.log("camera_photo_received", request_id=camera["id"])
     try:
         allowed = await asyncio.get_running_loop().run_in_executor(s.executor, s.allowed_species) if observation.group == "Aves" else None
+        if not await s.photo_stage(observation, camera, "recognizing"):
+            raise HTTPException(409, "Capture cancelled before image recognition")
         result = await asyncio.to_thread(classify_frame, jpeg, crop, sorted(allowed) if allowed else None)
     except Exception:
-        if s.camera_request is camera:
-            camera["phase"], camera["confirmed"] = "ready", False
-            observation.awaiting_answer = False
-            observation.analysis_status = "failed"
-            await s.broadcast_observation(observation)
-        if s.camera_feedback_request is camera:
-            s.camera_feedback_request = None
-            s.pending = deque(p for p in s.pending if p[0] != "camera_photo")
+        await s.photo_failed(observation, camera)
         raise
+    if not await s.photo_stage(observation, camera, "resolving_species"):
+        raise HTTPException(409, "Capture cancelled before species lookup")
     candidates = []
     for candidate in result["candidates"]:
         sci = candidate["sci"]
@@ -2867,11 +3119,19 @@ async def post_frame(request: Request, session: str, obs: str, x: float | None =
     s.frames[detection_id] = thumb.getvalue()
     observation.detections.append(detection)
     observation.image_revision += 1
-    await s.refusion(observation)
+    if not await s.photo_stage(observation, camera, "fusing"):
+        raise HTTPException(409, "Capture cancelled before evidence fusion")
+    try:
+        await s.refusion(observation)
+    except Exception:
+        await s.photo_failed(observation, camera)
+        raise
     if s.camera_request is not camera:
         raise HTTPException(409, "Capture cancelled while updating evidence")
     s.camera_request = None
     observation.analysis_status = "ready"
+    observation.analysis_stage = "ready"
+    observation.analysis_finished = time.monotonic()
     s.log("classification_completed", request_id=camera["id"], observation_id=obs,
           image_revision=observation.image_revision, uncertain=observation.uncertain,
           duration_ms=round((time.monotonic() - camera["uploaded_at"]) * 1000),

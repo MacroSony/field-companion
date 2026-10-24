@@ -3,6 +3,24 @@
 The optional [GPT Naturalist expert path](../docs/EXPERT.md) handles complex
 comparisons and species-fact follow-ups without changing the logging fast path.
 
+## Existing task progress and photo reuse
+
+Photo identification and GPT investigations share the read-only `get_task_status`
+tool. Clear English/Chinese progress queries bypass model tool selection and read
+the actual task state. Ambiguous requests ask which task; first/latest/all and
+explicit R IDs are supported. A progress check reports readiness, not findings:
+it does not start work, consume an explanation offer, mark a result announced, or
+erase a queued photo answer. Speech still uses the existing Higgs output path.
+
+Photo stages now distinguish opening/confirmation, capture/upload, local-species
+lookup, image recognition, species-name resolution and evidence fusion. A photo's
+linked visual-expert investigation remains part of its progress after image
+recognition finishes. The backend rechecks the stage before speaking a status.
+Completed current photos survive a mistaken model `look`/`new_observation` call;
+explicit retake/new-subject requests and manual Identify retain their camera action.
+See [TASK_STATUS.md](../docs/TASK_STATUS.md) for selectors, lifecycle and tests.
+Physical phone voice timing still needs hardware verification.
+
 ## Speaker playback safety (2026-10-24)
 
 Speaker mode again alternates listening and replies: queued/active assistant audio

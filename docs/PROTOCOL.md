@@ -56,7 +56,11 @@ One WebSocket per phone: `wss://<host>/ws`. The backend also serves the web app 
 ## Notes
 - Observation payloads additionally expose `analysis_status` (`idle`,
   `awaiting_confirmation`, `capturing`, `analyzing`, `ready`, `failed`, `cancelled`),
-  `analysis_request_id` and integer `image_revision`. Previous candidates are not
+  finer `analysis_stage`, ISO `analysis_created_at`, `analysis_request_id` and
+  integer `image_revision`. Actual image stages are `camera_opening`,
+  `awaiting_confirmation`, `capturing`, `range_lookup`, `recognizing`,
+  `resolving_species`, `fusing`, `ready`, `failed` and `cancelled`; birds use the
+  local-species lookup, while other groups go directly to recognition. Previous candidates are not
   the result of a new photo while its status is capturing/analyzing. Ready is
   published only after fusion and result-queue flags are committed together.
 - Camera readiness/capture uses the phone transport independently of Higgs
@@ -81,6 +85,41 @@ One WebSocket per phone: `wss://<host>/ws`. The backend also serves the web app 
   changing the camera request discards its obsolete queued progress.
 - Audio direction asymmetry is intentional: 48 kHz in (BirdNET needs it), 24 kHz out (Higgs output).
 - All checklist state lives on the backend; reconnecting phones receive `state` + `checklist` right after `hello`.
+
+## Existing task status
+
+`get_task_status` is a model tool, not a new phone WebSocket message. It reads
+canonical camera and investigation state with optional arguments:
+
+```json
+{"scope":"auto","id":"R1","selection":"latest"}
+```
+
+`scope` is `auto` (default), `camera`, `investigations` or `all`; `selection` is
+`first`, `latest` or `all`. An explicit ID selects that existing investigation.
+Auto considers active work first, otherwise the latest retained task. A camera
+photo and its own revision-matched visual-expert investigation are treated as
+one related task. Multiple independent matches ask for a selection; explicit all
+summarizes up to three and reports how many remain.
+
+The internal result is `{ok, answer, tasks, requires_selection?}`. Task rows contain
+identity, kind, state/stage, creation time and queue position; camera rows additionally
+contain request/revision IDs, elapsed seconds, pending-result availability and related
+investigation IDs. Findings, species answers and source contents are excluded.
+Progress never changes `announced`, `vision_answered` or the pending explanation
+offer. A completed task is still queryable before its result has been spoken.
+Ordinary investigation snapshots retain their existing result payload; this
+restriction concerns the status tool and its spoken reply.
+
+Clear English/Chinese progress questions are recognized before tool routing, for
+example “Check out the identification process”, “Any progress?”, “Is it done yet?”,
+“R1进行到哪一步了” and “任务进度”. They use the fixed status sentence through the
+existing Higgs speech path. A second execution guard redirects a misrouted status
+question to the same read-only tool. A ready current photo cannot be replaced by
+an accidental `look`/`new_observation`: identity follow-ups reuse its evidence,
+while explicit retake/look-again/new-subject requests and manual Identify can
+prepare another photo. Queued results remain queued during status reads.
+See [TASK_STATUS.md](TASK_STATUS.md) for stages, consent and verification limits.
 
 ## v0.2: Observations and Look mode (see docs/PLAN.md)
 ### Backend → clients

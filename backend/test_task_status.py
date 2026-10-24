@@ -1,0 +1,422 @@
+"""Offline regressions for camera/research status and unread photo protection."""
+import asyncio
+import io
+import json
+import threading
+from types import SimpleNamespace
+import unittest
+from unittest.mock import AsyncMock, patch
+
+from PIL import Image
+
+import server as s
+from expert import NaturalistExpert, Settings
+from investigations import Investigation
+from test_server import ASGIClient, FakePhone
+
+
+class TaskStatusTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.c = s.Session("task-status-test")
+        self.c.expert = NaturalistExpert(Settings(enabled=False))
+        self.phone = FakePhone()
+        self.client = s.Client(self.phone, self.c)
+        self.client.playback_protocol = 1
+        self.c.clients.add(self.client)
+        self.c.mic = self.client
+        self.c.connected = True
+        self.c.rt_send = AsyncMock()
+        self.c.allowed_species = lambda: set()
+        self.c.play_feedback = AsyncMock(return_value=True)
+        self.c.speak_expert = AsyncMock(return_value={"status": "completed"})
+        self.c.generate = AsyncMock(return_value={"status": "completed", "output": []})
+
+    async def asyncTearDown(self):
+        s.SESSIONS.pop(self.c.id, None)
+        await self.c.close()
+
+    async def photo(self, status="ready"):
+        obs = await self.c.new_focus()
+        obs.analysis_status = status
+        obs.analysis_request_id = "original-photo"
+        obs.image_revision = 1
+        obs.fused = [{"sci": "Haliaeetus leucocephalus", "en": "Bald Eagle", "p": .99}]
+        obs.detections = [s.Detection("image-1", "image", s.now_iso(), [
+            {"sci": "Haliaeetus leucocephalus", "en": "Bald Eagle", "p": .43}])]
+        obs.uncertain = True
+        self.phone.events.clear()
+        return obs
+
+    def research(self, task_id, *, status="running", stage="retrieving"):
+        job = Investigation(task_id, "What does the original bird eat?", {
+            "id": "research-focus", "fused": [{"en": "Blue Jay", "sci": "Cyanocitta cristata"}],
+            "detections": []}, status=status, stage=stage)
+        if status == "completed":
+            job.result = {"ok": True, "answer": "SECRET-RESEARCH-FINDINGS: the bird eats seeds."}
+        self.c.investigations.jobs[task_id] = job
+        return job
+
+    async def route(self, text, name, args=None):
+        self.c.turn_question = text
+        await self.c.finish_route({"status": "completed", "output": [{
+            "type": "function_call", "name": name, "call_id": "status-route",
+            "arguments": json.dumps(args or {})}]})
+
+    def assert_no_camera_commands(self):
+        self.assertFalse(any(e.get("type") in ("camera_prepare", "camera_cancelled", "capture")
+                             for e in self.phone.events))
+
+    def assert_no_findings(self, payload):
+        text = json.dumps(payload, ensure_ascii=False)
+        self.assertNotIn("SECRET-RESEARCH-FINDINGS", text)
+        self.assertNotIn("the bird eats seeds", text)
+
+    async def test_invalid_model_status_arguments_clarify_without_starting_work(self):
+        for arguments in ('{"scope":"invalid"}', '{invalid-json'):
+            await self.c.finish_route({"status": "completed", "output": [{
+                "type": "function_call", "name": "get_task_status", "call_id": "bad-status",
+                "arguments": arguments}]})
+        self.c.speak_expert.assert_not_awaited()
+        self.assertFalse(self.c.investigations.jobs)
+        self.assert_no_camera_commands()
+        self.assertTrue(any(p[0] == "feedback" and p[1]["kind"] == "clarify" for p in self.c.pending))
+
+    async def prepare_upload(self):
+        await self.c.request_look()
+        request = self.c.camera_request
+        await self.c.camera_ready({"request_id": request["id"]})
+        await self.c.camera_confirmation("Start.")
+        obs = self.c.observations[request["obs"]]
+        self.c.names["Haliaeetus leucocephalus"] = {
+            "sci": "Haliaeetus leucocephalus", "en": "Bald Eagle"}
+        data = io.BytesIO()
+        Image.new("RGB", (50, 50), "green").save(data, "JPEG")
+        s.SESSIONS[self.c.id] = self.c
+        self.phone.events.clear()
+        return obs, request, data.getvalue()
+
+    async def upload(self, request, jpeg):
+        async with ASGIClient() as http:
+            return await http.post("/api/frame", params={"session": self.c.id,
+                "obs": request["obs"], "capture": request["id"]}, content=jpeg)
+
+    async def test_no_tasks_returns_an_empty_truthful_status(self):
+        result = await self.c.task_status({})
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["tasks"], [])
+        self.assertTrue(result["answer"])
+        self.c.generate.assert_not_awaited()
+
+    async def test_snapshot_contains_running_and_queued_work_without_findings(self):
+        running = self.research("R1", stage="retrieving")
+        queued = self.research("R2", status="queued", stage="queued")
+        finished = self.research("R3", status="completed", stage="completed")
+        rows = self.c.task_status_snapshot()
+        indexed = {r["id"]: r for r in rows}
+        self.assertEqual(indexed["R1"]["stage"], "retrieving")
+        self.assertEqual(indexed["R2"]["status"], "queued")
+        self.assertEqual(indexed["R3"]["status"], "completed")
+        self.assert_no_findings(rows)
+        self.assertFalse(running.announced or queued.announced or finished.announced)
+        self.assertTrue(all("result" not in r or r["result"] is None for r in rows))
+
+    async def test_camera_snapshot_reports_each_real_processing_stage(self):
+        obs = await self.photo("analyzing")
+        for stage in ("range_lookup", "recognizing", "resolving_species", "fusing"):
+            obs.analysis_stage = stage
+            result = await self.c.task_status({"scope": "camera"})
+            self.assertEqual(len(result["tasks"]), 1)
+            row = result["tasks"][0]
+            self.assertEqual((row["kind"], row["stage"]), ("camera", stage))
+            self.assertEqual(row["id"], "photo:original-photo")
+            self.assertEqual(row["request_id"], "original-photo")
+            self.assertEqual(row["image_revision"], 1)
+            self.assertNotIn("Bald Eagle", result["answer"])
+        self.assert_no_camera_commands()
+
+    async def test_explicit_research_selectors_do_not_read_results_or_announce(self):
+        first = self.research("R1", status="completed", stage="completed")
+        self.research("R2", stage="analyzing")
+        self.c.investigation_offer_ids = ["R1"]
+        for args, expected in (({"id": "R1"}, "R1"),
+                               ({"scope": "investigations", "selection": "first"}, "R1"),
+                               ({"id": "R2"}, "R2")):
+            result = await self.c.task_status(args)
+            self.assertEqual([r["id"] for r in result["tasks"]], [expected])
+            self.assert_no_findings(result)
+        self.assertFalse(first.announced)
+        self.assertEqual(self.c.investigation_offer_ids, ["R1"])
+        self.c.speak_expert.assert_not_awaited()
+
+    async def test_first_task_selection_keeps_completed_first_before_running_second(self):
+        self.research("R1", status="completed", stage="completed")
+        self.research("R2", stage="analyzing")
+        result = await self.c.task_status({"selection": "first"})
+        self.assertEqual([r["id"] for r in result["tasks"]], ["R1"])
+        self.assert_no_findings(result)
+
+    async def test_ambiguous_camera_and_research_status_requests_selection(self):
+        await self.photo("analyzing")
+        self.research("R1")
+        result = await self.c.task_status({})
+        self.assertTrue(result.get("requires_selection"))
+        self.assertGreaterEqual(len(result["tasks"]), 2)
+        self.assert_no_findings(result)
+        self.assert_no_camera_commands()
+
+    async def test_ambiguity_accepts_short_task_selection_only_after_its_own_question(self):
+        await self.photo("analyzing")
+        self.research("R1")
+        result = await self.c.speak_task_status({})
+        self.c.last_assistant_text = result["answer"]  # Actual final output transcript.
+        self.assertEqual(self.c.status_selector("R1"), {"id": "R1"})
+        self.assertEqual(self.c.status_selector("Photo."), {"scope": "camera"})
+        self.assertEqual(self.c.status_selector("照片"), {"scope": "camera"})
+        self.c.last_assistant_text = "Investigation R1 is ready. Would you like me to explain?"
+        self.assertIsNone(self.c.status_selector("Yes."))
+        self.assertIsNone(self.c.status_selector("R1"))
+        self.assert_no_camera_commands()
+
+    async def test_explicit_all_scope_can_summarize_camera_and_research_together(self):
+        await self.photo()
+        self.research("R1")
+        self.research("R2", status="queued", stage="queued")
+        result = await self.c.task_status({"scope": "all"})
+        self.assertFalse(result.get("requires_selection", False))
+        self.assertEqual({r["kind"] for r in result["tasks"]}, {"camera", "investigation"})
+        self.assertEqual({r["id"] for r in result["tasks"]}, {"photo:original-photo", "R1", "R2"})
+        self.assert_no_findings(result)
+
+    async def test_photo_and_its_own_visual_research_are_one_related_status(self):
+        obs = await self.photo()
+        self.c.expert = type("AvailableExpert", (), {"available": True})()
+        job = self.research("R1")
+        job.origin = "vision"
+        job.observation = obs.payload()
+        result = await self.c.task_status({})
+        self.assertFalse(result.get("requires_selection", False))
+        camera = next(r for r in self.c.task_status_snapshot() if r["kind"] == "camera")
+        self.assertEqual(camera["related_investigation_ids"], ["R1"])
+        self.assertEqual(camera["stage"], "expert_retrieving")
+        self.assertFalse(job.announced)
+        self.assert_no_findings(result)
+
+    async def test_ready_uncertain_photo_reports_waiting_for_expert_before_dispatch(self):
+        obs = await self.photo()
+        self.c.expert = type("AvailableExpert", (), {"available": True})()
+        pending = ("vision", {"obs": obs.id, "image_revision": 1,
+                             "request_id": obs.analysis_request_id}, None)
+        self.c.pending.append(pending)
+        result = await self.c.task_status({"scope": "camera"})
+        self.assertEqual(result["tasks"][0]["stage"], "awaiting_expert")
+        self.assertIn(result["tasks"][0]["status"], ("queued", "running"))
+        self.assertTrue(result["tasks"][0]["pending_result"])
+        self.assertIn(pending, self.c.pending)
+        self.assertFalse(self.c.investigations.jobs)
+        self.c.generate.assert_not_awaited()
+
+    async def test_logged_ready_status_phrase_cannot_restart_camera_or_erase_unread_work(self):
+        obs = await self.photo()
+        vision = ("vision", {"obs": obs.id, "image_revision": 1,
+                            "request_id": obs.analysis_request_id}, None)
+        self.c.pending.append(vision)
+        for wrong_tool in ("look", "get_observation", "get_investigations", "speak", "ignore"):
+            await self.route("Check out the identification process.", wrong_tool)
+            self.assertEqual(obs.analysis_status, "ready")
+            self.assertEqual(obs.analysis_request_id, "original-photo")
+            self.assertEqual(obs.image_revision, 1)
+            self.assertIsNone(self.c.camera_request)
+            self.assertIn(vision, self.c.pending)
+            self.assertNotIn((obs.id, 1), self.c.vision_answered)
+            self.assert_no_camera_commands()
+        self.c.generate.assert_not_awaited()
+        self.assertEqual(self.c.speak_expert.await_count, 5)
+
+    async def test_progress_query_during_photo_inference_preserves_capture_request(self):
+        obs = await self.photo("analyzing")
+        request = self.c.camera_request = {"id": "original-photo", "obs": obs.id,
+            "phase": "classifying", "confirmed": True, "language": "en"}
+        await self.route("Check out the identification process.", "look")
+        self.assertIs(self.c.camera_request, request)
+        self.assertEqual(request["phase"], "classifying")
+        self.assertEqual(obs.analysis_status, "analyzing")
+        self.assert_no_camera_commands()
+        self.c.generate.assert_not_awaited()
+
+    async def test_clear_status_request_bypasses_model_routing_and_preserves_ready_work(self):
+        obs = await self.photo()
+        vision = ("vision", {"obs": obs.id, "image_revision": 1,
+                            "request_id": obs.analysis_request_id}, None)
+        self.c.pending.append(vision)
+        delivered = asyncio.Event()
+        pending_at_delivery = []
+        async def speak(*args, **kwargs):
+            pending_at_delivery.extend(self.c.pending)
+            delivered.set()
+            return {"status": "completed"}
+        self.c.speak_expert.side_effect = speak
+        self.c.answer_vision = AsyncMock()
+        self.c.tasks.append(asyncio.create_task(self.c.turn_worker()))
+        await self.c.handle_phone({"type": "text", "text": "Check out the identification process."}, self.client)
+        await asyncio.wait_for(delivered.wait(), 1)
+        self.c.generate.assert_not_awaited()
+        self.assertIn(vision, pending_at_delivery)
+        self.assertEqual(obs.analysis_status, "ready")
+        self.assertEqual(obs.analysis_request_id, "original-photo")
+        self.assert_no_camera_commands()
+
+    async def test_changed_stage_during_status_delivery_queues_fresh_status(self):
+        obs = await self.photo("analyzing")
+        obs.analysis_stage = "recognizing"
+        guards = []
+        async def change_before_speaking(answer, *, guard=None):
+            self.assertIsNotNone(guard)
+            obs.analysis_stage = "resolving_species" if not guards else "fusing"
+            guards.append(guard())
+            return {"status": "deferred"}
+        self.c.speak_expert.side_effect = change_before_speaking
+        await self.route("What is the identification status?", "look")
+        self.assertEqual(guards, [False, False])
+        self.assertTrue(any(p[0] == "task_status" for p in self.c.pending))
+        latest = await self.c.task_status({"scope": "camera"})
+        self.assertEqual(latest["tasks"][0]["stage"], "fusing")
+        self.assert_no_camera_commands()
+
+    async def test_elapsed_clock_alone_does_not_invalidate_an_unchanged_stage(self):
+        obs = await self.photo("analyzing")
+        obs.analysis_stage = "recognizing"
+        obs.analysis_started = 100
+        now = [101.0]
+        guards = []
+        async def setup_delay(answer, *, guard=None):
+            self.assertIsNotNone(guard)
+            now[0] += 1.0  # Model setup took time, but actual work stage is unchanged.
+            guards.append(guard())
+            return {"status": "completed" if guards[-1] else "deferred"}
+        self.c.speak_expert.side_effect = setup_delay
+        with patch.object(s, "time", SimpleNamespace(monotonic=lambda: now[0])):
+            await self.route("What is the identification status?", "look")
+        self.assertEqual(guards, [True])
+        self.assertFalse(any(p[0] == "task_status" for p in self.c.pending))
+
+    async def test_ready_unread_identification_reads_existing_photo_until_explicit_retake(self):
+        obs = await self.photo()
+        await self.route("What is that?", "look")
+        self.assertEqual(obs.analysis_status, "ready")
+        self.assertEqual(obs.analysis_request_id, "original-photo")
+        self.assertIsNone(self.c.camera_request)
+        self.assert_no_camera_commands()
+        await self.route("Look again, take another photo.", "look")
+        self.assertIsNotNone(self.c.camera_request)
+        self.assertNotEqual(self.c.camera_request["id"], "original-photo")
+        self.assertEqual(obs.analysis_status, "awaiting_confirmation")
+        self.assertTrue(any(e.get("type") == "camera_prepare" for e in self.phone.events))
+
+    async def test_mistaken_new_observation_cannot_discard_ready_unread_focus(self):
+        obs = await self.photo()
+        self.c.turn_question = "What is that?"
+        result = await self.c.tool("new_observation", {"group": "Aves"})
+        self.assertEqual(self.c.focus, obs.id)
+        self.assertEqual(obs.status, "open")
+        self.assertEqual(obs.analysis_status, "ready")
+        self.assertEqual(obs.analysis_request_id, "original-photo")
+        self.assertIsNone(self.c.camera_request)
+        self.assert_no_camera_commands()
+        self.assertTrue(result.get("ok", True))
+
+    async def test_status_wording_cannot_explain_a_completed_result_even_if_router_requests_it(self):
+        job = self.research("R1", status="completed", stage="completed")
+        self.c.investigation_offer_ids = ["R1"]
+        await self.route("What is the status of R1?", "get_investigations", {"id": "R1", "explain": True})
+        self.assertFalse(job.announced)
+        self.assertEqual(self.c.investigation_offer_ids, ["R1"])
+        self.assert_no_findings(self.c.speak_expert.await_args.args[0])
+        self.assertIn("R1", self.c.speak_expert.await_args.args[0])
+        self.c.generate.assert_not_awaited()
+
+    async def test_result_consent_keeps_the_existing_explanation_path(self):
+        job = self.research("R1", status="completed", stage="completed")
+        self.c.last_assistant_text = "Investigation R1 is ready. Would you like me to explain?"
+        self.c.investigation_offer_ids = ["R1"]
+        await self.route("Yes.", "get_investigations", {"explain": True})
+        self.assertIn("SECRET-RESEARCH-FINDINGS", self.c.speak_expert.await_args.args[0])
+        self.assertTrue(job.announced)
+        self.assertEqual(self.c.investigation_offer_ids, [])
+
+    async def test_real_upload_progress_does_not_cancel_classification_or_lose_its_result(self):
+        obs, request, jpeg = await self.prepare_upload()
+        started, release = threading.Event(), threading.Event()
+        def classify(*args):
+            started.set()
+            if not release.wait(3):
+                raise RuntimeError("Offline fixture was not released")
+            return {"candidates": [{"sci": "Haliaeetus leucocephalus", "p": .99}]}
+        with patch.object(s, "classify_frame", side_effect=classify):
+            work = asyncio.create_task(self.upload(request, jpeg))
+            try:
+                self.assertTrue(await asyncio.to_thread(started.wait, 1))
+                self.assertEqual(obs.analysis_stage, "recognizing")
+                self.assertEqual(request["phase"], "classifying")
+                await self.route("Check out the identification process.", "look")
+                self.assertIs(self.c.camera_request, request)
+                status = await self.c.task_status({"scope": "camera"})
+                self.assertEqual(status["tasks"][0]["stage"], "recognizing")
+                self.assertFalse(any(e.get("type") in ("camera_prepare", "camera_cancelled")
+                                     for e in self.phone.events))
+            finally:
+                release.set()
+                result = await asyncio.wait_for(work, 2)
+        self.assertEqual(result.status_code, 200)
+        self.assertIsNone(self.c.camera_request)
+        self.assertEqual((obs.analysis_status, obs.analysis_stage), ("ready", "ready"))
+        self.assertEqual(obs.image_revision, 1)
+        self.assertEqual(obs.fused[0]["sci"], "Haliaeetus leucocephalus")
+        vision = next(p[1] for p in self.c.pending if p[0] == "vision")
+        self.assertEqual((vision["obs"], vision["request_id"], vision["image_revision"]),
+                         (obs.id, request["id"], 1))
+
+    async def test_classification_http_failure_has_failed_status_instead_of_running_forever(self):
+        obs, request, jpeg = await self.prepare_upload()
+        with patch.object(s, "classify_frame", side_effect=s.HTTPException(503, "Offline service unavailable")):
+            result = await self.upload(request, jpeg)
+        self.assertEqual(result.status_code, 503)
+        self.assertEqual((obs.analysis_status, obs.analysis_stage), ("failed", "failed"))
+        self.assertFalse(obs.awaiting_answer)
+        status = await self.c.task_status({"scope": "camera"})
+        self.assertEqual((status["tasks"][0]["status"], status["tasks"][0]["stage"]),
+                         ("failed", "failed"))
+        self.assertFalse(any(p[0] == "vision" for p in self.c.pending))
+
+    async def test_late_classification_cannot_overwrite_an_explicit_new_capture_request(self):
+        obs, old, jpeg = await self.prepare_upload()
+        started, release = threading.Event(), threading.Event()
+        def classify(*args):
+            started.set()
+            if not release.wait(3):
+                raise RuntimeError("Offline fixture was not released")
+            return {"candidates": [{"sci": "Haliaeetus leucocephalus", "p": .99}]}
+        with patch.object(s, "classify_frame", side_effect=classify):
+            work = asyncio.create_task(self.upload(old, jpeg))
+            try:
+                self.assertTrue(await asyncio.to_thread(started.wait, 1))
+                self.c.turn_question = "Look again, take another photo."
+                await self.c.tool("look", {})
+                newer = self.c.camera_request
+                self.assertIsNot(newer, old)
+                self.assertEqual(obs.analysis_request_id, newer["id"])
+                self.assertEqual(obs.analysis_stage, "camera_opening")
+            finally:
+                release.set()
+                result = await asyncio.wait_for(work, 2)
+        self.assertEqual(result.status_code, 409)
+        self.assertIs(self.c.camera_request, newer)
+        self.assertEqual((newer["phase"], obs.analysis_status, obs.analysis_stage),
+                         ("opening", "awaiting_confirmation", "camera_opening"))
+        self.assertEqual(obs.analysis_request_id, newer["id"])
+        self.assertEqual(obs.image_revision, 0)
+        self.assertFalse(any(p[0] == "vision" for p in self.c.pending))
+
+
+if __name__ == "__main__":
+    unittest.main()
+

@@ -62,7 +62,7 @@ def serve(port):
                 await self.worker_release.wait()
                 return {"status": "completed", "output": [{"type": "function_call",
                     "name": "ignore", "call_id": "fixture-resumed", "arguments": "{}"}]}
-            if phase == "route" and self.turn_question == "What is that?":
+            if phase == "route" and self.turn_question in ("What is that?", "Look again."):
                 return {"status": "completed", "output": [{"type": "function_call",
                     "name": "look", "call_id": "fixture-look-" + uuid.uuid4().hex,
                     "arguments": "{}"}]}
@@ -75,6 +75,8 @@ def serve(port):
             if phase == "answer" and self.expert_readout:
                 await self.phone_json({"type": "transcript", "role": "assistant",
                                        "text": self.expert_readout, "final": True})
+            elif phase == "answer":
+                await self.phone_json({"type": "fixture_visual_answer"})
             return {"status": "completed", "output": []}
 
         async def fixture_expert(self, question, observation, *, on_progress, **kwargs):
@@ -86,15 +88,18 @@ def serve(port):
         async def handle_phone(self, event, client=None):
             text = event.get("text", "")
             if event.get("type") == "text" and text.startswith("fixture:"):
-                if text == "fixture:voice-look":
+                if text in ("fixture:voice-look", "fixture:voice-retake"):
                     await self.handle_rt({"type": "conversation.item.input_audio_transcription.completed",
-                        "transcript": "What is that?", "item_id": "voice-" + uuid.uuid4().hex})
+                        "transcript": "Look again." if text == "fixture:voice-retake" else "What is that?",
+                        "item_id": "voice-" + uuid.uuid4().hex})
                 elif text == "fixture:voice-start":
                     await self.handle_rt({"type": "conversation.item.input_audio_transcription.completed",
                         "transcript": "Start.", "item_id": "voice-" + uuid.uuid4().hex})
-                elif text in ("fixture:progress", "fixture:ambiguous"):
+                elif text in ("fixture:progress", "fixture:ambiguous", "fixture:status"):
                     await self.handle_rt({"type": "conversation.item.input_audio_transcription.completed",
-                        "transcript": "What do you think?" if text == "fixture:progress" else "Second.",
+                        "transcript": {"fixture:progress": "What do you think?",
+                                       "fixture:ambiguous": "Second.",
+                                       "fixture:status": "Check out the identification process."}[text],
                         "item_id": "voice-" + uuid.uuid4().hex})
                 elif text == "fixture:hold-photo":
                     classification_release.clear()
@@ -300,8 +305,37 @@ async def test(port, cdp):
         await until("window.__messages.slice(" + str(before_manual) + ").some(e=>e.text===\"I'm still analyzing the photo. I'll tell you when it's ready.\")")
         assert await js("document.querySelectorAll('#observation-evidence img').length === 0")
         results["processingQueryDoesNotInventIdentification"] = True
+        status_marker = await js("window.__messages.length")
+        status_uploads = await js("window.__uploads.length")
+        status_encodes = await js("window.__encodes.length")
+        await voice_input("fixture:status")
+        await until("window.__messages.slice(" + str(status_marker) + ").some(e=>e.text===\"The photo has been received; the image model is identifying the subject.\")")
+        assert await js("window.__uploads.length") == status_uploads
+        assert await js("window.__encodes.length") == status_encodes
+        assert not await js("window.__messages.slice(" + str(status_marker) + ").some(e=>e.type==='camera_prepare' || e.type==='capture' || e.text==='Camera ready. Say start to take a photo.')")
+        results["identificationProgressReadsCanonicalStateWithoutRecapture"] = True
+        # Finish the image while a conversation occupies the worker, leaving
+        # the existing visual answer queued behind a genuine status question.
+        ready_marker = await js("window.__messages.length")
+        await js("window.__sockets[0].send(JSON.stringify({type:'text',text:'fixture:hold-worker'}))")
+        await until("window.__messages.slice(" + str(ready_marker) + ").some(e=>e.type==='fixture_busy')")
         await js("window.__sockets[0].send(JSON.stringify({type:'text',text:'fixture:release-photo'}))")
         await until("document.querySelectorAll('#observation-evidence img').length === 1 && !document.getElementById('camera-shutter').disabled")
+        assert not await js("window.__messages.slice(" + str(ready_marker) + ").some(e=>e.type==='fixture_visual_answer')")
+        await voice_input("fixture:status")
+        await js("window.__sockets[0].send(JSON.stringify({type:'text',text:'fixture:release-worker'}))")
+        await until("window.__messages.slice(" + str(ready_marker) + ").some(e=>e.text==='Photo identification is complete; the result is ready.')")
+        await until("window.__messages.slice(" + str(ready_marker) + ").some(e=>e.type==='fixture_visual_answer')")
+        ready_messages = await js("window.__messages.slice(" + str(ready_marker) + ")")
+        status_done = next(i for i, e in enumerate(ready_messages)
+                           if e.get("text") == "Photo identification is complete; the result is ready.")
+        auto_answer = next(i for i, e in enumerate(ready_messages) if e.get("type") == "fixture_visual_answer")
+        assert status_done < auto_answer
+        assert not any(e.get("type") in ("camera_prepare", "capture")
+                       or e.get("text") == "Camera ready. Say start to take a photo." for e in ready_messages)
+        assert await js("window.__uploads.length") == status_uploads
+        assert await js("window.__encodes.length") == status_encodes
+        results["completedUnreadPhotoProgressDoesNotRestartCamera"] = True
         await until("window.__messages.slice(" + str(before_manual) + ").some(e=>e.text==='Photo ready. Starting identification.')")
         manual_messages = await js("window.__messages.slice(" + str(before_manual) + ")")
         taking = next(i for i, e in enumerate(manual_messages) if e.get("text") == "Start taking photo.")
@@ -356,11 +390,11 @@ async def test(port, cdp):
         assert await js("window.__streams[0].getAudioTracks()[0].readyState === 'live'")
         # Look opens a usable preview and announces readiness, without even
         # encoding a frame. A second completed STT turn authorizes the photo.
-        async def voice_ready():
+        async def voice_ready(*, retake=False):
             marker = await js("window.__messages.length")
             uploads = await js("window.__uploads.length")
             encodes = await js("window.__encodes.length")
-            await voice_input("fixture:voice-look")
+            await voice_input("fixture:voice-retake" if retake else "fixture:voice-look")
             await until("window.__messages.slice(" + str(marker) + ").some(e=>e.text==='Camera ready. Say start to take a photo.') && !document.getElementById('camera-shutter').disabled")
             await asyncio.sleep(.3)
             assert await js("window.__uploads.length") == uploads
@@ -386,7 +420,7 @@ async def test(port, cdp):
         await until("window.__messages.slice(" + str(voice_marker) + ").some(e=>e.text==='Photo ready. Starting identification.')")
         feedback_before_capture(before_voice)
         before_voice = len(events)
-        await voice_ready()
+        await voice_ready(retake=True)
         voice_marker = await js("window.__messages.length")
         await voice_input("fixture:voice-start")
         await until("document.querySelectorAll('#observation-evidence img').length === 2 && !document.getElementById('camera-shutter').disabled")
@@ -394,7 +428,7 @@ async def test(port, cdp):
         feedback_before_capture(before_voice)
         results["voiceCameraReadyThenStartWithCameraClosedAndOpen"] = True
         results["voiceStartSpeaksTakingThenPhotoReady"] = True
-        await voice_ready()
+        await voice_ready(retake=True)
         uploads = await js("window.__uploads.length")
         await js("Object.defineProperty(document,'hidden',{configurable:true,value:true}); document.dispatchEvent(new Event('visibilitychange'))")
         assert await js("window.__streams.filter(s=>s.getVideoTracks().length).every(s=>s.getTracks().every(t=>t.readyState==='ended'))")
@@ -405,7 +439,7 @@ async def test(port, cdp):
         assert await js("window.__uploads.length") == uploads
         assert await js("document.getElementById('camera-panel').hidden")
         results["backgroundInvalidatesConfirmation"] = True
-        await voice_ready()
+        await voice_ready(retake=True)
         await voice_input("fixture:voice-start")
         await until("document.querySelectorAll('#observation-evidence img').length === 3 && !document.getElementById('camera-shutter').disabled")
         results["backgroundStopsCameraOnly"] = True
