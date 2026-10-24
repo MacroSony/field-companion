@@ -98,3 +98,12 @@ observations below are retained as the before-fix record, not current status.
 6. Settings/debug drawer (mic picker, capture line, model id, text input, speaker/earphones, headset button); clearer labels for Quiet vs Speaker/Earphones vs Pause vs Tap — low.
 7. Decide Look scope before merging PR #1/#2; if in scope: PR #1 model first, port PR #2 deliberately.
 8. Later: retire transcript-echo heuristic after physical validation; split server.py into modules (1–2 days, not before demo).
+
+## F. Live test after round 1 (Oct 24 00:02–00:16, branch fix/round1; speaker mode then 2× earphones, phone + laptop test clips)
+Overall: much better. Mic checks → speak (3/3), hearing questions → recent_sounds (8/8), accept/remove/count corrections correct, reset works, no exotic false positives (species heard: Black-capped Chickadee, Robin, Cardinal, Song Sparrow, Red-winged Blackbird, Blue Jay, Mourning Dove, House Finch, Canada Goose + a few plausible confusions: Carolina Chickadee ×4, Tufted Titmouse, Western Barn Owl, Golden-crowned Kinglet). Earcon 0.6–1.9 s; spoken answers 1.8–2.7 s.
+- F1 Fillers still sometimes act: "Ah." / "Okay." → get_checklist + spoken readout (00:07:25, 00:11:19); "Uh." → add_observations (00:08:34); "As a check-up only." → remove_observation (00:08:37). ("Oh." correctly ignored.)
+- F2 Read-then-write intent: "Add whatever you heard recently." → recent_sounds (spoken) — the write happened one turn later on a filler ("Uh." → add_observations). Same family as E2.
+- F3 Echo filter false positive in earphones mode: "As a song sparrow." dropped as echo (00:13:45) — probably the user's "Add the song sparrow" after the assistant said "...a song sparrow"; user had to repeat.
+- F4 STT mangles short confirmations ("Add both for me" → "Advocates." / "That bowls for me." / "Had." / "And."); router still accepted correctly thanks to pending-suggestion context. Tension with the "garbled → ignore" rule.
+- F5 Tool arguments are not logged, so wrong adds/removes can't be audited from logs. Log tool args + result summary.
+- F6 Similar songs: Carolina vs Black-capped Chickadee (Carolina is rare in Toronto; consider a stricter threshold for species with low local counts).
