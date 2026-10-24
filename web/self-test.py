@@ -50,7 +50,7 @@ async def main():
         await call('Emulation.setGeolocationOverride', latitude=43.66, longitude=-79.39, accuracy=10)
         await call('Browser.grantPermissions', permissions=['audioCapture', 'geolocation'], origin='http://localhost:8877')
         await call('Page.addScriptToEvaluateOnNewDocument', source='''
-            window.__stops = 0; window.__starts = []; window.__contexts = []; window.__sockets = []; window.__micRequests = 0;
+            window.__stops = 0; window.__starts = []; window.__contexts = []; window.__sockets = []; window.__micRequests = 0; window.__gains = []; window.__sources = [];
             const gum = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
             navigator.mediaDevices.getUserMedia = (...args) => { window.__micRequests++; return gum(...args); };
             const WS = window.WebSocket;
@@ -58,8 +58,16 @@ async def main():
             const AC = window.AudioContext;
             window.AudioContext = class extends AC {
               constructor(...args) { super(...args); window.__contexts.push(this); }
+              createGain() {
+                const gain = super.createGain(), connect = gain.connect.bind(gain);
+                gain.__destinations = [];
+                gain.connect = (...args) => { gain.__destinations.push(args[0]); return connect(...args); };
+                window.__gains.push(gain); return gain;
+              }
               createBufferSource() {
-                const s = super.createBufferSource(), stop = s.stop.bind(s), start = s.start.bind(s);
+                const s = super.createBufferSource(), stop = s.stop.bind(s), start = s.start.bind(s), connect = s.connect.bind(s);
+                s.__destinations = []; window.__sources.push(s);
+                s.connect = (...args) => { s.__destinations.push(args[0]); return connect(...args); };
                 s.stop = (...args) => { window.__stops++; return stop(...args); };
                 s.start = (...args) => { if (Number.isFinite(args[0])) window.__starts.push({scheduled: args[0], now: this.currentTime, duration: s.buffer?.duration || 0}); return start(...args); };
                 return s;
@@ -99,12 +107,15 @@ async def main():
         assert results['items'] == 4 and results['heard'] == 2 and results['candidates'] == 3, results
         assert results['sampleRate'] == 48000 and results['flushStoppedSources'] > 0 and not results['overflow'], results
         assert await evaluate("window.__contexts[0] && document.getElementById('capture-settings').textContent.includes('echoCancellation: true')")
-        assert await evaluate("document.getElementById('interrupt-hint').textContent.includes('stop')")
+        assert await evaluate("document.getElementById('interrupt-hint').textContent.includes('Tap to interrupt') && document.getElementById('audio-mode').textContent.includes('tap to interrupt')")
         results['speakerEchoCancellation'] = True
         assert await evaluate("document.getElementById('audio-mode').getAttribute('aria-pressed')") == 'false'
         await evaluate("document.getElementById('audio-mode').click()")
         assert await evaluate("document.getElementById('audio-mode').getAttribute('aria-pressed') === 'true' && localStorage.getItem('field-earphones') === 'true'")
+        assert await evaluate("document.getElementById('interrupt-hint').textContent.includes('Say something to interrupt') && document.getElementById('audio-mode').textContent.includes('voice interruption on')")
         await evaluate("document.getElementById('audio-mode').click()")
+        assert await evaluate("document.getElementById('interrupt-hint').textContent.includes('Tap to interrupt') && document.getElementById('earphone-tip').textContent.includes('ignores voice')")
+        results['speakerTapAndEarphoneVoiceGuidance'] = True
         await evaluate("""window.__sockets[0].dispatchEvent(new MessageEvent('message', {data: JSON.stringify({type:'suggestions',items:[
           {sci:'Cardinalis cardinalis',en:'Northern Cardinal',conf:.87}, {sci:'Turdus migratorius',en:'American Robin',conf:.82}
         ]})}));""")
@@ -121,6 +132,54 @@ async def main():
         assert any(m.get('type') == 'playback' and m.get('active') is False for m in messages)
         results['audioModesAndPlaybackReports'] = True
         results['suggestionChipActions'] = True
+        # Silence assistant output without changing microphone audio or the
+        # existing playback timeline; both current and future chunks share a bus.
+        await evaluate("""(() => {
+          const ws = window.__sockets[0], json = message => ws.dispatchEvent(new MessageEvent('message', {data:JSON.stringify(message)}));
+          json({type:'flush'}); json({type:'audio_start',id:'mute-check'});
+          for (let i=0;i<2;i++) ws.dispatchEvent(new MessageEvent('message',{data:new ArrayBuffer(48000)}));
+          json({type:'audio_end',id:'mute-check'});
+          window.__muteBaseline = {starts:window.__starts.length, stops:window.__stops, micRequests:window.__micRequests};
+        })()""")
+        await asyncio.sleep(.1)
+        muted = await evaluate("""(async () => {
+          document.getElementById('assistant-mute').click();
+          // Scheduled AudioParam values take effect on the audio render thread.
+          await new Promise(resolve => setTimeout(resolve, 50));
+          const ws=window.__sockets[0], ac=window.__contexts[0];
+          ws.dispatchEvent(new MessageEvent('message',{data:JSON.stringify({type:'transcript',role:'assistant',text:'Muted reply stays in captions.',final:true})}));
+          const output=window.__gains.filter(g=>g.__destinations.includes(ac.destination));
+          ws.dispatchEvent(new MessageEvent('message',{data:JSON.stringify({type:'earcon',kind:'heard'})}));
+          return {outputCount:output.length,gain:output[0]?.gain.value,
+            pcmSharesOutput:window.__sources.slice(-2).every(s=>s.__destinations.length===1 && s.__destinations[0]===output[0]),
+            toneSharesOutput:window.__gains.some(g=>g.__destinations.includes(output[0])),
+            pressed:document.getElementById('assistant-mute').getAttribute('aria-pressed'),
+            visibleStatus:!document.getElementById('start-note').hidden && document.getElementById('start-note').textContent.includes('Assistant muted'),
+            caption:document.getElementById('assistant-caption').textContent,
+            sameStarts:window.__starts.length===window.__muteBaseline.starts,sameStops:window.__stops===window.__muteBaseline.stops};
+        })()""")
+        assert muted == {'outputCount': 1, 'gain': 0, 'pcmSharesOutput': True, 'toneSharesOutput': True, 'pressed': 'true', 'visibleStatus': True,
+                         'caption': 'Muted reply stays in captions.', 'sameStarts': True, 'sameStops': True}, muted
+        mic_before_mute = sum(e.get('method') == 'Network.webSocketFrameSent' and e['params']['response']['opcode'] == 2 for e in events)
+        await asyncio.sleep(.2)
+        assert sum(e.get('method') == 'Network.webSocketFrameSent' and e['params']['response']['opcode'] == 2 for e in events) > mic_before_mute
+        mute_reports = [json.loads(e['params']['response']['payloadData']) for e in events
+                        if e.get('method') == 'Network.webSocketFrameSent' and e['params']['response']['opcode'] == 1]
+        assert any(m.get('type') == 'playback' and m.get('response_id') == 'mute-check' and m.get('active') is True for m in mute_reports)
+        assert {'type': 'output_mute', 'muted': True} in mute_reports
+        unmuted = await evaluate("""(async () => {
+          document.getElementById('assistant-mute').click();
+          await new Promise(resolve => setTimeout(resolve, 50));
+          const output=window.__gains.find(g=>g.__destinations.includes(window.__contexts[0].destination));
+          return {gain:output.gain.value,sameStarts:window.__starts.length===window.__muteBaseline.starts,
+            sameStops:window.__stops===window.__muteBaseline.stops,micUnchanged:window.__micRequests===window.__muteBaseline.micRequests};
+        })()""")
+        assert unmuted == {'gain': 1, 'sameStarts': True, 'sameStops': True, 'micUnchanged': True}, unmuted
+        await asyncio.sleep(.05)
+        mute_messages = [json.loads(e['params']['response']['payloadData']) for e in events
+                         if e.get('method') == 'Network.webSocketFrameSent' and e['params']['response']['opcode'] == 1]
+        assert [m for m in mute_messages if m.get('type') == 'output_mute'][-1] == {'type': 'output_mute', 'muted': False}
+        results['assistantMutePreservesCaptureCaptionsAndPlayback'] = True
         # Queue 40 seconds immediately in a suspended real AudioContext. Stream
         # synthesis can run much faster than playback; no waiting for 40 seconds.
         burst = await evaluate("""(async () => {
@@ -153,10 +212,18 @@ async def main():
         results['phoneMapMarkers'] = await evaluate("document.querySelectorAll('.leaflet-marker-icon').length")
         results['youAreHereDot'] = await evaluate("!!document.querySelector('.leaflet-interactive')")
         assert results['phoneMapMarkers'] == 4 and results['youAreHereDot']
-        await evaluate("document.getElementById('map-card').open = false; window.__sockets[0].close()")
+        await evaluate("document.getElementById('map-card').open = false; document.getElementById('assistant-mute').click()")
+        await asyncio.sleep(.05)
+        mute_sent_before_reconnect = sum(e.get('method') == 'Network.webSocketFrameSent' and e['params']['response']['opcode'] == 1
+            and json.loads(e['params']['response']['payloadData']) == {'type': 'output_mute', 'muted': True} for e in events)
+        await evaluate("window.__sockets[0].close()")
         await asyncio.sleep(2.5)
         results['autoReconnect'] = await evaluate("window.__sockets.length >= 2 && document.getElementById('connection').classList.contains('online')")
         assert results['autoReconnect'], results
+        assert sum(e.get('method') == 'Network.webSocketFrameSent' and e['params']['response']['opcode'] == 1
+            and json.loads(e['params']['response']['payloadData']) == {'type': 'output_mute', 'muted': True} for e in events) > mute_sent_before_reconnect
+        assert await evaluate("document.getElementById('assistant-mute').getAttribute('aria-pressed')") == 'true'
+        await evaluate("document.getElementById('assistant-mute').click()")
         await evaluate("document.querySelectorAll('.counter')[0].lastElementChild.click()")
         await asyncio.sleep(.2)
         assert await evaluate("document.querySelector('.counter output').value") == '5'
@@ -189,9 +256,11 @@ async def main():
         results['ebirdColumns'] = len(rows[0])
         results['genericRowsIncludingHeader'] = 5
         results['gpsInExport'] = rows[0][6:8]
+        await evaluate("document.getElementById('assistant-mute').click()")
         await evaluate("document.getElementById('export-dialog').close(); document.getElementById('stop').click()")
         await asyncio.sleep(.3)
         assert await evaluate("document.getElementById('start').hidden") is False
+        assert await evaluate("document.getElementById('assistant-mute').getAttribute('aria-pressed')") == 'false'
         await evaluate("window.__starts=[]; document.getElementById('start').click()")
         await asyncio.sleep(1)
         await evaluate("document.getElementById('tap').click()")

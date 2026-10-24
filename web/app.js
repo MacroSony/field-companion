@@ -1,6 +1,6 @@
 'use strict';
 (() => {
-  const CLIENT_BUILD = '2026-10-24-task-receipts';
+  const CLIENT_BUILD = '2026-10-24-camera-intent';
   const $ = id => document.getElementById(id);
   const params = new URLSearchParams(location.search);
   const displayMode = params.get('display') === '1';
@@ -12,7 +12,7 @@
     listening: false, speaking: false, items: [], heard: [], investigations: [], coords: null,
     startedAt: null, endedAt: null, model: '', retry: 0
   };
-  let earphones = false;
+  let earphones = false, assistantMuted = false, assistantGain = null;
   try {
     earphones = localStorage.getItem('field-earphones') === 'true';
   } catch (_) { /* Storage may be unavailable; speaker is the safe default. */ }
@@ -50,10 +50,14 @@
   function updateControls() {
     camera.updateConnection();
     if ($('audio-mode')) {
-      $('audio-mode').textContent = earphones ? 'Earphones · voice interruption on' : 'Speaker · voice or tap to interrupt';
+      $('audio-mode').textContent = earphones ? 'Earphones · voice interruption on' : 'Speaker · tap to interrupt';
       $('audio-mode').setAttribute('aria-pressed', String(earphones));
     }
-    if ($('interrupt-hint')) $('interrupt-hint').textContent = earphones ? 'Say something to interrupt' : 'Say “stop” or tap to interrupt';
+    if ($('assistant-mute')) {
+      $('assistant-mute').disabled = !audioEnabled;
+      $('assistant-mute').setAttribute('aria-pressed', String(assistantMuted));
+    }
+    if ($('interrupt-hint')) $('interrupt-hint').textContent = earphones ? 'Say something to interrupt' : 'Tap to interrupt; speak after the reply';
     if ($('earphone-tip')) $('earphone-tip').hidden = false;
     $('tap').disabled = $('send').disabled = !state.connected;
     $('reconnect').hidden = !replaced;
@@ -65,7 +69,8 @@
     $('mic-label').textContent = state.paused ? 'Resume mic' : 'Pause mic';
     $('mic-icon').textContent = state.paused ? '▷' : 'Ⅱ';
     $('start').hidden = state.running || replaced;
-    $('start-note').hidden = state.running;
+    $('start-note').textContent = assistantMuted ? 'Assistant muted · microphone and captions stay on' : 'Microphone needs HTTPS or localhost';
+    $('start-note').hidden = state.running && !assistantMuted;
     $('stop').hidden = !state.running;
     $('start').disabled = state.starting;
     const playing = playback.size > 0 || state.speaking;
@@ -298,6 +303,14 @@
     state.speaking = false;
     updateControls();
   }
+  function assistantOutput() {
+    if (!assistantGain) {
+      assistantGain = context.createGain();
+      assistantGain.gain.value = assistantMuted ? 0 : 1;
+      assistantGain.connect(context.destination);
+    }
+    return assistantGain;
+  }
   function playPCM(bytes) {
     if (!audioEnabled || !context || !state.running || bytes.byteLength < 2) return;
     const count = Math.floor(bytes.byteLength / 2);
@@ -306,7 +319,7 @@
     for (let i = 0; i < count; i++) channel[i] = view.getInt16(i * 2, true) / 32768;
     const source = context.createBufferSource();
     source.buffer = buffer; // WebAudio resamples 24 kHz to the shared context rate.
-    source.connect(context.destination);
+    source.connect(assistantOutput());
     // Reset only when the AudioContext changes. A long queue in the same clock
     // is valid; resetting it would overlap the next chunk with earlier speech.
     if (playbackContext !== context) {
@@ -340,7 +353,7 @@
       gain.gain.setValueAtTime(0, now + delay);
       gain.gain.linearRampToValueAtTime(.055, now + delay + .012);
       gain.gain.exponentialRampToValueAtTime(.0001, now + delay + duration);
-      oscillator.connect(gain).connect(context.destination);
+      oscillator.connect(gain).connect(assistantOutput());
       tones.add(oscillator);
       oscillator.onended = () => { tones.delete(oscillator); oscillator.disconnect(); gain.disconnect(); };
       oscillator.start(now + delay); oscillator.stop(now + delay + duration + .01);
@@ -378,6 +391,7 @@
       ws.send(JSON.stringify(helloMessage()));
       state.connected = true; state.retry = 0;
       lastSentCoords = state.coords ? {...state.coords} : null;
+      if (audioEnabled) send({type: 'output_mute', muted: assistantMuted});
       if (!displayMode) {
         send({type: 'audio_mode', earphones});
         send({type: 'mic', on: !!stream && !state.paused});
@@ -747,6 +761,7 @@
     stream?.getTracks().forEach(track => track.stop()); stream = null;
     capture?.disconnect(); micSource?.disconnect(); capture = micSource = null;
     const oldWakeLock = wakeLock, oldContext = context;
+    assistantGain?.disconnect(); assistantGain = null; assistantMuted = false;
     wakeLock = null; context = null; nextPlaybackTime = 0;
     $('level-fill').style.width = '0%'; $('mic-meter').setAttribute('aria-valuenow', '0');
     captureSettings();
@@ -800,6 +815,14 @@
     earphones = !earphones;
     try { localStorage.setItem('field-earphones', String(earphones)); } catch (_) {}
     if (state.connected && !displayMode) send({type: 'audio_mode', earphones});
+    updateControls();
+  });
+  $('assistant-mute')?.addEventListener('click', () => {
+    assistantMuted = !assistantMuted;
+    // Keep microphone capture, captions and the playback clock unchanged.
+    // Muting the shared output also silences sources already queued or playing.
+    if (assistantGain && context) assistantGain.gain.setValueAtTime(assistantMuted ? 0 : 1, context.currentTime);
+    if (state.connected) send({type: 'output_mute', muted: assistantMuted});
     updateControls();
   });
   $('start').addEventListener('click', start);

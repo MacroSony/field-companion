@@ -29,6 +29,15 @@ class CameraConfirmationTests(unittest.IsolatedAsyncioTestCase):
     def captures(self):
         return [e for e in self.phone.events if e["type"] == "capture"]
 
+    def finish_playback(self):
+        # Model the phone's drained playback and elapsed acoustic tail before
+        # speaking again in Speaker mode; manual camera buttons need no wait.
+        ended = s.time.monotonic() - 1
+        self.c.play_until = self.c.echo_estimate = ended
+        for client in self.c.playback_clients():
+            client.playback_active = client.playback_pending = False
+            client.playback_end = ended
+
     async def ready(self, **kwargs):
         await self.c.request_look(**kwargs)
         request = self.c.camera_request
@@ -71,6 +80,7 @@ class CameraConfirmationTests(unittest.IsolatedAsyncioTestCase):
         for text in ("Start.", "开始。", "开始拍照", "take a photo"):
             with self.subTest(text=text):
                 request = await self.ready()
+                self.finish_playback()
                 await self.c.handle_rt({"type": "conversation.item.input_audio_transcription.completed",
                     "transcript": text, "item_id": "voice-start"})
                 self.assertEqual(request["phase"], "capturing")
@@ -199,6 +209,7 @@ class CameraConfirmationTests(unittest.IsolatedAsyncioTestCase):
                 self.phone.events.clear()
                 request = await self.ready(confirmed=manual)
                 if not manual:
+                    self.finish_playback()
                     await self.c.handle_rt({"type": "conversation.item.input_audio_transcription.completed",
                         "transcript": "Start.", "item_id": "start-1"})
                 await self.c.start_camera_capture(request["id"])

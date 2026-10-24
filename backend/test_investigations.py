@@ -187,7 +187,9 @@ class InvestigationSessionTests(unittest.IsolatedAsyncioTestCase):
     async def test_slow_expert_releases_voice_worker_for_more_questions_and_jobs(self):
         self.c.connected = True
 
-        async def generate(phase):
+        async def generate(phase, *, guard=None):
+            if guard is not None and not guard():
+                return {"status": "deferred"}
             self.generated.append((phase, self.c.expert_readout))
             if phase == "route":
                 text = self.c.turn_question

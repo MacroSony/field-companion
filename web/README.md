@@ -8,7 +8,7 @@ Plain HTML/CSS/JS, no build step. Serve this directory at `/` with the protocol 
 
 - Phone: `/?session=demo` (the session defaults to `demo`). Tap **Start listening**, allow the microphone, and use earphones. Phones require HTTPS; localhost also works.
 - Projector: `/?display=1&session=demo`. Connects automatically with `role=display`, never requests the microphone or GPS, and is silent by default. Designed for 1280×720 and 1920×1080 landscape.
-- Projector audio: add `&audio=1`, then click **Start display audio** to unlock WebAudio. Phone speech continues during playback; speaker/projector interruption waits for a non-echo transcript before cancelling. Earphones without an audio-enabled display can interrupt at voice onset. Tap remains an immediate fallback.
+- Projector audio: add `&audio=1`, then click **Start display audio** to unlock WebAudio. While assistant audio is playing, use **Tap to talk** on the phone to interrupt; voice interruption is disabled even if the phone is set to Earphones. Keep displays silent to use earphone voice interruption.
 - Session and role parameters are forwarded to the WebSocket, including when using the optional `?ws=wss%3A%2F%2Fother-host%2Fws` override. Hello is always first and uses `lang: "en"`.
 - English common names are primary, scientific names italicized below. `zh` fields are ignored. Photos appear on observations, heard detections, candidates, and map popups. Missing or failed photos fall back to a local source icon.
 - The phone's **Observation map** is collapsed initially. The projector map is always open. Observation coordinates determine markers and bounds; the phone additionally shows its available GPS position as a blue dot. Displays do not invent a phone location.
@@ -16,6 +16,23 @@ Plain HTML/CSS/JS, no build step. Serve this directory at `/` with the protocol 
 ## Microphones and headset buttons
 
 Open the header **Settings** gear for Speaker/Earphones, **Quiet (only speaks when you tap)**, microphone and capture diagnostics, model/build IDs, headset controls, **Type instead**, CSV export, and **Reset session**. Heard nearby and the map start collapsed on phones. The main controls are Start/End, **Tap to talk** (the next thing you say is addressed to the assistant; tap again to stop speech), and **Pause mic** (stops mic capture/transmission).
+
+**Speaker mode uses alternating listening and replies.** During assistant playback
+and its short echo tail, microphone audio is withheld from conversational speech
+recognition. Wait for the reply to finish, or use **Tap to talk** to stop it before
+speaking. A spoken “stop” during a reply is not heard in Speaker mode. Microphone
+capture and BirdNET processing retain their existing behavior; BirdNET still skips
+windows contaminated by assistant playback. **Earphones** keeps voice interruption
+when no audio-enabled display is connected. The setting chooses conversation
+behavior, not the phone's hardware audio route.
+
+**Mute assistant** temporarily sets only the shared assistant output gain to zero,
+including current/queued speech and earcons. Captions, microphone transmission and
+playback/drained timing continue, so audible and silent output can be compared
+without phone volume controls. It does not enable voice interruption in Speaker
+mode. The main screen shows the muted state; reconnect keeps
+it, End/page reload restores audible output, and unmuting never replays old audio.
+`output_mute` reports are diagnostic only and do not change BirdNET or mic policy.
 
 After **Start listening** grants permission, use **Microphone** in Settings to choose the phone, USB-C, or headset input. The device ID and label are saved locally. Switching acquires and connects the new input before stopping the old track, preserving the old input on failure; a missing saved or disconnected input falls back to the system default. The small debug line shows actual track settings and AudioContext rate ("not reported" means the browser omitted a setting). Speaker/Earphones controls conversation behavior, not hardware routing.
 
@@ -40,7 +57,7 @@ Mock checklist state is shared per session, persists through reconnects, and cle
 ## Implementation notes
 
 - Start unlocks a shared AudioContext and requests 48 kHz mono input with echo cancellation enabled, noise suppression and automatic gain control disabled. An AudioWorklet captures PCM16 in 20 ms chunks. A stateful linear JS resampler handles other negotiated rates; it is not a production band-limited resampler.
-- Hello includes `client_build` (`2026-10-24-tool-feedback`) and `playback_protocol: 1`; an optional differing `server_build` in state shows a reload banner. Absence is supported. Service-worker cache is bumped with this build. Deploy frontend and backend together.
+- Hello includes the current deployment's `client_build` and `playback_protocol: 1`; an optional differing `server_build` in state shows a reload banner. Absence is supported. Service-worker cache is bumped with each deployment. Deploy frontend and backend together.
 - GPS never delays hello. Late fixes and subsequent movement over 200 m send `location`. A replaced mic (backend reason `Replaced by newer microphone`, or a replacement state/error) stops audio/capture and auto-reconnect; the user must tap the takeover notice to reconnect.
 - Reset in Settings and the display header confirms **Clear checklist, suggestions, heard history, investigations and conversation?**, sends `reset`, and immediately clears local outing state, camera evidence, investigation cards and captions. Server reset cancels old investigations and starts a fresh queue/conversation.
 - Incoming 24 kHz PCM is queued sequentially through WebAudio, including queues over 30 seconds. The playback clock resets only when its AudioContext changes or an explicit flush occurs. Matching `audio_start` / `audio_end` and drained acknowledgements keep ready offers behind existing playback. Flush stops speech and earcons. Disconnected edits are disabled; reconnect uses backoff. Stale mic frames are dropped instead of buffered.

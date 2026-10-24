@@ -3,6 +3,40 @@
 The optional [GPT Naturalist expert path](../docs/EXPERT.md) handles complex
 comparisons and species-fact follow-ups without changing the logging fast path.
 
+## Existing task progress and photo reuse
+
+Photo identification and GPT investigations share the read-only `get_task_status`
+tool. Clear English/Chinese progress queries bypass model tool selection and read
+the actual task state. Ambiguous requests ask which task; first/latest/all and
+explicit R IDs are supported. A progress check reports readiness, not findings:
+it does not start work, consume an explanation offer, mark a result announced, or
+erase a queued photo answer. Speech still uses the existing Higgs output path.
+
+Photo stages now distinguish opening/confirmation, capture/upload, local-species
+lookup, image recognition, species-name resolution and evidence fusion. A photo's
+linked visual-expert investigation remains part of its progress after image
+recognition finishes. The backend rechecks the stage before speaking a status.
+Completed current photos survive a mistaken model `look`/`new_observation` call;
+explicit retake/new-subject requests and manual Identify retain their camera action.
+See [TASK_STATUS.md](../docs/TASK_STATUS.md) for selectors, lifecycle and tests.
+Physical phone voice timing still needs hardware verification.
+
+## Speaker playback safety (2026-10-24)
+
+Speaker mode again alternates listening and replies: queued/active assistant audio
+and the existing short echo tail block PCM from reaching Higgs. The send path also
+rechecks the gate after waiting for the Realtime send lock. Guarded VAD/STT cannot
+cancel playback, change the input revision, or trigger camera/other tasks. Bounded
+VAD records retain blocked-turn provenance for delayed final transcripts, without
+treating a reused provider item ID as permanently blocked.
+
+Use **Tap to talk** to stop a reply, then speak after its short tail. Earphones
+retain voice interruption while displays are silent; an audio-enabled display
+also requires the safe gate. Typed messages and camera buttons remain available.
+Microphone ring/filter processing continues for BirdNET, with its existing
+speaker-contaminated window exclusions. This restores the safe interaction policy;
+it does not claim to repair physical acoustic echo cancellation.
+
 ## Phone-log fixes (2026-10-24)
 
 Camera confirmation sends its capture command directly on the phone socket after
@@ -65,11 +99,35 @@ not a claim that every photo starts a GPT investigation. The photo cue waits for
 the previous playback and ongoing conversation and is discarded on cancellation
 or a changed focus. Results wait for the progress audio to drain.
 
-Current build: `2026-10-24-task-receipts`.
+That build: `2026-10-24-task-receipts`.
 All 169 offline tests pass. Regressions replay the unwanted Yes/Okay receipts, preserve investigation consent,
 and check task confirmation ordering, invalid/cancelled/stale routes and camera
 phase feedback. Browser media/classification are fixtures; physical phone playback
 and camera behavior still need user verification.
+
+## Short speaker echoes and mute control (2026-10-24)
+
+Phone logs captured the assistant's cached prompts returning as `Taking photo`,
+`I hurt you` (after `I heard you`) and `Photo ready`. These exact short variants
+are suppressed only against their matching recent cached output in speaker mode,
+during playback or its two-second tail. The general echo threshold is unchanged;
+single-word Start/Stop, valid offer consent and new questions remain supported.
+Unprompted Yes/Okay and filler are rejected before cancelling current playback.
+Dropped echo/ignored inputs are removed from model history. This is a bounded
+lexical safeguard, not a guarantee of acoustic echo cancellation.
+
+Settings now includes temporary **Mute assistant**, independent of system volume.
+The client keeps the same microphone/captions/PCM scheduling and drained reports,
+with the shared assistant PCM/earcon gain at zero. It sends diagnostic-only
+`output_mute` events on connect/toggle; these do not change BirdNET input or gates.
+The main screen displays mute; reconnect retains it and End/reload resets it.
+
+Current build: `2026-10-24-speaker-echo`. Offline tests replay the observed prompt
+echoes, pre-interruption rejection, valid consent/commands and output-state
+diagnostics. Browser tests additionally verify shared zero gain, continued mic
+packets/captions/reports and no replay/flush when muting or unmuting. Real phone
+acoustic behavior still requires a user check.
+Validation: 176 offline tests and both isolated browser suites passed.
 
 ## Camera confirmation (2026-10-24)
 

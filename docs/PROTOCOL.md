@@ -6,15 +6,26 @@ One WebSocket per phone: `wss://<host>/ws`. The backend also serves the web app 
 - `wss://<host>/ws?role=mic&session=<id>` (default role `mic`, default session `demo`): the phone. It sends mic audio and commands and receives everything below.
 - `wss://<host>/ws?role=display&session=<id>`: a big-screen view (laptop/projector, URL `/?display=1`). It receives the same JSON messages (checklist, heard, transcripts, candidates, state). It receives assistant audio only with `&audio=1` (so the audience can hear). It sends no mic audio, but may send `text`, `edit`, `delete`.
 - One backend session = one Higgs Realtime session + one BirdNET pipeline + one checklist, shared by all devices in it. Exactly one mic device per session; a newer mic replaces the older one.
-- **Echo guard**: speaker mode (`earphones=false`) and audio-enabled displays use transcript-confirmed interruption. Microphone audio continues to Realtime during playback. VAD alone is a candidate; a non-echo transcript cancels generation, flushes queued playback and routes the new question. Earphones without an audio-enabled display cancel at VAD start. Spoken “stop” / “等一下” cancels without a spoken acknowledgement, keeps investigations running, and defers automatic notices until the next user turn. Tap cancels immediately. Playback estimates, actual playback reports and their 500 ms tail (800 ms for legacy clients) still protect BirdNET and automatic notifications; they do not close Realtime input.
+- **Echo guard**: speaker mode (`earphones=false`) and audio-enabled displays use alternating listening/playback. During queued/active assistant playback and its 500 ms tail (800 ms for legacy clients), microphone PCM is not enqueued or sent to Realtime. VAD and final STT received in that interval are ignored before interruption/routing; a bounded FIFO of VAD turns also rejects delayed finals from blocked turns. Upstream item IDs can repeat, so records are consumed individually in order and expire after 30 seconds. Speaker users must wait for the reply or tap to stop, then speak after the short tail. Spoken “stop” during playback cannot interrupt in this mode. Earphones without an audio-enabled display keep voice-onset interruption: “stop” / “等一下” cancels without a spoken acknowledgement, keeps investigations running, and defers automatic notices until the next user turn. Tap cancels immediately in both modes. Typed messages and camera buttons remain available.
 - In speaker mode, three-second BirdNET windows containing any assistant-playback/tail samples are dropped and logged (`bird_window_skipped`, reason `assistant_playback`). Earphone-mode BirdNET is unchanged, including with an audio-enabled display.
 - Independently of output mode, recent assistant speech is compared to incoming STT before routing: up to three spoken transcripts, within ten seconds of assistant speech. A contiguous match of at least three normalized English words, or six tokens for Chinese (individual Chinese characters are tokens), covering >=70% of the input drops an echo (`echo_dropped`). Shorter inputs and explicit stop commands pass. Typed text is not filtered. This heuristic supplements browser acoustic echo cancellation.
+- In speaker mode, three observed short/misheard cached-cue echoes additionally
+  match the complete utterance during their matching playback or its two-second
+  tail: `Taking photo`, `Photo ready`, and `I hurt you` (from `I heard you`). This
+  does not lower the general word threshold or filter single-word Start/Stop.
+  Known filler/unprompted Yes/Okay is ignored before cancelling current playback;
+  matching logging/explanation consent and meaningful new questions still pass
+  whenever the playback input gate is open.
+  Dropped echo/ignored items are removed from retained model history.
 
 ## Phone → backend
 - **Binary frames**: microphone audio, PCM16 little-endian, mono, **48 kHz**, about 20–40 ms per frame. The browser requests echoCancellation=true, noiseSuppression=false and autoGainControl=false. Actual processing depends on browser/device support.
 - **JSON text frames**:
   - `{"type":"hello","lat":43.66,"lng":-79.39,"lang":"zh","earphones":false}`: sent first. GPS, language and boolean `earphones` are optional; each new mic defaults to speaker mode. The mic may repeat hello with its current language/output mode when an initially pending GPS fix arrives; subsequent observations use the updated location.
-  - `{"type":"audio_mode","earphones":true|false}`: mic only; change output policy. `false` = speaker / transcript-confirmed interruption; `true` = earphones / voice-onset interruption unless an audio-enabled display requires transcript confirmation. The UI persists the selection locally and sends it on connect and change.
+  - `{"type":"audio_mode","earphones":true|false}`: mic only; change output policy. `false` = speaker / tap to interrupt; `true` = earphones / voice-onset interruption unless an audio-enabled display requires the safe playback input gate. The UI persists the selection locally and sends it on connect and change.
+  - `{"type":"output_mute","muted":true|false}`: informational per-client output
+    state, logged for diagnostics. No input, model or playback policy changes.
+    The client sends it on connect and whenever its temporary mute is toggled.
   - `{"type":"playback","active":true|false}`: audio-output client reports when scheduled assistant audio actually starts and when its last queued source finishes, including after flush. End times are measured at backend receipt, not supplied by the client. Audio-enabled displays may report too. Reports never shorten the backend estimate.
   - `{"type":"mic","on":true|false}`: mic paused or resumed.
   - `{"type":"mode","quiet":true|false}`: quiet mode. Logging still works, but the assistant only speaks after a tap.
@@ -35,7 +46,7 @@ One WebSocket per phone: `wss://<host>/ws`. The backend also serves the web app 
   - `{"type":"heard","sci":"...","en":"...","zh":"...","conf":0.87,"t":"<iso>","new":true}`: an eligible BirdNET detection: two distinct windows >=0.5 within ten seconds, or one >=0.7 hit. `new` means the first qualifying event for this species in the outing; `unusual` is false/absent. Lower eligible hits >=0.25 remain queryable through `recent_sounds`, but are not sent as heard events. Reset clears backend heard history; clients should also clear their local outing display when resetting.
   - `{"type":"transcript","role":"user"|"assistant","text":"...","final":true|false}`: captions.
   - `{"type":"candidates","items":[{"sci":"...","en":"...","zh":"...","photo":"https://...","why":"..."}]}`: identification candidates to show as cards (describe-to-ID / photo ID).
-  - `{"type":"state","listening":true,"speaking":false,"model":"higgs-realtime-1.5-preview","connected":true,"echo_guard":true,"session":"demo"}`: status for the UI indicator. `echo_guard` describes transcript confirmation and BirdNET playback protection, not whether Realtime microphone input is being dropped.
+  - `{"type":"state","listening":true,"speaking":false,"model":"higgs-realtime-1.5-preview","connected":true,"echo_guard":true,"session":"demo"}`: status for the UI indicator. `echo_guard` means the playback input gate is enabled; PCM is dropped only while playback or its tail is pending. `listening` still describes whether microphone capture is enabled, including audio retained for BirdNET.
   - `{"type":"error","message":"..."}`
   - `{"type":"investigations","items":[{"id":"R1","question":"...","observation_id":"ob3","species":"Blue Jay","status":"running","stage":"analyzing","queue_position":0,"announced":false,"result":null}],"capacity":5,"timeout_seconds":180}`:
     full investigation state on connect/hello and task changes. Completed results
@@ -45,7 +56,11 @@ One WebSocket per phone: `wss://<host>/ws`. The backend also serves the web app 
 ## Notes
 - Observation payloads additionally expose `analysis_status` (`idle`,
   `awaiting_confirmation`, `capturing`, `analyzing`, `ready`, `failed`, `cancelled`),
-  `analysis_request_id` and integer `image_revision`. Previous candidates are not
+  finer `analysis_stage`, ISO `analysis_created_at`, `analysis_request_id` and
+  integer `image_revision`. Actual image stages are `camera_opening`,
+  `awaiting_confirmation`, `capturing`, `range_lookup`, `recognizing`,
+  `resolving_species`, `fusing`, `ready`, `failed` and `cancelled`; birds use the
+  local-species lookup, while other groups go directly to recognition. Previous candidates are not
   the result of a new photo while its status is capturing/analyzing. Ready is
   published only after fusion and result-queue flags are committed together.
 - Camera readiness/capture uses the phone transport independently of Higgs
@@ -70,6 +85,41 @@ One WebSocket per phone: `wss://<host>/ws`. The backend also serves the web app 
   changing the camera request discards its obsolete queued progress.
 - Audio direction asymmetry is intentional: 48 kHz in (BirdNET needs it), 24 kHz out (Higgs output).
 - All checklist state lives on the backend; reconnecting phones receive `state` + `checklist` right after `hello`.
+
+## Existing task status
+
+`get_task_status` is a model tool, not a new phone WebSocket message. It reads
+canonical camera and investigation state with optional arguments:
+
+```json
+{"scope":"auto","id":"R1","selection":"latest"}
+```
+
+`scope` is `auto` (default), `camera`, `investigations` or `all`; `selection` is
+`first`, `latest` or `all`. An explicit ID selects that existing investigation.
+Auto considers active work first, otherwise the latest retained task. A camera
+photo and its own revision-matched visual-expert investigation are treated as
+one related task. Multiple independent matches ask for a selection; explicit all
+summarizes up to three and reports how many remain.
+
+The internal result is `{ok, answer, tasks, requires_selection?}`. Task rows contain
+identity, kind, state/stage, creation time and queue position; camera rows additionally
+contain request/revision IDs, elapsed seconds, pending-result availability and related
+investigation IDs. Findings, species answers and source contents are excluded.
+Progress never changes `announced`, `vision_answered` or the pending explanation
+offer. A completed task is still queryable before its result has been spoken.
+Ordinary investigation snapshots retain their existing result payload; this
+restriction concerns the status tool and its spoken reply.
+
+Clear English/Chinese progress questions are recognized before tool routing, for
+example “Check out the identification process”, “Any progress?”, “Is it done yet?”,
+“R1进行到哪一步了” and “任务进度”. They use the fixed status sentence through the
+existing Higgs speech path. A second execution guard redirects a misrouted status
+question to the same read-only tool. A ready current photo cannot be replaced by
+an accidental `look`/`new_observation`: identity follow-ups reuse its evidence,
+while explicit retake/look-again/new-subject requests and manual Identify can
+prepare another photo. Queued results remain queued during status reads.
+See [TASK_STATUS.md](TASK_STATUS.md) for stages, consent and verification limits.
 
 ## v0.2: Observations and Look mode (see docs/PLAN.md)
 ### Backend → clients
