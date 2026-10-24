@@ -579,6 +579,11 @@ class Session:
     def normalized_words(text):
         return "".join(c.lower() if c.isalnum() else " " for c in text).split()
 
+    @staticmethod
+    def filler_only(text):
+        words = re.sub(r"[^\w\s]", "", str(text).lower()).split()
+        return bool(words) and all(w in {"ah", "uh", "um", "oh", "hmm", "mm", "mmhmm", "mhm", "er", "erm"} for w in words)
+
     def remember_spoken(self, key, text):
         if not text.strip():
             return
@@ -843,6 +848,10 @@ class Session:
                 else:
                     if kind == "text":
                         await self.inject(value)
+                    if self.filler_only(value):
+                        self.log("route_skipped_filler")
+                        await self.delete_items(self.turn_items)
+                        continue
                     response = await self.generate("route")
                     await self.finish_route(response)
             except asyncio.CancelledError:

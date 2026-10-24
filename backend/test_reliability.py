@@ -78,6 +78,23 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(deleted.isdisjoint(self.c.conversation_ids))
         self.c.finish_route.assert_awaited_once()
 
+    async def test_filler_guard_silent_deletes_user_without_routing(self):
+        self.c.generate = AsyncMock()
+        self.c.tool = AsyncMock()
+        self.c.suggestions = {"pending": {}}
+        self.c.pending.extend(('text', text, None) for text in ['Ah.', 'Uh.', 'Um, hmm!', 'Mm-hmm.', 'mhm er erm oh mm'])
+        self.c.turn_task = asyncio.create_task(self.c.turn_worker())
+        self.c.tasks.append(self.c.turn_task)
+        self.c.work_ready.set()
+        await self.wait_idle()
+        self.c.generate.assert_not_awaited()
+        self.c.tool.assert_not_awaited()
+        self.c.phone_json.assert_not_awaited()
+        self.assertFalse(self.c.conversation_ids)
+        self.assertEqual(len([e for e in self.events if e['type'] == 'conversation.item.delete']), 5)
+        for text in ['Okay.', 'yes', 'yeah', 'sure', 'Ah, add it', '']:
+            self.assertFalse(self.c.filler_only(text), text)
+
     async def test_answer_and_post_tool_failures_never_retry(self):
         for phase, executed in [('answer', False), ('route', True)]:
             self.statuses = ['failed']
