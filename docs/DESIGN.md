@@ -42,6 +42,13 @@ Birders rarely talk to themselves in the field. Speech is usually a sighting, a 
 - Sessions close after ~5 min without speech: reconnect automatically and inject a short checklist summary.
 - **Model**: `higgs-realtime-1.5-preview` (listed in /v1/models since Oct 23 evening; set it in both the URL and `session.model`, because the latter overrides the URL). Earlier tests ran on unversioned `higgs-realtime`; re-validating on 1.5.
 
+### UI decisions (Oct 23)
+- **English common names + Latin (scientific) names** everywhere; no Chinese in the UI. Voice input can still be any language.
+- Candidate and species photos: iNaturalist default taxon photos.
+- **Map** of observations (GPS per record): nice-to-have.
+- Demo phone: Android + Chrome.
+- **Multi-device**: the phone is the mic (+ earphones); a laptop at `/?display=1` mirrors the session (checklist, heard strip, captions, map) on the projector, optionally playing the assistant's voice for the audience (half-duplex echo guard).
+
 ## 4. Tools exposed to Higgs Realtime
 | Tool | Purpose |
 |---|---|
