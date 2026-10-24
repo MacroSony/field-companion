@@ -8,12 +8,14 @@ from functools import lru_cache
 import io
 import math
 import os
+from pathlib import Path
 import threading
 import time
 import warnings
 
-os.environ.setdefault("HF_HOME", "/data/build/hf-cache")
-os.environ.setdefault("TMPDIR", "/data/build/tmp")
+# Keep downloaded models in the ignored workspace cache on every platform.
+# An explicitly configured Hugging Face cache still takes precedence.
+os.environ.setdefault("HF_HOME", str(Path(__file__).resolve().parents[1] / "out" / "hf-cache"))
 
 import numpy as np
 from PIL import Image, ImageOps, UnidentifiedImageError
@@ -112,7 +114,7 @@ class VisionEngine:
         compile_original = torch.compile
         try:
             torch.compile = lambda model, *args, **kwargs: model
-            self.tree = TreeOfLifeClassifier(device="cpu")
+            self.tree = TreeOfLifeClassifier(model_str="hf-hub:imageomics/bioclip-2", device="cpu")
         finally:
             torch.compile = compile_original
         self.tree.model.eval()

@@ -75,7 +75,41 @@ the complete real BioCLIP → expert → Higgs spoken flow still need hardware t
   silent/audio-enabled displays. Its screenshots/JSON remain in ignored output.
 - JS syntax checks, Python AST parsing and `git diff --check` passed.
 
-The development computer serves the updated app on localhost:8791. At this
-validation point its real BioCLIP service was not running and its separate model
-dependencies were not installed; photo classification in the browser test was
-deliberately a fixture, not evidence of real-species accuracy.
+Those camera browser checks used a fixture classifier. A subsequent real-model
+installation is recorded below; neither run used a physical phone camera.
+
+## Real BioCLIP installation — 2026-10-24
+
+Installed `.venv-vision` with Python 3.12, torch 2.8.0+cpu, torchvision 0.23.0+cpu,
+pybioclip 2.1.6, open-clip-torch 3.3.0 and huggingface-hub 2.3.0. Both the voice
+and vision environments pass `pip check`; all 72 backend tests still pass.
+Model weights and species embeddings are cached in ignored `out/hf-cache/`.
+
+The real service on 127.0.0.1:8795 reports `loaded: true`, model
+`imageomics/bioclip-2` and 867,455 taxa. Four publicly sourced iNaturalist default
+photos were checked, with provenance/attribution retained in ignored output:
+
+| Photo label | Real open-classifier top candidate | HTTP duration |
+| --- | --- | --- |
+| Common Milkweed | Asclepias syriaca | 3,279 ms |
+| Northern Cardinal | Cardinalis cardinalis | 2,253 ms |
+| Blue Jay | Cyanocitta cristata | 1,900 ms |
+| Monarch | Danaus plexippus | 2,150 ms |
+
+These are four clear reference photographs, possibly overlapping training data;
+they are an installation smoke check, not a held-out accuracy benchmark.
+Results are in `out/vision-setup/real-model-results.json`; sources are in
+`out/vision-setup/photos/sources.json`.
+
+A separate `vision-install-*` session on the real app backend (127.0.0.1:8791)
+also passed for Blue Jay and Monarch: `look` → JPEG POST → real BioCLIP →
+Observation/top candidates → Higgs PCM reply → explicit confirmation. Image POSTs
+returned HTTP 200 in 3,875 ms and 3,437 ms respectively; both top candidates
+matched the photo labels. The session confirmed two species and generated
+147,840 PCM bytes, consumed by the test without playback. It used file uploads,
+not a microphone or physical camera. Report: `out/vision-setup/backend-live-results.json`.
+
+The vision service stays running; use `backend/start_vision.ps1 -Background` to
+start it after a future shutdown. The script refuses an occupied port rather
+than loading a second model. Physical phone camera, audio routing, autofocus
+and in-field identification remain separate acceptance checks.

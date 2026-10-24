@@ -316,6 +316,14 @@ claim. The expert remains a stub; browser camera behavior was not tested here.
 
 ## Vision service
 
+Windows CPU setup and the `backend/start_vision.ps1` launcher are documented in
+[LOCAL_DEVELOPMENT.md](../docs/LOCAL_DEVELOPMENT.md#install-and-start-bioclip-on-windows).
+Use the separate `.venv-vision` and `requirements-vision.txt`. The default Hugging
+Face cache is now the repository's ignored `out/hf-cache/`, with `HF_HOME` still
+taking precedence. The model is explicitly BioCLIP 2 rather than a library default.
+For a portable HTTP check of an already-running service, use
+`python backend/vision_smoke.py path/to/photo.jpg`.
+
 Standalone, loopback-only BioCLIP 2 process; no changes to `server.py` are needed
 for running it. The main backend must call this JSON API from its own venv.
 Do not expose this unauthenticated service publicly. One process/worker only.

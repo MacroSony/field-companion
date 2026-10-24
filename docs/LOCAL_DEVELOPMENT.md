@@ -61,6 +61,44 @@ HTTPS. The server's session state is in memory.
 
 ## Camera development
 
+### Install and start BioCLIP on Windows
+
+Use the dedicated CPU environment, leaving the existing voice environment alone:
+
+```powershell
+.\.venv\Scripts\python.exe -m venv .venv-vision
+.\.venv-vision\Scripts\python.exe -m pip install --upgrade pip
+.\.venv-vision\Scripts\python.exe -m pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cpu
+.\.venv-vision\Scripts\python.exe -m pip install -r requirements-vision.txt
+.\backend\start_vision.ps1
+```
+
+The first start downloads the model and species embeddings; later starts reuse
+ignored `out/hf-cache/`. An existing `HF_HOME` setting overrides this location.
+The service uses the operating system's temporary directory, including on Windows.
+It listens only at `http://127.0.0.1:8795`; the main backend already defaults to
+that address. Startup finishes only after model load and warmup.
+
+To start hidden in the background instead, run
+`.\backend\start_vision.ps1 -Background`. Logs and the launcher PID are written
+to ignored `out/vision-service/`. This is a development process, not a Windows
+service or a boot-time task. If the port is occupied, the script leaves that
+process alone.
+
+Check readiness with `Invoke-RestMethod http://127.0.0.1:8795/health`; expect
+`loaded: true` and `model: imageomics/bioclip-2`. Test a local JPEG with:
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -B backend/vision_smoke.py bird.jpg --report out/vision-check.json
+```
+
+The smoke check calls the running model and saves ranked species, timing and
+crop information. It does not load another model or claim field accuracy.
+The pinned CPU pair follows the [official PyTorch installation commands](https://pytorch.org/get-started/previous-versions/);
+BioCLIP uses the [official pybioclip package](https://imageomics.github.io/pybioclip/).
+
+### Camera interface and browser checks
+
 Open **Look closer** after starting the session. The camera has separate permission
 and leaves microphone input running when it is closed. Real identification also
 requires the BioCLIP service; see [CAMERA.md](CAMERA.md) for setup and limitations.
