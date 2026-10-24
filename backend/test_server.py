@@ -41,7 +41,7 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([e["type"] for e in self.phone.events], ["state", "checklist"])
         vad = self.c.session()["audio"]["input"]["turn_detection"]
         self.assertFalse(vad["create_response"])
-        self.assertTrue(vad["interrupt_response"])
+        self.assertFalse(vad["interrupt_response"])  # manual barge-in only
         self.assertEqual(self.c.config("route")["tool_choice"], "required")
         self.assertEqual(self.c.config("answer")["tools"], [])
 
@@ -173,7 +173,7 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
     async def test_transcription_enqueues_route(self):
         await self.c.handle_rt({"type": "input_audio_buffer.speech_stopped"})
         await self.c.handle_rt({"type": "conversation.item.input_audio_transcription.completed", "transcript": "two birds"})
-        self.assertEqual(self.c.pending[0][0], "audio")
+        self.assertEqual(self.c.pending[0][0], "text")
         self.assertIsNotNone(self.c.pending[0][2])
 
     async def test_realtime_reconnect_reinjects_checklist(self):
