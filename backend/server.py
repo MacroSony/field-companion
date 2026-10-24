@@ -869,6 +869,8 @@ class Session:
             if os.environ.get("TEMPLATE_ANSWERS") == "1" and name in ("recent_sounds", "get_checklist"):
                 if await self.template_answer(name, result):
                     return
+                if not self.may_speak() or (self.turn_stopped_at is not None and time.monotonic() - self.turn_stopped_at > 12):
+                    return
             await self.generate("answer")
 
     async def template_answer(self, name, result):

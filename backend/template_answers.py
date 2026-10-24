@@ -48,7 +48,8 @@ def build_answer(name, result):
         text = f'{len(items)} species logged so far: ' + joined(names[:3]) + (f' and {len(names)-3} more' if len(names) > 3 else '') + f'. {count} ' + ('individual' if count == 1 else 'individuals') + ' in total.'
     else:
         return None
-    return expand_numbers(text[0].upper() + text[1:])
+    text = expand_numbers(text)
+    return re.sub(r'(^|[.!?] )([a-z])', lambda m: m[1] + m[2].upper(), text)
 
 
 class SpeechStream:
