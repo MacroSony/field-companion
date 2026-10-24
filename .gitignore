@@ -8,6 +8,12 @@ out/
 !backend/audio/check-zh.wav
 !backend/audio/camera-ready-en.wav
 !backend/audio/camera-ready-zh.wav
+!backend/audio/camera-taking-en.wav
+!backend/audio/camera-taking-zh.wav
+!backend/audio/photo-ready-en.wav
+!backend/audio/photo-ready-zh.wav
+!backend/audio/received-en.wav
+!backend/audio/received-zh.wav
 *.pcm
 *.src
 .env

@@ -179,6 +179,7 @@ window.FieldCamera = class FieldCamera {
   }
   look() {
     if (!this.connected() || this.displayMode || this.busy || !this.stream) return;
+    this.status('Start taking photo…');
     this.send({type: 'look', group: this.$('camera-group').value, confirmed: true});
   }
   newSubject() {
@@ -311,7 +312,7 @@ window.FieldCamera = class FieldCamera {
         if (i + 1 < n) await new Promise(resolve => setTimeout(resolve, 400));
       }
       if (!current()) return;
-      this.status('Identifying the clearest photo…');
+      this.status('Photo ready. Starting identification…');
       const url = this.endpoint('/api/frame');
       url.searchParams.set('session', this.session); url.searchParams.set('obs', message.obs);
       url.searchParams.set('capture', message.request_id);

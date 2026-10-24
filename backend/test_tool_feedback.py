@@ -106,6 +106,49 @@ class FeedbackTests(unittest.IsolatedAsyncioTestCase):
         self.phone.send_bytes.assert_not_awaited()
         self.c.speak_expert.assert_awaited_once_with("Investigation R1 is scheduled.")
 
+    async def test_voice_receipt_is_immediate_even_when_another_tool_owns_worker(self):
+        self.c.active = True
+        self.c.phase = "route"
+        self.c.generate = AsyncMock()
+        await self.c.handle_rt({"type": "conversation.item.input_audio_transcription.completed",
+            "transcript": "How many species have I seen today?", "item_id": "question-2"})
+        self.assertIn("I heard you.", [e.get("text") for e in self.events])
+        self.phone.send_bytes.assert_awaited_once()
+        self.c.generate.assert_not_awaited()
+        self.assertTrue(self.c.pending[-1][1].acknowledged)
+        self.assertEqual(self.c.pending[-1][1].item_ids, {"question-2"})
+
+    async def test_typed_receipt_and_already_acknowledged_tool_do_not_duplicate_preamble(self):
+        await self.c.handle_phone({"type": "text", "text": "这里有哪些鸟？"}, self.client)
+        self.assertTrue(any(e.get("text") == "听到了，我来处理。" for e in self.events))
+        self.assertTrue(self.c.transcript_is_echo("听到了，我来处理。"))
+        self.c.input_acknowledged = self.c.pending[-1][1].acknowledged
+        self.c.tool = AsyncMock(return_value={"ok": True})
+        self.c.generate = AsyncMock()
+        before = self.phone.send_bytes.await_count
+        await self.c.finish_route({"status": "completed", "output": [{"type": "function_call",
+            "name": "nearby_species", "call_id": "check", "arguments": "{}"}]})
+        self.assertEqual(self.phone.send_bytes.await_count, before)
+        self.c.tool.assert_awaited_once()
+
+    async def test_receipt_preserves_quiet_stop_filler_and_echo_policies(self):
+        self.c.quiet = True
+        await self.c.handle_rt({"type": "conversation.item.input_audio_transcription.completed",
+            "transcript": "What does it eat?", "item_id": "quiet-1"})
+        self.phone.send_bytes.assert_not_awaited()
+        self.c.quiet = False
+        self.c.pending.clear()
+        await self.c.handle_rt({"type": "conversation.item.input_audio_transcription.completed",
+            "transcript": "stop", "item_id": "stop-1"})
+        self.phone.send_bytes.assert_not_awaited()
+        self.assertFalse(self.c.pending)
+        self.assertFalse(await self.c.acknowledge_input("uh"))
+        self.c.remember_spoken(("received", "en"), "I heard you.")
+        await self.c.handle_rt({"type": "conversation.item.input_audio_transcription.completed",
+            "transcript": "I heard you.", "item_id": "echo-1"})
+        self.phone.send_bytes.assert_not_awaited()
+        self.assertFalse(self.c.pending)
+
     def test_all_bundled_clips_are_short_valid_pcm(self):
         for key, text in CLIPS.items():
             actual, pcm = recording(*key)

@@ -337,9 +337,10 @@ class TurnItems(set):
 
 class TurnText(str):
     """Transcript plus any already-committed audio item (never a newer turn)."""
-    def __new__(cls, text, item_ids=()):
+    def __new__(cls, text, item_ids=(), acknowledged=False):
         obj = super().__new__(cls, text)
         obj.item_ids = set(item_ids)
+        obj.acknowledged = acknowledged
         return obj
 
 
@@ -352,6 +353,7 @@ class Session:
         self.focus = None
         self.frames = {}
         self.camera_request = None
+        self.camera_feedback_request = None
         self.sound_windows = deque(maxlen=30)
         self.item_lock = asyncio.Lock()
         self.expiry_task = None
@@ -375,6 +377,7 @@ class Session:
         self.speech_stopped_at = None
         self.turn_stopped_at = None
         self.turn_question = ""
+        self.input_acknowledged = False
         self.expert_readout = None
         self.investigation_offer_ids = []
         self.first_audio = False
@@ -721,9 +724,10 @@ class Session:
     async def cancel_camera_request(self):
         request = self.camera_request
         self.camera_request = None
+        self.camera_feedback_request = None
         if request and (obs := self.observations.get(request["obs"])):
             obs.awaiting_answer = False
-        self.pending = deque(p for p in self.pending if p[0] not in ("camera_ready", "camera_start"))
+        self.pending = deque(p for p in self.pending if p[0] not in ("camera_ready", "camera_start", "camera_photo"))
         if request and self.mic:
             try:
                 await self.mic.send_json({"type": "camera_cancelled", "request_id": request["id"]})
@@ -734,6 +738,7 @@ class Session:
         if group is not None and group not in GROUPS:
             raise ValueError("invalid iconic group")
         await self.cancel_camera_request()
+        self.pending = deque(p for p in self.pending if p[0] != "vision")
         obs = await self.current_focus(create=True)
         if group is not None:
             obs.group = group
@@ -761,16 +766,22 @@ class Session:
             return
         request["phase"] = "ready"
         if request["confirmed"]:
-            self.queue_camera_start(request)
+            await self.queue_camera_start(request)
         else:
             self.pending.append(("camera_ready", request["id"], None))
             await self.flush_pending()
 
-    def queue_camera_start(self, request):
+    async def queue_camera_start(self, request):
         if self.camera_request is not request or request["phase"] != "ready":
             return
         request["phase"], request["confirmed"] = "starting", True
+        self.log("camera_confirmed", request_id=request["id"])
         self.pending = deque(p for p in self.pending if p[0] != "camera_ready")
+        request["start_acknowledged"] = bool(await self.play_feedback("camera-taking",
+            language=request["language"],
+            guard=lambda: self.camera_request is request and request["phase"] == "starting"))
+        if self.camera_request is not request:
+            return
         self.pending.append(("camera_start", request["id"], None))
         self.work_ready.set()
 
@@ -792,7 +803,11 @@ class Session:
         if request["phase"] == "ready":
             if self.assistant_audio_pending():
                 await self.cancel_speech()
-            self.queue_camera_start(request)
+            await self.queue_camera_start(request)
+        else:
+            # A repeated/early start is still heard, but never takes a second
+            # photo or saves consent for a preview that is not ready yet.
+            await self.acknowledge_input(text)
         # Early/duplicate confirmations never authorize a later capture.
         return True
 
@@ -806,22 +821,37 @@ class Session:
             return
         obs.touched = time.monotonic()
         obs.awaiting_answer = True
-        await self.play_feedback("look", language=request["language"])
+        if not request.get("start_acknowledged"):
+            await self.play_feedback("camera-taking", language=request["language"],
+                guard=lambda: self.camera_request is request and request["phase"] == "starting")
         known = {d.id for d in obs.detections}
         for stamp, detection in self.sound_windows:
             if abs(time.monotonic() - stamp) <= 10 and detection.id not in known:
                 obs.detections.append(detection)
-        try:
-            await self.refusion(obs)
-        except Exception:
-            if self.camera_request is request:
-                request["phase"], request["confirmed"] = "ready", False
-                obs.awaiting_answer = False
-            raise
+        # Camera capture must not wait for the first BirdNET/range-model load.
+        # Sound evidence is fused with the photo after its upload is accepted.
         if self.camera_request is request and self.focus == obs.id and obs.status == "open" and self.mic:
             request["phase"] = "capturing"
             await self.mic.send_json({"type": "capture", "obs": obs.id, "n": 3,
                 "hint": obs.hint, "request_id": request_id})
+            self.log("camera_capture_requested", request_id=request_id)
+
+    def camera_photo_current(self, request):
+        obs = self.observations.get(request["obs"])
+        return (self.camera_feedback_request is request and obs is not None
+                and obs.status == "open" and self.focus == obs.id)
+
+    async def announce_camera_photo(self, request_id):
+        request = self.camera_feedback_request
+        if not request or request["id"] != request_id or not self.camera_photo_current(request):
+            return
+        played = await self.play_feedback("photo-ready", language=request["language"],
+            guard=lambda: self.camera_photo_current(request))
+        if self.camera_photo_current(request):
+            if played or not self.may_speak():
+                self.camera_feedback_request = None
+            else:
+                self.pending.append(("camera_photo", request_id, None))
 
     async def change_checklist(self, item_id, count=None):
         row = next((r for r in self.items if r["id"] == item_id), None)
@@ -856,6 +886,13 @@ class Session:
         kind = FEEDBACK_TOOLS.get(name)
         if kind:
             return await self.play_feedback(kind)
+
+    async def acknowledge_input(self, text):
+        # Receipt must not wait for routing, another tool or a cold model load.
+        if self.filler_only(text) or self.stop_request(text):
+            return False
+        return bool(await self.play_feedback("received",
+            language="zh" if self.chinese(text) else "en"))
 
     async def play_feedback(self, kind, *, language=None, guard=None):
         revision = self.input_revision
@@ -1225,7 +1262,9 @@ class Session:
                 self.pending.remove(user)
                 self.pending.appendleft(user)
             else:
-                vision = next((p for p in self.pending if p[0] == "vision"), None)
+                progress = next((p for p in self.pending if p[0] == "camera_start"), None)
+                progress = progress or next((p for p in self.pending if p[0] == "camera_photo"), None)
+                vision = progress or next((p for p in self.pending if p[0] == "vision"), None)
                 if vision is not None:
                     self.pending.remove(vision)
                     self.pending.appendleft(vision)
@@ -1233,20 +1272,27 @@ class Session:
             if kind == "text" and stopped is not None:
                 # Merge consecutive queued utterances into one turn (backlog after a slow turn).
                 parts = [value]
+                acknowledged = getattr(value, "acknowledged", False)
                 merged_ids = set(getattr(value, "item_ids", ()))
                 while len(self.pending) > 1 and self.pending[1][0] == "text" and self.pending[1][2] is not None:
                     _, more, stopped = self.pending[1]
                     del self.pending[1]
                     parts.append(more)
+                    acknowledged = acknowledged or getattr(more, "acknowledged", False)
                     merged_ids.update(getattr(more, "item_ids", ()))
                 if len(parts) > 1:
-                    value = TurnText(" ".join(parts), merged_ids)
+                    value = TurnText(" ".join(parts), merged_ids, acknowledged)
                     self.pending[0] = (kind, value, stopped)
                     self.log("turns_merged", n=len(parts))
             self.turn_stale = stopped is not None and time.monotonic() - stopped > 12
-            if kind in ("notify", "investigation", "camera_ready") and self.auto_speech_paused:
+            if kind in ("notify", "investigation", "camera_ready", "camera_photo", "vision") and self.auto_speech_paused:
                 continue
-            if kind in ("notify", "investigation", "camera_ready") and self.playback_pending():
+            start_acknowledged = (kind == "camera_start" and self.camera_request
+                                  and self.camera_request.get("start_acknowledged"))
+            if kind in ("notify", "investigation", "camera_ready", "camera_start", "camera_photo", "vision") and self.playback_pending() and not start_acknowledged:
+                continue
+            if kind in ("camera_start", "camera_photo", "vision") and (self.awaiting_transcript
+                    or (time.monotonic() < self.play_until and not start_acknowledged)):
                 continue
             if kind == "camera_ready" and (self.awaiting_transcript or not self.may_speak()
                     or time.monotonic() < self.play_until):
@@ -1269,6 +1315,7 @@ class Session:
             self.turn_in_progress = True
             self.turn_stopped_at = stopped if kind in ("text", "audio") else None
             self.turn_items = TurnItems(getattr(value, "item_ids", ()))
+            self.input_acknowledged = getattr(value, "acknowledged", False)
             for item_id in self.turn_items:
                 self.item_owners[item_id] = self.turn_items
             self.tools_executed = False
@@ -1282,6 +1329,8 @@ class Session:
                             self.pending.append(("camera_ready", value, None))
                 elif kind == "camera_start":
                     await self.start_camera_capture(value)
+                elif kind == "camera_photo":
+                    await self.announce_camera_photo(value)
                 elif kind == "investigation":
                     job = self.investigations.jobs.get(value)
                     if job is not None:
@@ -1328,6 +1377,7 @@ class Session:
             finally:
                 self.turn_items = None
                 self.turn_question = ""
+                self.input_acknowledged = False
                 self.proactive_turn = False
                 self.active = False
                 self.turn_in_progress = False
@@ -1378,7 +1428,8 @@ class Session:
         name = call["name"]
         try:
             args = json.loads(call.get("arguments") or "{}")
-            await self.acknowledge_tool(name)
+            if not self.input_acknowledged:
+                await self.acknowledge_tool(name)
             self.tools_executed = True
             result = {"ok": True} if name == "ignore" else (
                 {"ready_to_answer": True, "reason": args.get("reason")} if name == "speak"
@@ -1576,7 +1627,8 @@ class Session:
                 if await self.camera_confirmation(text):
                     await self.flush_pending()
                     return
-                self.pending.append(("text", TurnText(text, [event["item_id"]] if event.get("item_id") else []), self.speech_stopped_at))  # transcript as text; audio buffer is cleared
+                acknowledged = await self.acknowledge_input(text)
+                self.pending.append(("text", TurnText(text, [event["item_id"]] if event.get("item_id") else [], acknowledged), self.speech_stopped_at))  # transcript as text; audio buffer is cleared
                 await self.flush_pending()
         elif ty == "conversation.item.input_audio_transcription.failed":
             self.awaiting_transcript = False
@@ -2108,13 +2160,18 @@ class Session:
             if await self.camera_confirmation(text):
                 await self.flush_pending()
                 return
-            self.pending.append(("text", text, None))
+            if self.assistant_audio_pending():
+                await self.cancel_speech()
+            acknowledged = await self.acknowledge_input(text)
+            self.pending.append(("text", TurnText(text, acknowledged=acknowledged), None))
             await self.flush_pending()
         elif ty == "look":
             self.input_revision += 1
             self.auto_speech_paused = False
             if not isinstance(event.get("confirmed", False), bool):
                 raise ValueError("confirmed must be boolean")
+            if event.get("confirmed") and self.assistant_audio_pending():
+                await self.cancel_speech()
             await self.request_look(event.get("hint", ""), event.get("group"), confirmed=event.get("confirmed", False))
         elif ty == "observation_action":
             obs = self.observations.get(event.get("id"))
@@ -2401,6 +2458,10 @@ async def post_frame(request: Request, session: str, obs: str, x: float | None =
     if s.camera_request is not camera or camera["phase"] != "capturing":
         raise HTTPException(409, "Capture cancelled or already submitted")
     camera["phase"] = "classifying"
+    s.camera_feedback_request = camera
+    s.pending.append(("camera_photo", camera["id"], None))
+    await s.flush_pending()
+    s.log("camera_photo_received", request_id=camera["id"])
     try:
         allowed = await asyncio.get_running_loop().run_in_executor(s.executor, s.allowed_species) if observation.group == "Aves" else None
         result = await asyncio.to_thread(classify_frame, jpeg, crop, sorted(allowed) if allowed else None)
@@ -2408,6 +2469,9 @@ async def post_frame(request: Request, session: str, obs: str, x: float | None =
         if s.camera_request is camera:
             camera["phase"], camera["confirmed"] = "ready", False
             observation.awaiting_answer = False
+        if s.camera_feedback_request is camera:
+            s.camera_feedback_request = None
+            s.pending = deque(p for p in s.pending if p[0] != "camera_photo")
         raise
     candidates = []
     for candidate in result["candidates"]:

@@ -168,16 +168,98 @@ class CameraConfirmationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.c.play_feedback.call_args.args, ("camera-ready",))
         self.assertFalse(self.captures())
 
-    async def test_lookup_failure_requires_fresh_confirmation_for_retry(self):
+    async def test_start_does_not_wait_for_range_lookup_or_sound_model_loading(self):
         request = await self.ready()
         await self.c.camera_confirmation("start")
-        self.c.refusion = AsyncMock(side_effect=RuntimeError("fixture lookup failed"))
-        with self.assertRaises(RuntimeError):
-            await self.c.start_camera_capture(request["id"])
-        self.assertEqual(request["phase"], "ready")
-        self.assertFalse(request["confirmed"])
-        self.assertFalse(self.c.observations[self.c.focus].awaiting_answer)
-        self.assertFalse(self.captures())
+        self.c.refusion = AsyncMock(side_effect=AssertionError("Slow lookup before capture"))
+        self.c.allowed_species = lambda: self.fail("Cold model should not block camera")
+        await asyncio.wait_for(self.c.start_camera_capture(request["id"]), 1)
+        self.c.refusion.assert_not_awaited()
+        self.assertEqual(len(self.captures()), 1)
+
+    async def test_voice_and_identify_say_taking_photo_before_capture(self):
+        self.c.connected = True
+        for manual, language in ((False, "en"), (True, "en"), (False, "zh")):
+            with self.subTest(manual=manual, language=language):
+                self.c.lang = language
+                await self.c.cancel_speech()
+                self.phone.events.clear()
+                request = await self.ready(confirmed=manual)
+                if not manual:
+                    await self.c.handle_rt({"type": "conversation.item.input_audio_transcription.completed",
+                        "transcript": "Start.", "item_id": "start-1"})
+                await self.c.start_camera_capture(request["id"])
+                caption = "Start taking photo." if language == "en" else "开始拍照。"
+                feedback = next(i for i, e in enumerate(self.phone.events) if e.get("text") == caption)
+                capture = next(i for i, e in enumerate(self.phone.events) if e["type"] == "capture")
+                self.assertLess(feedback, capture)
+                self.assertTrue(self.phone.audio)
+
+    async def test_identify_cancels_current_speech_before_acknowledging(self):
+        self.c.connected = True
+        self.c.play_until = s.time.monotonic() + 10
+        self.c.cancel_speech = AsyncMock()
+        await self.c.handle_phone({"type": "look", "confirmed": True}, self.client)
+        self.c.cancel_speech.assert_awaited_once()
+
+    async def test_photo_progress_precedes_result_and_waits_for_previous_playback(self):
+        request = await self.capture()
+        self.c.camera_feedback_request = request
+        self.c.camera_request = None  # Fast classification already finished.
+        self.c.pending = s.deque([("vision", request["obs"], None),
+                                  ("camera_photo", request["id"], None)])
+        self.c.connected = True
+        self.c.prune_history = AsyncMock()
+        self.c.answer_vision = AsyncMock()
+        self.client.playback_protocol = 1
+        self.client.playback_pending = True
+        self.c.turn_task = asyncio.create_task(self.c.turn_worker())
+        self.c.tasks.append(self.c.turn_task)
+        await self.c.flush_pending()
+        await asyncio.sleep(.02)
+        self.assertFalse(any(e.get("text") == "Photo ready. Starting identification." for e in self.phone.events))
+        self.c.answer_vision.assert_not_awaited()
+        self.client.playback_pending = False
+        await self.c.flush_pending()
+        async with asyncio.timeout(1):
+            while not any(e.get("text") == "Photo ready. Starting identification." for e in self.phone.events):
+                await asyncio.sleep(.01)
+        self.c.answer_vision.assert_not_awaited()
+        # A matching drained report releases the queued result only after the
+        # progress clip has actually ended, even with very fast classification.
+        self.c.play_until = 0
+        self.client.playback_pending = False
+        await self.c.flush_pending()
+        async with asyncio.timeout(1):
+            while not self.c.answer_vision.await_count:
+                await asyncio.sleep(.01)
+        self.c.answer_vision.assert_awaited_once_with(request["obs"])
+        self.assertIsNone(self.c.camera_feedback_request)
+
+    async def test_new_request_cancels_old_photo_progress(self):
+        request = await self.capture()
+        self.c.camera_feedback_request = request
+        self.c.pending.append(("camera_photo", request["id"], None))
+        self.c.pending.append(("vision", request["obs"], None))
+        await self.c.request_look()
+        self.c.play_feedback = AsyncMock()
+        await self.c.announce_camera_photo(request["id"])
+        self.c.play_feedback.assert_not_awaited()
+        self.assertFalse(any(p[0] == "camera_photo" for p in self.c.pending))
+        self.assertFalse(any(p[0] == "vision" for p in self.c.pending))
+
+    async def test_start_ack_is_immediate_while_worker_is_busy_and_is_not_repeated(self):
+        request = await self.ready()
+        self.c.connected = self.c.active = True
+        await self.c.handle_rt({"type": "conversation.item.input_audio_transcription.completed",
+            "transcript": "Start.", "item_id": "busy-start"})
+        self.assertTrue(any(e.get("text") == "Start taking photo." for e in self.phone.events))
+        self.assertTrue(request["start_acknowledged"])
+        self.assertFalse(self.captures())  # Worker is still owned by another task.
+        self.c.active = False
+        await self.c.start_camera_capture(request["id"])
+        self.assertEqual(len(self.captures()), 1)
+        self.assertEqual(sum(e.get("text") == "Start taking photo." for e in self.phone.events), 1)
 
     async def test_frame_route_rejects_unconfirmed_old_and_consumed_tokens(self):
         s.SESSIONS[self.c.id] = self.c

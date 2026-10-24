@@ -167,7 +167,9 @@ async def run(url):
                                for e in events["mic"][before_events:])
                 await asyncio.sleep(3)
                 if label != "look":
-                    assert audio == before_audio, label + " unexpectedly spoke"
+                    captions = [e.get("text") for e in events["mic"][before_events:]
+                                if e.get("type") == "transcript" and e.get("role") == "assistant"]
+                    assert all(text == "I heard you." for text in captions), label + " added speech beyond receipt"
                 print(json.dumps({"event": "router_case_pass", "case": label,
                                   "audio_bytes": {k: audio[k] - before_audio[k] for k in audio}}), flush=True)
             assert not any(e.get("type") == "error" for e in events["mic"])

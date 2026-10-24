@@ -40,10 +40,18 @@ Closing, backgrounding, changing/closing focus, resetting or replacing/disconnec
 the microphone invalidates the old confirmation. The frame endpoint requires the
 matching single-use request ID. Old clients cannot upload without this handshake.
 
+On “start” / “开始” or Identify, the assistant says **“Start taking photo.”** /
+“开始拍照。” before requesting the frames. The shutter no longer waits for a cold
+BirdNET range/model load. Once a valid JPEG upload arrives, it queues **“Photo ready.
+Starting identification.”** / “照片已拍好，开始识别。” while range lookup and recognition
+run. The result waits for this progress clip to finish. This cue refers to image
+identification; a GPT investigation is separately scheduled only when required.
+
 Ready prompts use bundled Higgs recordings through the shared PCM queue, with no
 runtime synthesis call. They wait for ongoing speech/playback; quiet and interruption
-rules apply. The existing short acknowledgement still precedes voice Look requests
-and confirmed capture work. Investigations and other questions can continue while
+rules apply. Other accepted voice/text requests receive “I heard you.” / “听到了，
+我来处理。” before model routing, so a busy tool cannot delay the receipt.
+Investigations and other questions can continue while
 the camera waits for confirmation.
 
 The display receives the same observation card and evidence, without requesting

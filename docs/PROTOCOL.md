@@ -43,6 +43,15 @@ One WebSocket per phone: `wss://<host>/ws`. The backend also serves the web app 
     See [INVESTIGATIONS.md](INVESTIGATIONS.md) for all states and retention rules.
 
 ## Notes
+- Accepted final voice transcripts and typed inputs receive a local cached spoken
+  receipt before routing or waiting for the turn worker. Echoes, empty/filler-only
+  speech and stop commands do not get a receipt; quiet rules still apply. Camera
+  confirmation uses its specific “Start taking photo.” cue instead. A receipt
+  means the input was heard, not that a tool succeeded or a sighting was logged.
+- After a confirmed, valid JPEG upload the backend queues “Photo ready. Starting
+  identification.” while inference proceeds. Progress waits for ongoing playback
+  and conversation; the visual result waits until this cue drains. Cancelling or
+  changing the camera request discards its obsolete queued progress.
 - Audio direction asymmetry is intentional: 48 kHz in (BirdNET needs it), 24 kHz out (Higgs output).
 - All checklist state lives on the backend; reconnecting phones receive `state` + `checklist` right after `hello`.
 

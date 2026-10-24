@@ -1,4 +1,4 @@
-"""Short, local Higgs recordings for feedback before slow read-only tools.
+"""Short local Higgs recordings for input receipt, tools and camera progress.
 
 Regenerate explicitly with: python -B backend/tool_feedback.py --generate
 Runtime playback never makes a synthesis/model request.
@@ -15,13 +15,19 @@ CLIPS = {
     ("check", "zh"): "好的，我查一下。",
     ("camera-ready", "en"): "Camera ready. Say start to take a photo.",
     ("camera-ready", "zh"): "相机已就绪。说开始就拍照。",
+    ("camera-taking", "en"): "Start taking photo.",
+    ("camera-taking", "zh"): "开始拍照。",
+    ("photo-ready", "en"): "Photo ready. Starting identification.",
+    ("photo-ready", "zh"): "照片已拍好，开始识别。",
+    ("received", "en"): "I heard you.",
+    ("received", "zh"): "听到了，我来处理。",
 }
 TOOLS = {"look": "look", "new_observation": "look",
          "nearby_species": "check", "describe": "check"}
 DIRECTORY = Path(__file__).with_name("audio")
 
 
-@lru_cache(maxsize=6)
+@lru_cache(maxsize=12)
 def recording(kind, language):
     text = CLIPS[kind, language]
     with wave.open(str(DIRECTORY / f"{kind}-{language}.wav"), "rb") as source:

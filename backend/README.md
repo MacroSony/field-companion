@@ -3,6 +3,31 @@
 The optional [GPT Naturalist expert path](../docs/EXPERT.md) handles complex
 comparisons and species-fact follow-ups without changing the logging fast path.
 
+## Immediate receipt and camera progress (2026-10-24)
+
+Accepted voice transcripts and typed requests now play “I heard you.” / “听到了，
+我来处理。” immediately from cached audio, before routing or waiting for another
+tool. Empty input, filler-only speech, playback echoes, stop and quiet policies
+remain silent. An acknowledged turn skips the redundant pre-tool preamble.
+Receipt confirms that input was received; it does not claim a checklist write or
+successful result. It adds no runtime synthesis/model request.
+
+For camera confirmation, “start” / “开始” and Identify both say “Start taking
+photo.” / “开始拍照。” before the capture request. Photo capture no longer waits
+for the cold BirdNET range/model lookup; fusion/range work runs after upload.
+A validated uploaded photo queues “Photo ready. Starting identification.” /
+“照片已拍好，开始识别。” before its spoken result. This is identification progress,
+not a claim that every photo starts a GPT investigation. The photo cue waits for
+the previous playback and ongoing conversation and is discarded on cancellation
+or a changed focus. Results wait for the progress audio to drain.
+
+Current build: `2026-10-24-camera-progress`.
+Validation: 146 offline tests and both isolated browser suites passed. Coverage
+includes receipt while the worker is busy, camera acknowledgement before capture,
+photo progress before the result, playback draining, interruption, focus changes
+and cancellation. Browser media/classification are fixtures; physical phone
+playback and camera behavior still need user verification.
+
 ## Camera confirmation (2026-10-24)
 
 Opening the camera or asking “What is that?” now prepares a live preview without
@@ -24,7 +49,7 @@ Validation: 138 offline backend tests and both isolated browser suites passed.
 The camera suite checks no JPEG encoding/upload before a second STT confirmation,
 including with an existing preview, plus stale confirmation after backgrounding.
 These use fake media/classification; physical phone audio/camera remains to verify.
-Current build: `2026-10-24-camera-confirmation`.
+Earlier build: `2026-10-24-camera-confirmation`.
 
 ## Feedback before slow tools (2026-10-24)
 

@@ -243,8 +243,16 @@ async def test(port, cdp):
         await until("window.__messages.filter(e=>e.type==='observation').at(-1)?.group==='Aves'")
         results["groupChangeRearmsWithoutCapturing"] = True
         await js("document.getElementById('camera-zoom').value='2'; document.getElementById('camera-zoom').dispatchEvent(new Event('input')); document.getElementById('camera-viewport').dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true}))")
+        before_manual = await js("window.__messages.length")
         await js("document.getElementById('camera-shutter').click()")
         await until("document.querySelectorAll('#observation-evidence img').length === 1 && !document.getElementById('camera-shutter').disabled")
+        await until("window.__messages.slice(" + str(before_manual) + ").some(e=>e.text==='Photo ready. Starting identification.')")
+        manual_messages = await js("window.__messages.slice(" + str(before_manual) + ")")
+        taking = next(i for i, e in enumerate(manual_messages) if e.get("text") == "Start taking photo.")
+        capture = next(i for i, e in enumerate(manual_messages) if e.get("type") == "capture")
+        ready = next(i for i, e in enumerate(manual_messages) if e.get("text") == "Photo ready. Starting identification.")
+        assert taking < capture < ready
+        results["identifySpeaksTakingThenPhotoReady"] = True
         upload = await js("window.__uploads[0]")
         assert upload["type"] == "image/jpeg" and 100 <= max(upload["width"], upload["height"]) <= 1920, (upload, await js("window.__geometry"))
         assert "x=0.275000" in upload["url"] and "w=0.450000" in upload["url"], upload
@@ -299,22 +307,27 @@ async def test(port, cdp):
         def feedback_before_capture(start):
             messages = [json.loads(e["params"]["response"]["payloadData"]) for e in events[start:]
                         if e.get("method") == "Network.webSocketFrameReceived" and e["params"]["response"]["opcode"] == 1]
-            feedback = next(i for i, e in enumerate(messages) if e.get("text") == "Let me take a look.")
+            feedback = next(i for i, e in enumerate(messages) if e.get("text") == "Start taking photo.")
             capture = next(i for i, e in enumerate(messages) if e.get("type") == "capture")
             assert feedback < capture
             assert any(e.get("type") == "audio_end" and e["id"].startswith("feedback-") for e in messages[:capture])
 
         before_voice = len(events)
         await voice_ready(wait_for_drain=True)
+        voice_marker = await js("window.__messages.length")
         await js("window.__sockets[0].send(JSON.stringify({type:'text',text:'fixture:voice-start'}))")
         await until("document.querySelectorAll('#observation-evidence img').length === 1 && !document.getElementById('camera-shutter').disabled")
+        await until("window.__messages.slice(" + str(voice_marker) + ").some(e=>e.text==='Photo ready. Starting identification.')")
         feedback_before_capture(before_voice)
         before_voice = len(events)
         await voice_ready()
+        voice_marker = await js("window.__messages.length")
         await js("window.__sockets[0].send(JSON.stringify({type:'text',text:'fixture:voice-start'}))")
         await until("document.querySelectorAll('#observation-evidence img').length === 2 && !document.getElementById('camera-shutter').disabled")
+        await until("window.__messages.slice(" + str(voice_marker) + ").some(e=>e.text==='Photo ready. Starting identification.')")
         feedback_before_capture(before_voice)
         results["voiceCameraReadyThenStartWithCameraClosedAndOpen"] = True
+        results["voiceStartSpeaksTakingThenPhotoReady"] = True
         await voice_ready()
         uploads = await js("window.__uploads.length")
         await js("Object.defineProperty(document,'hidden',{configurable:true,value:true}); document.dispatchEvent(new Event('visibilitychange'))")
