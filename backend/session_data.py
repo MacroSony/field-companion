@@ -85,10 +85,23 @@ def _dbfs(samples, peak=False):
     return round(20 * math.log10(max(value, 1e-6)), 2)
 
 
+PRE_PAD_S = 1.0   # speech_started receipt lags the real onset (VAD + network)
+POST_PAD_S = .3   # speech_stopped already includes the VAD silence hangover
+
+
+def frame_dbfs(samples, sample_rate, frame_s=.02):
+    """20 ms frame RMS levels in dBFS (empty array if too short)."""
+    n = int(frame_s * sample_rate)
+    if n <= 0 or len(samples) < n:
+        return np.empty(0)
+    frames = samples[: len(samples) // n * n].reshape(-1, n)
+    return 20 * np.log10(np.maximum(np.sqrt(np.mean(frames ** 2, axis=1)), 1e-6))
+
+
 class TurnRecorder:
     """One final JSONL row per VAD occurrence, even with no transcript or route.
 
-    Save audio as soon as 300 ms of post-padding arrives (500 ms wall timeout).
+    Save audio as soon as POST_PAD_S of post-padding arrives (500 ms wall timeout).
     Metadata waits for route completion, at most 60 s, or flush on disconnect,
     reset/close. Unique occurrence IDs, not provider IDs, own queued route results.
     """
@@ -112,7 +125,7 @@ class TurnRecorder:
                "speech_rms_dbfs": None, "peak_dbfs": None, "noise_floor_dbfs": None}
         state = {"row": row, "start": position, "stop": None, "audio_done": False,
                  "settled": False, "audio_timer": None, "chunks": [],
-                 "cursor": position - round(.3 * self.sample_rate), "clipped": False,
+                 "cursor": position - round(PRE_PAD_S * self.sample_rate), "clipped": False,
                  "final_received": False}
         self.pending[turn_id] = state
         self._collect(state, position)
@@ -151,7 +164,7 @@ class TurnRecorder:
 
     def _collect(self, state, position):
         """Copy new mic-ring slices before rollover, including during long speech."""
-        end = position if state["stop"] is None else min(position, state["stop"] + round(.3 * self.sample_rate))
+        end = position if state["stop"] is None else min(position, state["stop"] + round(POST_PAD_S * self.sample_rate))
         if end <= state["cursor"]:
             return
         samples, bounds = self.extract(state["cursor"], end, padding=0)
@@ -166,7 +179,7 @@ class TurnRecorder:
             if state["audio_done"]:
                 continue
             self._collect(state, position)
-            if state["stop"] is not None and position >= state["stop"] + round(.3 * self.sample_rate):
+            if state["stop"] is not None and position >= state["stop"] + round(POST_PAD_S * self.sample_rate):
                 self.capture(turn_id)
 
     def capture(self, turn_id):
@@ -180,18 +193,22 @@ class TurnRecorder:
         chunks = state["chunks"]
         samples = np.concatenate([part for _, part in chunks]) if chunks else np.empty(0, dtype=np.float32)
         indices = np.concatenate([np.arange(start, start + len(part)) for start, part in chunks]) if chunks else np.empty(0)
-        pad = round(.3 * self.sample_rate)
+        pre, post = round(PRE_PAD_S * self.sample_rate), round(POST_PAD_S * self.sample_rate)
         row.update(start_sample=int(indices[0]) if len(indices) else state["start"],
                    end_sample=int(indices[-1]) + 1 if len(indices) else state["start"],
                    speech_start_sample=state["start"], speech_end_sample=state["stop"],
-                   requested_start_sample=state["start"] - pad, requested_end_sample=state["stop"] + pad,
-                   clipped=state["clipped"] or state["cursor"] < state["stop"] + pad)
+                   requested_start_sample=state["start"] - pre, requested_end_sample=state["stop"] + post,
+                   clipped=state["clipped"] or state["cursor"] < state["stop"] + post)
         row["duration_s"] = len(samples) / self.sample_rate
         row["speech_duration_s"] = (state["stop"] - state["start"]) / self.sample_rate
         speech = (indices >= state["start"]) & (indices < state["stop"])
         row["speech_rms_dbfs"] = _dbfs(samples[speech])
         row["peak_dbfs"] = _dbfs(samples[speech], peak=True)
-        row["noise_floor_dbfs"] = _dbfs(samples[~speech])
+        # VAD markers are late at the start, so the padding may hold speech onset:
+        # use frame-level percentiles over the whole clip for robust level features.
+        levels = frame_dbfs(samples, self.sample_rate)
+        row["noise_floor_dbfs"] = round(float(np.percentile(levels, 10)), 2) if len(levels) else None
+        row["speech_p90_dbfs"] = round(float(np.percentile(levels, 90)), 2) if len(levels) else None
         filename = row["turn_id"] + ".wav"
         try:
             self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)

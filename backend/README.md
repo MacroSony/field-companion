@@ -52,13 +52,14 @@ Provider `audio_start_ms`/`audio_end_ms` are **not used**: buffer clears,
 reconnects, queued input and speaker-mode withholding make their origin unsafe
 to map directly onto the unbroken mic ring. Instead, monotonic VAD **receipt**
 timestamps anchor the latest absolute mic sample position. WAVs cover that start
-minus 300 ms through that stop plus 300 ms. This is approximate acoustic alignment:
+minus 1 s through that stop plus 300 ms (the start receipt lags the real onset). This is approximate acoustic alignment:
 onset error includes upstream queue/network/VAD delay and up to one mic packet
 (accepted packets are at most one second); stop receipt additionally includes the
 configured **600 ms VAD silence**. Expect hundreds of milliseconds of error even
 without a stall; no measured hardware bound is claimed, and network stalls can
-be worse. The 300 ms pre-padding cannot guarantee the full physical onset under
-high latency. Wall time is receipt time, not calibrated microphone capture time.
+be worse. The 1 s pre-padding is a margin, not a guarantee of the full physical onset under
+high latency. Level features use 20 ms frame percentiles over the whole clip (noise floor =
+10th percentile, `speech_p90_dbfs` = 90th), because the padding may contain speech onset. Wall time is receipt time, not calibrated microphone capture time.
 
 The existing float mic ring is 48 kHz, circular, with absolute `position` indices.
 The recorder copies incremental slices before its 30-second rollover, preserving

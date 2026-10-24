@@ -63,7 +63,7 @@ class SessionDataTests(unittest.IsolatedAsyncioTestCase):
                                 "item_id": item_id, "transcript": text})
 
     async def turn(self, text=None, item_id="item"):
-        await self.feed(.4)
+        await self.feed(1)  # enough history for the 1 s pre-padding
         await self.vad("started", item_id)
         await self.feed(.5, 8192)
         await self.vad("stopped", item_id)
@@ -125,29 +125,31 @@ class SessionDataTests(unittest.IsolatedAsyncioTestCase):
         # A short fake ring makes this interval cross its circular wrap.
         self.c.ring = np.zeros(s.SR, dtype=np.float32)
         self.c.echo_ring = np.zeros(s.SR, dtype=bool)
-        await self.feed(.9, 4096)
+        await self.feed(1.2, 4096)
         await self.vad("started")
         await self.feed(.4, 16384)
         await self.vad("stopped")
         await self.final("Uh")
         await self.feed(.3, 4096)
         row, = self.rows()
-        self.assertEqual((row["start_sample"], row["end_sample"]), (round(.6*s.SR), round(1.6*s.SR)))
+        # 1 s pre-padding before the VAD start marker, 0.3 s after the stop marker.
+        self.assertEqual((row["start_sample"], row["end_sample"]), (round(.2*s.SR), round(1.9*s.SR)))
         self.assertFalse(row["clipped"])
-        self.assertEqual(row["duration_s"], 1)
+        self.assertEqual(row["duration_s"], 1.7)
         self.assertEqual(row["speech_rms_dbfs"], -6.02)
         self.assertEqual(row["peak_dbfs"], -6.02)
         self.assertEqual(row["noise_floor_dbfs"], -18.06)
+        self.assertEqual(row["speech_p90_dbfs"], -6.02)
         with wave.open(str(self.directory / "recordings" / row["wav_filename"]), "rb") as wav:
-            self.assertEqual((wav.getnchannels(), wav.getsampwidth(), wav.getframerate(), wav.getnframes()), (1, 2, s.SR, s.SR))
+            self.assertEqual((wav.getnchannels(), wav.getsampwidth(), wav.getframerate(), wav.getnframes()), (1, 2, s.SR, round(1.7*s.SR)))
             samples = np.frombuffer(wav.readframes(wav.getnframes()), dtype="<i2")
         np.testing.assert_array_equal(samples, np.concatenate([
-            np.full(round(.3*s.SR), 4096), np.full(round(.4*s.SR), 16384), np.full(round(.3*s.SR), 4096)]))
+            np.full(round(1*s.SR), 4096), np.full(round(.4*s.SR), 16384), np.full(round(.3*s.SR), 4096)]))
 
     async def test_turn_longer_than_ring_is_preserved_incrementally(self):
         self.c.ring = np.zeros(s.SR, dtype=np.float32)
         self.c.echo_ring = np.zeros(s.SR, dtype=bool)
-        await self.feed(.4)
+        await self.feed(1)
         await self.vad("started")
         for _ in range(6):
             await self.feed(.5, 8192)
@@ -159,9 +161,9 @@ class SessionDataTests(unittest.IsolatedAsyncioTestCase):
         await self.feed(.3)
         row, = self.rows()
         self.assertFalse(row["clipped"])
-        self.assertEqual(row["duration_s"], 3.6)
+        self.assertEqual(row["duration_s"], 4.3)
         with wave.open(str(self.directory / "recordings" / row["wav_filename"]), "rb") as wav:
-            self.assertEqual(wav.getnframes(), round(3.6 * s.SR))
+            self.assertEqual(wav.getnframes(), round(4.3 * s.SR))
 
     async def test_reusable_extraction_clips_missing_and_overwritten_audio(self):
         ring = np.arange(10, dtype=np.float32)
@@ -258,7 +260,7 @@ class SessionDataTests(unittest.IsolatedAsyncioTestCase):
         await self.c.reset()
         row, = self.rows()
         self.assertEqual(row["reason"], "reset")
-        self.assertEqual(row["duration_s"], 1.1)
+        self.assertEqual(row["duration_s"], 1.8)
         self.assertEqual(self.c.position, 0)
         self.assertFalse(self.c.recorder.pending)
 
