@@ -6,12 +6,16 @@ One WebSocket per phone: `wss://<host>/ws`. The backend also serves the web app 
 - `wss://<host>/ws?role=mic&session=<id>` (default role `mic`, default session `demo`): the phone. It sends mic audio and commands and receives everything below.
 - `wss://<host>/ws?role=display&session=<id>`: a big-screen view (laptop/projector, URL `/?display=1`). It receives the same JSON messages (checklist, heard, transcripts, candidates, state). It receives assistant audio only with `&audio=1` (so the audience can hear). It sends no mic audio, but may send `text`, `edit`, `delete`.
 - One backend session = one Higgs Realtime session + one BirdNET pipeline + one checklist, shared by all devices in it. Exactly one mic device per session; a newer mic replaces the older one.
-- **Echo guard**: if any display has audio on, the backend runs half-duplex. While the assistant is speaking, plus 300 ms after, mic audio is not forwarded to Realtime (BirdNET still gets it). Barge-in is lost in this mode; the phone tap button still cancels speech.
+- **Echo guard**: the microphone defaults to speaker mode (`earphones=false`), which is safe half-duplex. Guarding is enabled when the mic uses its speaker **or** any display has `audio=1`. It begins before the first outgoing assistant PCM. Mic audio is withheld from Realtime until the later of the backend duration estimate and reported playback end, plus **500 ms**. A reported active playback keeps the gate closed until its end; clients without end reports use the estimate plus **800 ms**. With multiple audio outputs the latest deadline wins. Guarded VAD speech-start events do not cancel playback; **Tap still interrupts**.
+- In speaker mode, three-second BirdNET windows containing any assistant-playback/tail samples are dropped and logged (`bird_window_skipped`, reason `assistant_playback`). Earphone-mode BirdNET is unchanged, including with an audio-enabled display.
+- Independently of output mode, recent assistant speech is compared to incoming STT before routing: up to three spoken transcripts, within ten seconds of assistant speech. Lowercased alphanumeric word overlap >=0.6 or `difflib` ratio >=0.75 drops an echo (`echo_dropped`). Single-word transcripts require an exact word match. Typed text is not filtered. This is a heuristic defense, not acoustic echo cancellation.
 
 ## Phone → backend
 - **Binary frames**: microphone audio, PCM16 little-endian, mono, **48 kHz**, about 20–40 ms per frame. Browser mic processing is off (echoCancellation/noiseSuppression/autoGainControl = false).
 - **JSON text frames**:
-  - `{"type":"hello","lat":43.66,"lng":-79.39,"lang":"zh"}`: sent first. lat/lng are optional.
+  - `{"type":"hello","lat":43.66,"lng":-79.39,"lang":"zh","earphones":false}`: sent first. GPS, language and boolean `earphones` are optional; each new mic defaults to speaker mode.
+  - `{"type":"audio_mode","earphones":true|false}`: mic only; change output mode. `false` = speaker / half-duplex, `true` = earphones / voice interruption (unless an audio-enabled display forces guarding). The UI persists the selection locally and sends it on connect and change.
+  - `{"type":"playback","active":true|false}`: audio-output client reports when scheduled assistant audio actually starts and when its last queued source finishes, including after flush. End times are measured at backend receipt, not supplied by the client. Audio-enabled displays may report too. Reports never shorten the backend estimate.
   - `{"type":"mic","on":true|false}`: mic paused or resumed.
   - `{"type":"mode","quiet":true|false}`: quiet mode. Logging still works, but the assistant only speaks after a tap.
   - `{"type":"tap"}`: push-to-talk / "talk to me now". The next utterance is treated as addressed.
@@ -27,7 +31,7 @@ One WebSocket per phone: `wss://<host>/ws`. The backend also serves the web app 
   - `{"type":"heard","sci":"...","en":"...","zh":"...","conf":0.87,"t":"<iso>","new":true}`: a BirdNET detection. `new` means first time in this session above threshold.
   - `{"type":"transcript","role":"user"|"assistant","text":"...","final":true|false}`: captions.
   - `{"type":"candidates","items":[{"sci":"...","en":"...","zh":"...","photo":"https://...","why":"..."}]}`: identification candidates to show as cards (describe-to-ID / photo ID).
-  - `{"type":"state","listening":true,"speaking":false,"model":"higgs-realtime-1.5-preview","connected":true}`: status for the UI indicator.
+  - `{"type":"state","listening":true,"speaking":false,"model":"higgs-realtime-1.5-preview","connected":true,"echo_guard":true,"session":"demo"}`: status for the UI indicator. `echo_guard` describes the selected policy, not whether input is currently being dropped.
   - `{"type":"error","message":"..."}`
 
 ## Notes
@@ -46,3 +50,17 @@ One WebSocket per phone: `wss://<host>/ws`. The backend also serves the web app 
 - `POST /api/frame?session=<id>&obs=<id>[&x=..&y=..&w=..&h=..]`, body = JPEG (≤ 1920 px long side). Optional crop is normalized 0..1 (from a tap on the bird). One request per frame. Response: `{"detection": {...}}`. The backend then broadcasts the updated `observation`.
 - `{"type":"look"}`: the user opened Look mode / pressed the shutter without speaking. Equivalent to "what's that?" (opens a new focus if none is open).
 - `{"type":"observation_action","id":"ob3","action":"confirm"|"discard"|"focus","count":2?}`: UI buttons.
+
+## Batched BirdNET suggestions
+- `{"type":"suggestions","items":[{"sci":"Cardinalis cardinalis","en":"Northern Cardinal","photo":"https://…","conf":0.87,"t":"<iso>"}]}`:
+  full pending confirmation state, broadcast on change and sent on connection/hello.
+  `conf` is the best confidence; `t` is the last detection time. Empty clears the UI.
+- `{"type":"suggestion_action","sci":"Cardinalis cardinalis","action":"accept"|"dismiss"}`:
+  mic or display may accept/dismiss a chip without model routing. Accept adds one
+  individual with source `birdnet`; either action gives one logged earcon, no speech.
+- Qualifying species accumulate for ~3.5 s. One proactive prompt per 25 s, at most
+  three names (confidence order), with extras on screen. Quiet mode is UI-only
+  even after tap. Unannounced detections older than 60 s are dropped; prompted
+  suggestions expire 120 s after prompt dispatch, without re-suggesting this session.
+  Voice “yes/both/all”, a named subset, and “no” route to silent accept/dismiss;
+  counts and multi-species observation reports are supported in one routed action.

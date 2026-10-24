@@ -13,6 +13,14 @@ Plain HTML/CSS/JS, no build step. Serve this directory at `/` with the protocol 
 - English common names are primary, scientific names italicized below. `zh` fields are ignored. Photos appear on observations, heard detections, candidates, and map popups. Missing or failed photos fall back to a local source icon.
 - The phone's **Observation map** is collapsed initially. The projector map is always open. Observation coordinates determine markers and bounds; the phone additionally shows its available GPS position as a blue dot. Displays do not invent a phone location.
 
+## Microphones and headset buttons
+
+After **Start listening** grants permission, use **Microphone** near Speaker/Earphones to choose the phone, USB-C, or headset input. The device ID and label are saved locally. Switching stops the old input and reconnects to the same capture worklet/session; a missing saved or disconnected input falls back to the system default. The small debug line shows actual track settings and AudioContext rate ("not reported" means the browser omitted a setting). Speaker/Earphones controls conversation behavior, not hardware routing.
+
+Start also plays a looping, zero-valued WAV through a separate audio element to keep Media Session active. Supported play/pause/next/previous headset actions act like **Tap to talk**, cancel speech, and show **Headset button → talk**. End releases this media session. This is tap-to-talk, not hold-to-record; unsupported browsers still have the on-screen button.
+
+On Android, compare built-in/USB-C capture with Bluetooth capture while earbuds play speech. Check the debug settings, bird sound pickup, playback quality, physical buttons, unplug/reconnect, and lock-screen behavior. Chrome/Android may ignore constraints, change Bluetooth profiles, or suppress silent media sessions; selecting an input does not guarantee high-quality Bluetooth playback. Keep the page foregrounded for initial tests.
+
 ## Protocol mock
 
 From the repository root:

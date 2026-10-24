@@ -26,12 +26,19 @@
 
     <main>
       <section class="listening-panel" aria-label="Session controls and status">
-        <div class="status-line"><span id="connection" class="connection"><i></i><span>Offline</span></span><span id="activity">Ready when you are</span></div>
+        <div class="status-line"><span id="connection" class="connection"><i></i><span>Offline</span></span><button id="audio-mode" class="audio-mode" type="button" aria-pressed="false" title="Switch between speaker and earphones">🔊 Speaker</button><span id="activity">Ready when you are</span></div>
+        <div class="mic-settings">
+          <label for="mic-device">Microphone</label>
+          <select id="mic-device" disabled aria-describedby="capture-settings"><option value="">Default · allow microphone to list devices</option></select>
+        </div>
+        <p id="capture-settings" class="capture-settings">Capture settings appear after Start.</p>
         <div class="soundscape" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div>
         <div id="mic-meter" class="level-meter" role="meter" aria-label="Microphone level" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="level-fill"></div></div>
         <div class="panel-foot"><span id="model">Open mic · hands free</span><span id="session-time">00:00</span></div>
         <button id="start" class="start-button" type="button"><span aria-hidden="true">◉</span> Start listening <span aria-hidden="true">↗</span></button>
-        <p id="start-note" class="start-note">Use earphones · Microphone needs HTTPS or localhost</p>
+        <p id="interrupt-hint" class="start-note">Tap to interrupt</p>
+        <p id="earphone-tip" class="start-note" hidden>Earphones recommended — quieter for birds, and you can interrupt by voice.</p>
+        <p id="start-note" class="start-note">Microphone needs HTTPS or localhost</p>
         <button id="stop" class="stop-button" type="button" hidden>End session</button>
       </section>
 
@@ -71,6 +78,8 @@
 
   <div id="audio-overlay" class="audio-overlay" hidden><div><p class="eyebrow">PROJECTOR AUDIO</p><h2>Let the field speak.</h2><p>Click to enable assistant audio. This screen never uses a microphone.</p><p class="echo-note">While audio is enabled, phone voice input pauses during assistant speech. The phone’s tap button can still interrupt.</p><button id="enable-audio" class="start-button" type="button">Start display audio <span>↗</span></button><a id="silent-display" href="?display=1">Continue without audio</a></div></div>
   <dialog id="export-dialog" aria-labelledby="export-heading"><form method="dialog"><button class="dialog-close" aria-label="Close" value="cancel">×</button></form><p class="eyebrow">TAKE YOUR FIELD NOTES HOME</p><h2 id="export-heading">Export observations</h2><p id="export-summary"></p><label>Location name<input id="location-name" placeholder="e.g. High Park"></label><div class="export-location"><label>State / province<input id="export-state" placeholder="e.g. ON"></label><label>Country<input id="export-country" placeholder="e.g. CA"></label></div><p class="export-note">eBird includes birds only, without headers. Incidental protocol: this version does not collect complete survey effort.<br>Generic CSV includes all taxa and column headers.</p><button id="export-ebird" class="start-button" type="button">Download eBird CSV <span>↓</span></button><button id="export-all" class="secondary-button" type="button">All taxa · Generic CSV ↓</button></dialog>
+  <audio id="headset-audio" loop playsinline hidden></audio>
+  <div id="headset-toast" class="headset-toast" role="status" hidden></div>
   <noscript>This companion needs JavaScript for audio and field notes.</noscript>
 </body>
 </html>
