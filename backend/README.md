@@ -6,13 +6,74 @@ comparisons and species-fact follow-ups without changing the logging fast path.
 ```bash
 source /data/build/birding-demo/.venv/bin/activate
 # BOSON_API_KEY, or the existing ~/.config/boson/api_key; never copy into the repo
-python -B backend/server.py --port 8793
+python -B backend/server.py --port 8796
 ```
 
 The backend serves the existing `web/` at `/` and WebSockets at `/ws`. A phone
 needs HTTPS for microphone capture; use one tunnel for both. This is an
 unauthenticated, in-memory hackathon demo: use a single uvicorn worker and do not
 expose it publicly. Server restart loses session state.
+
+## look-ui / round1 integration (2026-10-24)
+
+Both router tool sets are retained: visual/pronoun requests use Look and the
+read-only expert, while sound questions, greetings and garbage follow round1's
+rules. Per-turn snapshots include focus ID, top-three fused candidates,
+uncertainty and hint. History pruning is serialized and deferred until the
+whole turn completes, including function outputs and the answer.
+
+The checklist remains derived from confirmed observations, including accepted
+BirdNET suggestions. Clear-all and reset clear observations/focus, frames,
+sound evidence, heard history and pending suggestions; reset also reconnects
+with empty conversation state. Fusion priors come from the same paginated iNat
+allowlist query, not a second eligibility list.
+
+Verification: 49 server + 27 expert + 4 model-free vision unit tests passed;
+all web JavaScript passed `node --check`. Both headless browser suites passed
+against isolated fixtures (camera suite also checks reset clears evidence).
+Real Higgs on port 8797 routed mic check → `speak`, two mallards →
+`add_observation`, “What's that?” → `look` with capture, clear-all →
+`remove_observation`; reset reconnected successfully. With an explicitly empty
+OpenAI key, a diet follow-up routed `ask_expert` and safely abstained with
+`not_configured`; no client errors. Smoke was text/quiet mode, not acoustic or
+real vision-model validation. Evidence: ignored `out/integration/` logs and
+`web-self-passing-results.json` in this worktree.
+
+## Round 1 fixes (2026-10-23)
+
+- Sound questions use `recent_sounds(seconds=15)`; checklist/count questions use
+  `get_checklist`. Greetings/mic checks use `speak`; filler/garbled fragments use
+  `ignore`. Only explicit approval accepts pending suggestions. Explicit
+  all/everything/clear requests can use `remove_observation(all=true)`.
+- BirdNET uses one scientific-name allowlist: geo SpeciesList at **0.001** union
+  iNat verifiable Aves species, all time, paginated at 500/page. Ontario bbox
+  (41.7–56.9 N, 95.2–74.3 W) uses place 6883; elsewhere uses a 100 km radius.
+  Non-bird labels and non-binomial names are always dropped; no rarity bypass.
+  Both sources must succeed to replace the last good list. Failure reuses the
+  regional memory/disk cache (`/data/build/tmp/allowlist-<lat>_<lng>.json`, rounded
+  to one decimal), or suppresses all detections and logs; retries after 60 s.
+- All eligible >=0.25 detections remain in `recent_sounds` history. Heard events
+  and suggestions require two distinct >=0.5 windows within 10 s or one >=0.7
+  hit. `unusual` is always false.
+- Higgs item deletion was probed successfully. Item-created/added IDs are tracked;
+  each completed turn retains only the last **8 items**, including function
+  outputs and NOTIFY. Fresh route instructions carry checklist species/counts,
+  pending suggestions and the last three distinct heard species. The active
+  strategy and pruning counts are logged. Reconnect clears VAD/transcript flags;
+  response completion must match the awaited response ID.
+- `reset` from mic **or display** flushes speech, clears outing/queued state and
+  reconnects Higgs with an empty checklist. Mic `location` supports late GPS.
+
+Verification: **39 offline tests**, plus ten real-Higgs text routing cases on
+**127.0.0.1:8796** (quiet mode suppressed answer audio; pending suggestions were
+seeded in the test process). All ten selected the expected tools; explicit
+remove-all emptied two checklist species. Display reset established a fresh
+Realtime connection. No port-8780 changes or acoustic/STT retest.
+Evidence (outside the repository): `/data/build/tmp/round1-unit.log`,
+`round1-delete-probe.log`, `round1-live.log`, `round1-live-results.json`,
+`round1-allowlist-live.log`. Live allowlist: 517 species, including Red-necked
+Grebe, excluding the five reviewed out-of-range species and Human non-vocal.
+Historical verification sections below describe earlier revisions.
 
 ## Sessions and audio
 
@@ -70,7 +131,7 @@ only after the first update; its initial `session.created` is accepted for setup
 3. Speak/read results switch the session to audio, tool choice none, no tools;
    answer PCM streams immediately, **without waiting for response.done**.
 4. Proactive BirdNET notifications enter the answer phase directly. Two >=0.5
-   detections in distinct windows within ten seconds are required. Detections
+   detections in distinct windows within ten seconds OR a single >=0.7 hit qualify. Detections
    >=0.25 appear in history, but are never automatically logged. Notifications
    wait for user speech, transcription, active generation and playback; user
    turns take priority over deferred notifications.
@@ -146,7 +207,7 @@ speaker-echo verification below for current behavior.
 
 ## Batched proactive suggestions (feat/batched-suggestions)
 
-The existing two-window / ten-second / >=0.5 rule now populates an ordered
+The two-window / ten-second / >=0.5 rule (or one >=0.7 hit) populates an ordered
 session suggestion buffer, retaining best confidence and first/last heard times.
 A 3.5-second debounce produces one batch; prompt starts are at least 25 seconds
 apart (measured again at first output audio). New species accumulate during the

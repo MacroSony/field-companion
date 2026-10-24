@@ -20,6 +20,8 @@ One WebSocket per phone: `wss://<host>/ws`. The backend also serves the web app 
   - `{"type":"mode","quiet":true|false}`: quiet mode. Logging still works, but the assistant only speaks after a tap.
   - `{"type":"tap"}`: push-to-talk / "talk to me now". The next utterance is treated as addressed.
   - `{"type":"text","text":"..."}`: typed input (debug fallback).
+  - `{"type":"location","lat":43.66,"lng":-79.39}`: mic only; update GPS after a late fix. Both finite, in-range coordinates are required; subsequent detections and range filtering use the new position.
+  - `{"type":"reset"}`: mic or display; start a new outing. Clear checklist, pending suggestions, heard history, notification/focus queues and queued turns/audio; cancel speech and broadcast `flush`, empty `checklist`, empty `suggestions` and `state`. The backend reconnects Realtime to start a fresh conversation; clients stay connected. GPS, language and audio/quiet settings are retained.
   - `{"type":"edit","id":"<obs id>","count":3}` / `{"type":"delete","id":"<obs id>"}`: manual checklist edits from the UI.
 
 ## Backend → phone
@@ -28,7 +30,7 @@ One WebSocket per phone: `wss://<host>/ws`. The backend also serves the web app 
   - `{"type":"flush"}`: barge-in or cancelled response. Stop playback now and drop the queued audio.
   - `{"type":"earcon","kind":"logged"|"heard"|"error"}`: play a short local sound (generated on the phone, no file).
   - `{"type":"checklist","items":[{"id":"o1","sci":"Cardinalis cardinalis","en":"Northern Cardinal","zh":"北美红雀",  (zh optional; UI is English-first)"group":"Aves","count":2,"notes":"","first_seen":"2026-10-24T10:02:11-04:00","source":"voice"|"birdnet"|"photo"}]}`: full checklist state, sent after every change. The UI renders only this, never the model's words.
-  - `{"type":"heard","sci":"...","en":"...","zh":"...","conf":0.87,"t":"<iso>","new":true}`: a BirdNET detection. `new` means first time in this session above threshold.
+  - `{"type":"heard","sci":"...","en":"...","zh":"...","conf":0.87,"t":"<iso>","new":true}`: an eligible BirdNET detection: two distinct windows >=0.5 within ten seconds, or one >=0.7 hit. `new` means the first qualifying event for this species in the outing; `unusual` is false/absent. Lower eligible hits >=0.25 remain queryable through `recent_sounds`, but are not sent as heard events. Reset clears backend heard history; clients should also clear their local outing display when resetting.
   - `{"type":"transcript","role":"user"|"assistant","text":"...","final":true|false}`: captions.
   - `{"type":"candidates","items":[{"sci":"...","en":"...","zh":"...","photo":"https://...","why":"..."}]}`: identification candidates to show as cards (describe-to-ID / photo ID).
   - `{"type":"state","listening":true,"speaking":false,"model":"higgs-realtime-1.5-preview","connected":true,"echo_guard":true,"session":"demo"}`: status for the UI indicator. `echo_guard` describes the selected policy, not whether input is currently being dropped.

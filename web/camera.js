@@ -68,6 +68,14 @@ window.FieldCamera = class FieldCamera {
     this.$('camera-panel').hidden = true;
     this.updateConnection();
   }
+  reset() {
+    this.close();
+    this.observation = null; this.focus = false;
+    this.$('active-observation').hidden = true;
+    this.$('observation-candidates').replaceChildren();
+    this.$('observation-evidence').replaceChildren();
+    this.updateConnection();
+  }
   updateConnection() {
     const connected = this.connected();
     if (this.wasConnected && !connected) {

@@ -23,6 +23,7 @@ from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Response
 
 ROOT = Path(__file__).resolve().parent
+CLIENT_BUILD = '2026-10-24-integ1'
 PHOTOS = {}
 SESSIONS = {}
 SPECIES = [
@@ -90,6 +91,8 @@ class Session:
     def __init__(self):
         self.items = initial_items()
         self.clients = {}
+        self.coords = None
+        self.suggestions = []
         self.history = []
         self.task = None
         self.quiet = False
@@ -104,7 +107,7 @@ class Session:
                 await ws.send(data)
 
     async def status(self, speaking=False):
-        await self.emit('state', connected=True, listening=True, speaking=speaking, model='higgs-realtime-1.5-preview')
+        await self.emit('state', connected=True, listening=True, speaking=speaking, model='higgs-realtime-1.5-preview', server_build=CLIENT_BUILD)
 
     async def checklist(self):
         await self.emit('checklist', items=self.items)
@@ -130,6 +133,8 @@ class Session:
     async def demo(self):
         await asyncio.sleep(.3)
         await self.emit('heard', **taxon(1, conf=.97, t=now(), new=True))
+        self.suggestions = [taxon(1, conf=.97, t=now())]
+        await self.emit('suggestions', items=self.suggestions)
         await self.emit('earcon', kind='heard')
         await asyncio.sleep(.3)
         await self.emit('heard', **taxon(2, conf=.84, t=now(), new=False))
@@ -165,10 +170,14 @@ async def handler(ws):
         if role == 'mic':
             for older, client in list(session.clients.items()):
                 if client['role'] == 'mic':
-                    await older.close(1000, 'New mic joined')
+                    await older.close(1000, 'Replaced by newer microphone')
         session.clients[ws] = dict(role=role, audio=audio)
-        await ws.send(json.dumps(dict(type='state', connected=True, listening=True, speaking=False, model='higgs-realtime-1.5-preview')))
+        await ws.send(json.dumps(dict(type='state', connected=True, listening=True, speaking=False, model='higgs-realtime-1.5-preview', server_build=CLIENT_BUILD)))
+        hello = json.loads(first)
+        if role == 'mic' and all(isinstance(hello.get(k), (float, int)) for k in ('lat', 'lng')):
+            session.coords = {k: hello[k] for k in ('lat', 'lng')}
         await ws.send(json.dumps(dict(type='checklist', items=session.items)))
+        await ws.send(json.dumps(dict(type='suggestions', items=session.suggestions)))
         for event in session.history:
             await ws.send(event)
         if not session.task:
@@ -188,7 +197,41 @@ async def handler(ws):
             message = json.loads(raw)
             kind = message.get('type')
             print('client', raw, flush=True)
-            if kind == 'edit':
+            if kind == 'reset':
+                if session.task and not session.task.done():
+                    session.task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await session.task
+                session.items = []
+                session.history = []
+                session.suggestions = []
+                session.speaking_until = 0
+                await session.emit('reset')
+                await session.emit('flush')
+                await session.checklist()
+                await session.emit('suggestions', items=[])
+                await session.emit('candidates', items=[])
+                await session.status()
+            elif kind == 'location' and role == 'mic':
+                lat, lng = message.get('lat'), message.get('lng')
+                if (isinstance(lat, (int, float)) and isinstance(lng, (int, float))
+                        and math.isfinite(lat) and math.isfinite(lng) and abs(lat) <= 90 and abs(lng) <= 180):
+                    session.coords = dict(lat=lat, lng=lng)
+            elif kind == 'suggestion_action':
+                sci = message.get('sci')
+                suggestion = next((item for item in session.suggestions if item['sci'] == sci), None)
+                if suggestion and message.get('action') in {'accept', 'dismiss'}:
+                    session.suggestions = [item for item in session.suggestions if item['sci'] != sci]
+                    if message['action'] == 'accept':
+                        item = next((item for item in session.items if item['sci'] == sci), None)
+                        if item:
+                            item['count'] += 1
+                        else:
+                            session.items.append(suggestion | dict(id='o' + str(time.time_ns()), group='Aves', count=1,
+                                                                  source='birdnet', first_seen=now(), **(session.coords or {})))
+                        await session.checklist()
+                    await session.emit('suggestions', items=session.suggestions)
+            elif kind == 'edit':
                 for item in session.items:
                     if item['id'] == message.get('id'):
                         item['count'] = max(1, int(message.get('count', 1)))
@@ -223,9 +266,10 @@ async def handler(ws):
         print(f'closed role={role}; received {mic_frames} microphone frames', flush=True)
 
 
-async def main(port, host):
-    with ThreadPoolExecutor(max_workers=6) as pool:
-        PHOTOS.update(pool.map(fetch_photo, SPECIES))
+async def main(port, host, offline=False):
+    if not offline:
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            PHOTOS.update(pool.map(fetch_photo, SPECIES))
     print(f'iNaturalist photos: {sum(bool(p) for p in PHOTOS.values())}/{len(SPECIES)}', flush=True)
     async with serve(handler, host, port, process_request=process_request, max_size=2**20):
         print(f'Mock: http://localhost:{port} | /?display=1&session=demo', flush=True)
@@ -237,8 +281,9 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--port', type=int, default=8766)
     parser.add_argument('--host', default='0.0.0.0')
+    parser.add_argument('--offline', action='store_true', help='Skip remote photos for deterministic headless/offline runs')
     args = parser.parse_args()
     try:
-        asyncio.run(main(args.port, args.host))
+        asyncio.run(main(args.port, args.host, args.offline))
     except KeyboardInterrupt:
         pass
