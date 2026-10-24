@@ -302,6 +302,7 @@
       body.append(element('h3', '', item.en || item.sci), element('p', 'scientific', item.sci || ''));
       body.append(element('span', 'confidence', `${Math.round(Math.max(0, Math.min(1, Number(item.conf) || 0)) * 100)}%`));
       if (item.new) body.append(element('span', 'new-tag', 'NEW'));
+      if (item.unusual) body.append(element('span', 'new-tag unusual-tag', 'RARE?'));
       if (item.t && !Number.isNaN(Date.parse(item.t))) body.append(element('time', 'heard-time', new Date(item.t).toLocaleTimeString('en', {hour: '2-digit', minute: '2-digit'})));
       card.append(speciesPhoto(item), body);
       $('heard').append(card);

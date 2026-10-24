@@ -583,10 +583,44 @@ class Session:
         from birdnetlib.analyzer import Analyzer
         if self.analyzer is None:
             self.analyzer = Analyzer()
-        rec = RecordingBuffer(self.analyzer, samples, SR, lat=self.lat, lon=self.lng,
-                              date=datetime.now(), min_conf=0.25)
+        # Run unfiltered, then apply our own range filter: BirdNET's eBird-based season list
+        # misses locally recorded species (e.g. Red-necked Grebe in Toronto, Oct), so allow
+        # the union of BirdNET's list and recent iNat records; anything else needs high
+        # confidence and is flagged "unusual" (possible rarity) instead of being dropped.
+        rec = RecordingBuffer(self.analyzer, samples, SR, min_conf=0.25)
         rec.analyze()
-        return rec.detections
+        allowed = self.allowed_species()
+        out = []
+        for d in rec.detections:
+            sci = d.get("scientific_name") or d["common_name"]
+            if allowed and sci not in allowed:
+                if float(d["confidence"]) < 0.7:
+                    continue
+                d = {**d, "unusual": True}
+            out.append(d)
+        return out
+
+    def allowed_species(self):
+        key = (round(self.lat, 1), round(self.lng, 1), date.today().isoformat())
+        if getattr(self, "_allowed_key", None) == key:
+            return self._allowed
+        allowed = set()
+        try:
+            from birdnetlib.species import SpeciesList
+            allowed |= {x["scientific_name"] for x in SpeciesList().return_list(
+                lon=self.lng, lat=self.lat, date=datetime.now(), threshold=0.03)}
+        except Exception as exc:
+            self.log("species_list_failed", error_type=type(exc).__name__)
+        try:
+            since = (date.today() - timedelta(days=120)).isoformat()
+            r = inat("observations/species_counts", lat=self.lat, lng=self.lng, radius=25,
+                     d1=since, iconic_taxa="Aves", per_page=500)
+            allowed |= {t["taxon"]["name"] for t in r.get("results", [])}
+        except Exception as exc:
+            self.log("inat_species_failed", error_type=type(exc).__name__)
+        self._allowed_key, self._allowed = key, allowed
+        self.log("allowed_species", n=len(allowed))
+        return allowed
 
     async def bird_window(self, samples, end):
         try:
@@ -608,7 +642,7 @@ class Session:
                 if confidence >= 0.5:
                     self.seen.add(sci)
                 heard = {"type": "heard", **names, "conf": confidence, "t": now_iso(), "new": first,
-                         "lat": self.lat, "lng": self.lng}
+                         "lat": self.lat, "lng": self.lng, "unusual": bool(d.get("unusual"))}
                 self.history.append((time.monotonic(), {k: v for k, v in heard.items() if k != "type"}))
                 await self.phone_json(heard)
                 self.log("bird_detection", **names, conf=confidence, stream_s=round(end / SR, 2))

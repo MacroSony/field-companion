@@ -11,3 +11,5 @@
 @media(prefers-reduced-motion:reduce){.observation.updated{animation:none}}
 /* Native details content has its own anonymous box; anchor the projector map. */
 .display-mode .map-card{position:relative}.display-mode #map{position:absolute;inset:40px 0 24px;height:auto;min-height:0}.display-mode .map-note{position:absolute;left:0;bottom:0;right:0;height:24px}
+
+.unusual-tag { background: #b8860b33; color: #f0c040; border-color: #f0c04066; }
