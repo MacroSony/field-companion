@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Phone PCM fan-out, Higgs Realtime, BirdNET, and an in-memory demo checklist."""
+"""Phone PCM, Higgs, BirdNET and in-memory Detection/Observation/Checklist."""
 import os
 os.environ.setdefault("NUMBA_DISABLE_JIT", "1")
 
@@ -9,6 +9,9 @@ import base64
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
+from dataclasses import dataclass, field, asdict
+import math
+import io
 import json
 import logging
 from pathlib import Path
@@ -20,8 +23,8 @@ import numpy as np
 import requests
 from scipy.signal import firwin, lfilter
 import websockets
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
+from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 MODEL = "higgs-realtime-1.5-preview"
@@ -85,14 +88,105 @@ def nearby(lat, lng, group):
                         for r in result.get("results", [])]}
 
 
+@dataclass
+class Detection:
+    id: str
+    kind: str
+    t: str
+    candidates: list = field(default_factory=list)
+    thumb: str | None = None
+    text: str | None = None
+
+
+@dataclass
+class Observation:
+    id: str
+    status: str = "open"
+    detections: list = field(default_factory=list)
+    fused: list = field(default_factory=list)
+    uncertain: bool = True
+    hint: str = ""
+    count: int | None = None
+    notes: str = ""
+    t_start: str = field(default_factory=now_iso)
+    lat: float = 43.66
+    lng: float = -79.39
+    group: str = "Aves"
+    touched: float = field(default_factory=time.monotonic, repr=False)
+    awaiting_answer: bool = field(default=False, repr=False)
+
+    def payload(self):
+        return {k: v for k, v in asdict(self).items() if k not in ("touched", "awaiting_answer")}
+
+
+def fuse(detections, allowed=None, priors=None):
+    """Log-linear fusion; missing candidates get .01, resolved descriptions a 2x boost.
+
+    Only species actually seen in evidence are scored. Empty allowed means the
+    range service was unavailable; fail open rather than erase all evidence.
+    """
+    priors = priors or {}
+    names = {c["sci"]: c for d in detections for c in d.candidates}
+    species = sorted(s for s in names if not allowed or s in allowed)
+    scores = {}
+    for sci in species:
+        score = math.log(max(0, priors.get(sci, 0)) + 1)
+        for d in detections:
+            p = next((float(c["p"]) for c in d.candidates if c["sci"] == sci), None)
+            if d.kind == "description":
+                if p is not None:
+                    score += math.log(2) * max(0, min(1, p))
+            else:
+                score += (0.5 if d.kind == "sound" else 1) * math.log(max(1e-6, min(1, p if p is not None else .01)))
+        scores[sci] = score
+    if not scores:
+        return [], True
+    peak = max(scores.values())
+    weights = {s: math.exp(v - peak) for s, v in scores.items()}
+    total = sum(weights.values())
+    fused = [{"sci": sci, "en": names[sci].get("en", sci),
+              "photo": names[sci].get("photo", ""), "p": weights[sci] / total}
+             for sci in sorted(weights, key=lambda s: (-weights[s], s))]
+    margin = fused[0]["p"] - (fused[1]["p"] if len(fused) > 1 else 0)
+    return fused, fused[0]["p"] < .5 or margin < .2
+
+
+def expert_answer(question, observation_dict) -> str | None:
+    """Pluggable provider: replace this function; never required for core ID."""
+    return None
+
+
+def classify_frame(jpeg, crop, candidates):
+    try:
+        response = requests.post(VISION_URL + "/classify", json={
+            "jpeg_b64": base64.b64encode(jpeg).decode(), "crop": crop,
+            "candidates": candidates or None, "k": 5}, timeout=30)
+        response.raise_for_status()
+        result = response.json()
+        for c in result["candidates"]:
+            if not isinstance(c["sci"], str) or not math.isfinite(float(c["p"])) or not 0 <= float(c["p"]) <= 1:
+                raise ValueError("invalid candidate")
+        return result
+    except (requests.RequestException, ValueError, KeyError, TypeError):
+        raise HTTPException(503, "Vision service unavailable or invalid response (expected " + VISION_URL + "/classify)")
+
+
 def tool_schema(name, description, properties=None, required=()):
     return {"type": "function", "name": name, "description": description,
             "parameters": {"type": "object", "properties": properties or {}, "required": list(required)}}
 
 
+VISION_URL = os.environ.get("VISION_URL", "http://127.0.0.1:8795")
 NAME = {"type": "string"}
 COUNT = {"type": "integer", "minimum": 1}
 TOOLS = [
+    tool_schema("look", "Identify what the user is looking at ('what is that?'); request camera frames. Stay silent until frames arrive. Set group for nonbirds.", {"hint": NAME, "group": {"type": "string", "enum": GROUPS}}),
+    tool_schema("get_observation", "Read focus evidence for pronouns and follow-up naturalist questions."),
+    tool_schema("confirm_observation", "Add it / log it / two of them: confirm the focus, not a new named sighting. No speech.", {"count": COUNT, "notes": NAME}),
+    tool_schema("discard_observation", "Discard the focus; do not log it."),
+    tool_schema("new_observation", "Start a different organism as a new focus.", {"group": {"type": "string", "enum": GROUPS}}),
+    tool_schema("describe", "Attach a user description to the focus; resolve only explicit species names.", {"text": NAME, "name": NAME}, ("text",)),
+    tool_schema("ask_expert", "Ask the pluggable expert about the focus.", {"question": NAME}, ("question",)),
     tool_schema("add_observation", "Log a user-confirmed sighting; increases existing count. No spoken acknowledgement.",
                 {"name": NAME, "group": {"type": "string", "enum": GROUPS}, "count": COUNT,
                  "notes": {"type": "string"}}, ("name", "group", "count", "notes")),
@@ -117,7 +211,11 @@ Never claim to have logged anything without a successful tool call. Logging has 
 not speech. Never give delayed logging acknowledgements, including "I've logged X".
 For checklist questions call get_checklist; what just called: recent_sounds (unconfirmed).
 For other addressed birding questions call speak(reason); for local ID candidates use nearby_species.
-Never invent sightings or identify from insufficient evidence; ask for a description instead.
+For "what's that?", "look again", or visual identification call look, NOT speak.
+For "add it", "two of them", or "log that" call confirm_observation with the count.
+Pronouns refer to the focus; for follow-up facts call get_observation.
+For a different organism call new_observation; discard unwanted IDs with discard_observation.
+Never invent sightings or identify from insufficient evidence; request camera evidence with look.
 """
 ROUTING = INSTRUCTIONS + """
 ROUTING PHASE ONLY: select exactly ONE function call with NO text or audio.
@@ -131,9 +229,14 @@ Use supplied tool results and checklist. Never acknowledge any earlier log or ch
 no "I've logged X" acknowledgements in answers. Reply in English by default, but in the
 language of the question (including Chinese). [NOTIFY] is an automated, unconfirmed BirdNET
 event: briefly ask whether to add the heard species, in English; NEVER claim it is logged.
+[VISION] contains the current focus top-3 and uncertain flag. If certain say "Looks like a
+<species>"; if uncertain say "Not sure — <top two>; can you zoom in?". Use hint when
+present to request a discriminating close-up. If top3 is empty, say you cannot identify
+it yet and ask for a closer frame. Never claim a vision ID is logged.
 """
 SESSIONS = {}
 SESSION_TTL = 600
+FOCUS_TTL = 120
 
 
 def valid_count(value):
@@ -147,7 +250,10 @@ class Session:
         self.id = session_id
         self.clients = set()
         self.mic = None
-        self.items = []
+        self.observations = {}
+        self.focus = None
+        self.frames = {}
+        self.sound_windows = deque(maxlen=30)
         self.item_lock = asyncio.Lock()
         self.expiry_task = None
         self.update_lock = asyncio.Lock()
@@ -196,6 +302,106 @@ class Session:
         self.transcripts = {}
         self.total_audio_in = 0
         self.total_audio_out = 0
+
+    @property
+    def items(self):
+        rows = {}
+        for obs in self.observations.values():
+            if obs.status != "confirmed" or not obs.fused:
+                continue
+            top = obs.fused[0]
+            sci = top["sci"]
+            if sci not in rows:
+                rows[sci] = {"id": obs.id, "sci": sci, "en": top["en"], "photo": top.get("photo", ""),
+                             "count": 0, "notes": "", "first_seen": obs.t_start, "group": obs.group,
+                             "lat": obs.lat, "lng": obs.lng,
+                             "source": "photo" if any(d.kind == "image" for d in obs.detections) else (
+                                 "voice" if any(d.kind == "description" for d in obs.detections) else "birdnet")}
+            rows[sci]["count"] += obs.count or 1
+            rows[sci]["notes"] = "; ".join(filter(None, [rows[sci]["notes"], obs.notes]))
+        return list(rows.values())
+
+    async def broadcast_observation(self, obs):
+        await self.phone_json({"type": "observation", **obs.payload(), "focus": self.focus == obs.id})
+
+    async def expire_focus(self):
+        obs = self.observations.get(self.focus)
+        if obs and time.monotonic() - obs.touched >= FOCUS_TTL:
+            self.focus = None
+            if obs.status == "open":
+                obs.status = "discarded"
+            obs.awaiting_answer = False
+            await self.broadcast_observation(obs)
+
+    async def focus_watch(self):
+        while not self.closed:
+            await asyncio.sleep(1)
+            await self.expire_focus()
+
+    async def new_focus(self, group="Aves"):
+        old = self.observations.get(self.focus)
+        if old and old.status == "open":
+            old.status = "discarded"
+            old.awaiting_answer = False
+        obs = Observation("ob" + uuid.uuid4().hex[:10], lat=self.lat, lng=self.lng, group=group)
+        self.observations[obs.id] = obs
+        self.focus = obs.id
+        if old:
+            await self.broadcast_observation(old)
+        await self.broadcast_observation(obs)
+        return obs
+
+    async def current_focus(self, create=False):
+        await self.expire_focus()
+        obs = self.observations.get(self.focus)
+        if create and (not obs or obs.status != "open"):
+            obs = await self.new_focus()
+        if obs:
+            obs.touched = time.monotonic()
+        return obs
+
+    async def refusion(self, obs, touch=True):
+        allowed = await asyncio.get_running_loop().run_in_executor(self.executor, self.allowed_species) if obs.group == "Aves" else None
+        priors = getattr(self, "_prior_counts", {})
+        obs.fused, obs.uncertain = fuse(obs.detections, allowed, priors)
+        if touch:
+            obs.touched = time.monotonic()
+        await self.broadcast_observation(obs)
+
+    async def request_look(self, hint="", group=None):
+        if group is not None and group not in GROUPS:
+            raise ValueError("invalid iconic group")
+        obs = await self.current_focus(create=True)
+        if group is not None:
+            obs.group = group
+        obs.hint = str(hint or obs.hint)[:500]
+        obs.awaiting_answer = True
+        known = {d.id for d in obs.detections}
+        for stamp, detection in self.sound_windows:
+            if abs(time.monotonic() - stamp) <= 10 and detection.id not in known:
+                obs.detections.append(detection)
+        await self.refusion(obs)
+        if self.mic:
+            await self.mic.send_json({"type": "capture", "obs": obs.id, "n": 3, "hint": obs.hint})
+        return {"ok": True, "observation": obs.payload(), "waiting_for_frames": True}
+
+    async def change_checklist(self, item_id, count=None):
+        row = next((r for r in self.items if r["id"] == item_id), None)
+        if not row:
+            raise ValueError("Unknown checklist id")
+        members = [o for o in self.observations.values() if o.status == "confirmed" and o.fused and o.fused[0]["sci"] == row["sci"]]
+        # A total edit consolidates the species into the representative observation.
+        for i, obs in enumerate(members):
+            if count is None or i:
+                obs.status = "discarded"
+                obs.awaiting_answer = False
+                if self.focus == obs.id:
+                    self.focus = None
+            else:
+                obs.count = count
+            await self.broadcast_observation(obs)
+        await self.broadcast_checklist()
+        return row
 
     def log(self, event, **fields):
         LOG.info("%s", json.dumps({"connection": self.id, "event": event, **fields}, ensure_ascii=False))
@@ -293,7 +499,7 @@ class Session:
             self.work_ready.clear()
             if not self.connected or self.active or self.user_speaking or not self.pending:
                 continue
-            user = next((p for p in self.pending if p[0] != "notify"), None)
+            user = next((p for p in self.pending if p[0] in ("text", "audio")), None)
             if user is not None:
                 self.pending.remove(user)
                 self.pending.appendleft(user)
@@ -308,7 +514,12 @@ class Session:
             self.active = True
             self.turn_stopped_at = stopped
             try:
-                if kind == "notify":
+                if kind == "vision":
+                    obs = self.observations.get(value)
+                    if obs and obs.status == "open" and self.focus == obs.id and self.may_speak():
+                        await self.inject("[VISION] " + json.dumps({"top3": obs.fused[:3], "uncertain": obs.uncertain, "hint": obs.hint}))
+                        await self.generate("answer")
+                elif kind == "notify":
                     await self.inject("[NOTIFY] BirdNET heard " + value["en"])
                     await self.generate("answer")
                 else:
@@ -348,7 +559,7 @@ class Session:
         except Exception as exc:
             self.log("tool_failed", name=name, error_type=type(exc).__name__)
             result = {"ok": False, "error": "External service unavailable; try again"}
-        if name in ("add_observation", "set_count", "remove_observation"):
+        if name in ("add_observation", "set_count", "remove_observation", "confirm_observation"):
             await self.broadcast_checklist()
             if result.get("ok"):
                 await self.phone_json({"type": "earcon", "kind": "logged"})
@@ -359,7 +570,7 @@ class Session:
             "type": "function_call_output", "call_id": call["call_id"],
             "output": json.dumps(result, ensure_ascii=False)}})
         self.log("tool", name=name, ok=result.get("ok", True))
-        if name in ("speak", "get_checklist", "recent_sounds", "nearby_species") and self.may_speak():
+        if name in ("speak", "get_checklist", "recent_sounds", "nearby_species", "get_observation", "ask_expert", "describe") and self.may_speak():
             await self.generate("answer")
 
     def latency(self, target):
@@ -524,6 +735,47 @@ class Session:
         return None
 
     async def tool(self, name, args):
+        if name == "look":
+            return await self.request_look(args.get("hint", ""), args.get("group"))
+        if name == "new_observation":
+            group = args.get("group", "Aves")
+            if group not in GROUPS:
+                raise ValueError("invalid iconic group")
+            return {"ok": True, "observation": (await self.new_focus(group)).payload()}
+        if name in ("get_observation", "confirm_observation", "discard_observation", "ask_expert", "describe"):
+            obs = await self.current_focus(create=name == "describe")
+            if not obs:
+                return {"ok": False, "error": "No focus observation; look first"}
+            if name == "get_observation":
+                return {"observation": obs.payload()}
+            if name == "ask_expert":
+                answer = await asyncio.to_thread(expert_answer, str(args["question"]), obs.payload())
+                return {"answer": answer, "note": "expert provider not configured" if answer is None else "expert provider"}
+            if name == "discard_observation":
+                obs.status = "discarded"
+                obs.awaiting_answer = False
+                self.focus = None
+                await self.broadcast_observation(obs)
+                await self.broadcast_checklist()
+                return {"ok": True}
+            if name == "describe":
+                candidates = []
+                # Never autocomplete arbitrary descriptive prose into a species.
+                if args.get("name"):
+                    taxon = await asyncio.to_thread(resolve, str(args["name"]), obs.group)
+                    if taxon:
+                        candidates = [{**taxon, "p": 1.0}]
+                obs.detections.append(Detection("d" + uuid.uuid4().hex[:12], "description", now_iso(), candidates, text=str(args["text"])))
+                await self.refusion(obs)
+                return {"ok": True, "observation": obs.payload()}
+            if not obs.fused or obs.status == "discarded":
+                return {"ok": False, "error": "No identified candidate to confirm; look again"}
+            obs.count = valid_count(args.get("count", obs.count or 1))
+            obs.notes = str(args.get("notes", obs.notes))
+            obs.status = "confirmed"
+            obs.awaiting_answer = False
+            await self.broadcast_observation(obs)
+            return {"ok": True, "observation": obs.payload()}
         if name == "get_checklist":
             return {"items": [dict(r) for r in self.items], "species_count": len(self.items)}
         if name == "recent_sounds":
@@ -551,30 +803,21 @@ class Session:
             taxon = await asyncio.to_thread(resolve, str(args["name"]), group)
             if not taxon:
                 return {"ok": False, "error": "No matching taxon in that iconic group"}
-            async with self.item_lock:
-                row = next((r for r in self.items if r["sci"] == taxon["sci"]), None)
-                if row:
-                    row["count"] += count
-                    if args.get("notes"):
-                        row["notes"] = "; ".join(filter(None, [row["notes"], str(args["notes"])]))
-                else:
-                    row = {"id": "o" + uuid.uuid4().hex[:10], **taxon, "count": count,
-                           "notes": str(args.get("notes", "")), "first_seen": now_iso(), "source": "voice",
-                           "photo": taxon.get("photo", ""), "lat": self.lat, "lng": self.lng}
-                    self.items.append(row)
-                return {"ok": True, "item": dict(row)}
+            obs = await self.new_focus(group)
+            obs.detections.append(Detection("d" + uuid.uuid4().hex[:12], "description", now_iso(),
+                                             [{**taxon, "p": 1.0}], text=str(args["name"])))
+            # Explicit user sightings are not erased by a bird range filter.
+            obs.fused, obs.uncertain = fuse(obs.detections)
+            obs.count, obs.notes, obs.status = count, str(args.get("notes", "")), "confirmed"
+            await self.broadcast_observation(obs)
+            return {"ok": True, "observation": obs.payload()}
         if name in ("remove_observation", "set_count"):
             count = valid_count(args.get("count")) if name == "set_count" else None
             item_id = await self.find_item(args["name"])
-            async with self.item_lock:
-                row = next((r for r in self.items if r["id"] == item_id), None)
-                if row is None:
-                    return {"ok": False, "error": "Species is not in the checklist"}
-                if name == "remove_observation":
-                    self.items.remove(row)
-                else:
-                    row["count"] = count
-                return {"ok": True, "item": dict(row)}
+            if not item_id:
+                return {"ok": False, "error": "Species is not in the checklist"}
+            row = await self.change_checklist(item_id, count)
+            return {"ok": True, "item": row}
         raise ValueError("Unknown tool")
 
     def analyze(self, samples):
@@ -616,6 +859,7 @@ class Session:
             r = inat("observations/species_counts", lat=self.lat, lng=self.lng, radius=25,
                      d1=since, iconic_taxa="Aves", per_page=500)
             allowed |= {t["taxon"]["name"] for t in r.get("results", [])}
+            self._prior_counts = {t["taxon"]["name"]: t["count"] for t in r.get("results", [])}
         except Exception as exc:
             self.log("inat_species_failed", error_type=type(exc).__name__)
         self._allowed_key, self._allowed = key, allowed
@@ -628,6 +872,7 @@ class Session:
             detections = await asyncio.get_running_loop().run_in_executor(self.executor, self.analyze, samples)
             self.log("bird_window", stream_s=round(end / SR, 2), count=len(detections),
                      compute_ms=round((time.monotonic() - start) * 1000))
+            sound_candidates = []
             for d in detections:
                 sci = d.get("scientific_name") or d["common_name"]
                 if sci not in self.names:
@@ -638,6 +883,7 @@ class Session:
                     self.names[sci] = taxon or {"sci": sci, "en": d["common_name"], "zh": d["common_name"]}
                 names = {k: self.names[sci].get(k, "") for k in ("sci", "en", "zh", "photo")}
                 confidence = round(float(d["confidence"]), 4)
+                sound_candidates.append({**names, "p": confidence})
                 first = confidence >= 0.5 and sci not in self.seen
                 if confidence >= 0.5:
                     self.seen.add(sci)
@@ -657,6 +903,16 @@ class Session:
                     self.notified.add(sci)
                     self.pending.append(("notify", names, None))
                     self.log("notify_queued", sci=sci, windows=len(hits))
+            if sound_candidates:
+                stamp = time.monotonic() - max(0, (self.position - end) / SR) - 1.5
+                detection = Detection("d" + uuid.uuid4().hex[:12], "sound", now_iso(),
+                                      sorted(sound_candidates, key=lambda c: -c["p"])[:5])
+                self.sound_windows.append((stamp, detection))
+                await self.expire_focus()
+                obs = self.observations.get(self.focus)
+                if obs and obs.status == "open" and abs(stamp - obs.touched) <= 10:
+                    obs.detections.append(detection)
+                    await self.refusion(obs, touch=False)
             await self.flush_pending()
         except asyncio.CancelledError:
             raise
@@ -747,17 +1003,36 @@ class Session:
                 raise ValueError("text must contain 1–8000 characters")
             self.pending.append(("text", text, None))
             await self.flush_pending()
+        elif ty == "look":
+            await self.request_look(event.get("hint", ""), event.get("group"))
+        elif ty == "observation_action":
+            obs = self.observations.get(event.get("id"))
+            if not obs or obs.status == "discarded":
+                raise ValueError("Unknown or discarded observation")
+            action = event.get("action")
+            if action not in ("focus", "confirm", "discard"):
+                raise ValueError("Unknown observation action")
+            old = self.observations.get(self.focus)
+            self.focus = obs.id
+            obs.touched = time.monotonic()
+            if old and old is not obs:
+                if old.status == "open":
+                    old.status = "discarded"
+                    old.awaiting_answer = False
+                await self.broadcast_observation(old)
+            if action == "focus":
+                await self.broadcast_observation(obs)
+            else:
+                args = {k: event[k] for k in ("count", "notes") if k in event}
+                result = await self.tool(action + "_observation", args)
+                if not result.get("ok"):
+                    raise ValueError(result.get("error", "Action failed"))
+                await self.broadcast_checklist()
+                if action == "confirm":
+                    await self.phone_json({"type": "earcon", "kind": "logged"})
         elif ty in ("edit", "delete"):
             count = valid_count(event.get("count")) if ty == "edit" else None
-            async with self.item_lock:
-                row = next((r for r in self.items if r["id"] == event.get("id")), None)
-                if not row:
-                    raise ValueError("Unknown observation id")
-                if ty == "edit":
-                    row["count"] = count
-                else:
-                    self.items.remove(row)
-            await self.broadcast_checklist()
+            await self.change_checklist(event.get("id"), count)
             await self.phone_json({"type": "earcon", "kind": "logged"})
             if self.connected:
                 summary = json.dumps(self.items, ensure_ascii=False)
@@ -778,7 +1053,8 @@ class Session:
 
     def start(self):
         self.tasks = [asyncio.create_task(self.realtime_loop()),
-                      asyncio.create_task(self.audio_sender()), asyncio.create_task(self.turn_worker())]
+                      asyncio.create_task(self.audio_sender()), asyncio.create_task(self.turn_worker()),
+                      asyncio.create_task(self.focus_watch())]
 
     async def close(self):
         self.closed = True
@@ -828,6 +1104,8 @@ class Client:
         try:
             await s.state()
             await self.send_json({"type": "checklist", "items": [dict(r) for r in s.items]})
+            for obs in list(s.observations.values()):
+                await self.send_json({"type": "observation", **obs.payload(), "focus": s.focus == obs.id})
             while True:
                 packet = await self.phone.receive()
                 if packet["type"] == "websocket.disconnect":
@@ -842,7 +1120,7 @@ class Client:
                         event = json.loads(packet["text"])
                         if not isinstance(event, dict):
                             raise ValueError("JSON message must be an object")
-                        if self.role == "display" and event.get("type") not in ("hello", "text", "edit", "delete", "tap"):
+                        if self.role == "display" and event.get("type") not in ("hello", "text", "edit", "delete", "tap", "look", "observation_action"):
                             raise ValueError("Display cannot control microphone or mode")
                         if event.get("type") == "hello" and self.role == "display":
                             await self.send_json(s.state_payload())
@@ -865,7 +1143,7 @@ class Client:
                 s.expiry_task = asyncio.create_task(s.expire())
 
 
-app = FastAPI(title="Field Companion v0.1")
+app = FastAPI(title="Field Companion v0.2")
 
 
 @app.websocket("/ws")
@@ -881,6 +1159,70 @@ async def phone_socket(ws: WebSocket):
         session = SESSIONS[session_id] = Session(session_id)
         session.start()
     await Client(ws, session, role, ws.query_params.get("audio") == "1").run()
+
+
+@app.post("/api/frame")
+async def post_frame(request: Request, session: str, obs: str, x: float | None = None,
+                     y: float | None = None, w: float | None = None, h: float | None = None):
+    s = SESSIONS.get(session)
+    if not s:
+        raise HTTPException(404, "Unknown session; connect WebSocket first")
+    await s.expire_focus()
+    observation = s.observations.get(obs)
+    if not observation or observation.status != "open" or s.focus != obs:
+        raise HTTPException(409, "Frame requires the current open focus observation")
+    crop = None
+    if any(v is not None for v in (x, y, w, h)):
+        if any(v is None or not math.isfinite(v) for v in (x, y, w, h)) or not (0 <= x < 1 and 0 <= y < 1 and 0 < w <= 1 and 0 < h <= 1 and x + w <= 1 and y + h <= 1):
+            raise HTTPException(422, "Crop must be normalized x,y,w,h within the frame")
+        crop = [x, y, w, h]
+    jpeg = await request.body()
+    if len(jpeg) > 8 * 1024 * 1024:
+        raise HTTPException(413, "JPEG must be at most 8 MiB")
+    try:
+        from PIL import Image
+        image = Image.open(io.BytesIO(jpeg))
+        if image.format != "JPEG" or max(image.size) > 1920:
+            raise ValueError()
+        image.thumbnail((512, 512))
+        thumb = io.BytesIO()
+        image.convert("RGB").save(thumb, format="JPEG", quality=80)
+    except Exception:
+        raise HTTPException(422, "Expected valid JPEG with long side <=1920 pixels")
+    allowed = await asyncio.get_running_loop().run_in_executor(s.executor, s.allowed_species) if observation.group == "Aves" else None
+    result = await asyncio.to_thread(classify_frame, jpeg, crop, sorted(allowed) if allowed else None)
+    candidates = []
+    for candidate in result["candidates"]:
+        sci = candidate["sci"]
+        if sci not in s.names:
+            try:
+                taxon = await asyncio.to_thread(resolve, sci, observation.group)
+            except Exception:
+                taxon = None
+            s.names[sci] = taxon or {"sci": sci, "en": sci}
+        candidates.append({**s.names[sci], "sci": sci, "p": float(candidate["p"])})
+    # Vision is slow: discard late frames if focus changed while inference ran.
+    await s.expire_focus()
+    if observation.status != "open" or s.focus != obs:
+        raise HTTPException(409, "Observation closed or focus changed during classification")
+    detection_id = "d" + uuid.uuid4().hex[:12]
+    detection = Detection(detection_id, "image", now_iso(), candidates, thumb="/api/frame/" + detection_id + ".jpg")
+    s.frames[detection_id] = thumb.getvalue()
+    observation.detections.append(detection)
+    await s.refusion(observation)
+    if observation.awaiting_answer:
+        observation.awaiting_answer = False
+        s.pending.append(("vision", obs, None))
+        await s.flush_pending()
+    return {"detection": asdict(detection)}
+
+
+@app.get("/api/frame/{detection_id}.jpg")
+async def get_frame(detection_id: str):
+    for s in SESSIONS.values():
+        if detection_id in s.frames:
+            return Response(s.frames[detection_id], media_type="image/jpeg")
+    raise HTTPException(404, "Unknown frame")
 
 
 # Mount after the websocket route so /ws is never shadowed by the static app.
