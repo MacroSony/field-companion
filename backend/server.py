@@ -301,6 +301,10 @@ def valid_count(value):
     return value
 
 
+class TurnItems(set):
+    failed = False
+
+
 class TurnText(str):
     """Transcript plus any already-committed audio item (never a newer turn)."""
     def __new__(cls, text, item_ids=()):
@@ -327,6 +331,7 @@ class Session:
         self.conversation_ids = deque()
         self.history_lock = asyncio.Lock()
         self.turn_items = None
+        self.deleted_item_ids = deque(maxlen=500)
         self.item_owners = {}
         self.response_owners = {}
         self.tools_executed = False
@@ -668,6 +673,7 @@ class Session:
                 except (ConnectionError, websockets.ConnectionClosed):
                     return  # reconnect clears IDs; do not kill the turn worker
                 self.conversation_ids.popleft()
+                self.item_owners.pop(item_id, None)
                 deleted += 1
             if deleted:
                 self.log("history_pruned", deleted=deleted, retained=len(self.conversation_ids))
@@ -708,6 +714,7 @@ class Session:
                 if item_id in self.conversation_ids:
                     self.conversation_ids.remove(item_id)
                 self.item_owners.pop(item_id, None)
+                self.deleted_item_ids.append(item_id)
 
     async def generate(self, phase):
         self.phase = phase
@@ -826,7 +833,7 @@ class Session:
             self.active = True
             self.turn_in_progress = True
             self.turn_stopped_at = stopped
-            self.turn_items = set(getattr(value, "item_ids", ()))
+            self.turn_items = TurnItems(getattr(value, "item_ids", ()))
             for item_id in self.turn_items:
                 self.item_owners[item_id] = self.turn_items
             self.tools_executed = False
@@ -859,6 +866,7 @@ class Session:
                 raise
             except Exception as exc:
                 self.log("turn_failed", error_type=type(exc).__name__)
+                self.turn_items.failed = True
                 try:
                     await self.delete_items(self.turn_items)
                 except (ConnectionError, websockets.ConnectionClosed):
@@ -969,6 +977,7 @@ class Session:
                     self.awaited_response_id = None
                     self.user_speaking = self.awaiting_transcript = False
                     self.conversation_ids.clear()
+                    self.deleted_item_ids.clear()
                     self.item_owners.clear()
                     self.response_owners.clear()
                     self.transcripts.clear()
@@ -1029,17 +1038,27 @@ class Session:
         if ty in ("conversation.item.created", "conversation.item.added"):
             item = event.get("item", {})
             item_id = item.get("id")
+            if item_id in self.deleted_item_ids:
+                return  # delayed create acknowledgement after failed-turn deletion
             # User audio may arrive while an older turn is routing. Its transcript
             # assigns ownership later; never sweep it into the active turn.
             if item.get("role") != "user" and item_id not in self.item_owners:
                 self.own_item(item_id)
+            owner = self.item_owners.get(item_id)
+            if owner is not None and getattr(owner, "failed", False):
+                await self.delete_items([item_id])
+                return
             if item_id and item_id not in self.conversation_ids:
                 self.conversation_ids.append(item_id)
             if not self.active:
                 await self.prune_history()
             return
         if ty == "response.output_item.added":
-            self.own_item(event.get("item", {}).get("id"), self.response_owners.get(rid))
+            item_id = event.get("item", {}).get("id")
+            owner = self.response_owners.get(rid)
+            self.own_item(item_id, owner)
+            if owner is not None and getattr(owner, "failed", False) and item_id:
+                await self.delete_items([item_id])
             return
         if ty == "session.updated":
             if self.update_waiter is not None and not self.update_waiter.done():
@@ -1104,6 +1123,8 @@ class Session:
             self.response_id = event["response"]["id"]
             if self.turn_items is not None:
                 self.response_owners[self.response_id] = self.turn_items
+                while len(self.response_owners) > 100:
+                    del self.response_owners[next(iter(self.response_owners))]
             if self.response_id not in self.cancelled_ids and self.response_waiter is not None:
                 self.awaited_response_id = self.response_id
         elif ty in ("response.output_audio.delta", "response.audio.delta"):
@@ -1653,6 +1674,7 @@ class Session:
         self.user_speaking = self.awaiting_transcript = self.active = False
         self.response_id = self.awaited_response_id = None
         self.turn_items = None
+        self.deleted_item_ids.clear()
         self.item_owners.clear()
         self.response_owners.clear()
         self.tools_executed = False

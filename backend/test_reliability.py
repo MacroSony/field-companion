@@ -95,6 +95,17 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
         for text in ['Okay.', 'yes', 'yeah', 'sure', 'Ah, add it', '']:
             self.assertFalse(self.c.filler_only(text), text)
 
+    async def test_delayed_failed_items_do_not_reenter_history(self):
+        owner = s.TurnItems(['user'])
+        owner.failed = True
+        await self.c.delete_items(owner)
+        await self.c.handle_rt({'type': 'conversation.item.added', 'item': {'id': 'user', 'role': 'user'}})
+        self.c.response_owners['old'] = owner
+        await self.c.handle_rt({'type': 'response.output_item.added', 'response_id': 'old', 'item': {'id': 'late'}})
+        await self.c.handle_rt({'type': 'conversation.item.added', 'item': {'id': 'late', 'type': 'function_call'}})
+        self.assertFalse(self.c.conversation_ids)
+        self.assertIn('late', self.c.deleted_item_ids)
+
     async def test_remove_all_pair_only_and_ordered(self):
         def call(name, args):
             return {'type': 'function_call', 'name': name, 'call_id': name, 'arguments': json.dumps(args)}
