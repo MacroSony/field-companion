@@ -8,40 +8,47 @@
 - Target: a walking birder with earphones, a phone in the pocket and maybe a camera.
 
 ## 2. Core user flows (demo order, ~3 min)
-1. **Proactive sound ID**: the phone listens in the background. BirdNET hears a Northern Cardinal → the assistant cuts in: "I hear a Northern Cardinal, add it?" → "Yes, two, a male and a female" → the checklist updates on screen.
-2. **Voice logging**: "Three mallards on the pond" → "Actually four." Mixed Chinese/English is fine.
-3. **Describe-to-ID**: "Gray back, orange breast, walking on the lawn" → 3 candidate cards with photos (from local recent sightings) → "the first one" → logged.
-4. **Photo ID (any taxon)**: snap a photo of a flower or insect → BioCLIP identifies it → logged, so it works beyond birds.
-5. **Camera sync (stretch)**: import camera photos → match EXIF timestamps to voice notes ("those shots were the Red-tailed Hawk") → species keywords written to the photos and attached to the checklist.
-6. **Export**: eBird Record Format CSV (+ iNaturalist CSV) and a map/summary.
+1. **Just talk**: "Two mallards on the pond" → a soft *ding*, the checklist updates. No wake word, no reply. "Actually four" → *ding*. Mixed Chinese/English is fine.
+2. **Proactive sound ID**: BirdNET keeps listening. A new species (Northern Cardinal) → the assistant asks briefly: "Cardinal singing, add it?" → "Yes, two" → *ding*.
+3. **Ask about the past**: "What was that just now?" → the assistant checks BirdNET detections from the last ~15 s and answers. No need to wait for the bird to sing again.
+4. **Ignores chatter**: talking to a friend ("did you bring sunscreen?") → it stays silent.
+5. **Describe-to-ID**: "Gray back, orange breast, walking on the lawn" → 3 candidate cards with photos (from local recent sightings) → "the first one" → *ding*.
+6. **Photo ID (any taxon)**: snap a flower or insect → BioCLIP identifies it → logged, so it works beyond birds.
+7. **Camera sync (stretch)**: import camera photos → match EXIF timestamps to voice notes ("those shots were the Red-tailed Hawk") → species keywords written to the photos and attached to the checklist.
+8. **Export**: eBird Record Format CSV (+ iNaturalist CSV) and a map/summary.
 
 ## 3. Architecture
 ```
-Phone (mobile web / PWA)              Backend (Python, laptop → cloud later)               External
-  mic PCM  ───────── WebSocket ─────▶ relay ──▶ Higgs Realtime (voice, turn-taking, tools)  Boson API
-  playback ◀──────────────────────── relay ◀──
-  GPS, photos, UI ◀─ state/events ──  tools: add/remove/get checklist, nearby_species,      iNaturalist API
-                                         identify_by_description, photo_id
-                                       BirdNET (forked mic audio, 3 s windows) → proactive suggestions
-                                       BioCLIP 2 (photo ID, all taxa)
+Phone (mobile web / PWA)                Backend (Python, laptop -> cloud later)                External
+  mic PCM 48 kHz ──── WebSocket ─────▶  fan-out ─┬─▶ 24 kHz ─▶ Higgs Realtime 1.5 (voice, tools)  Boson API
+  playback / earcons ◀──────────────────────────┘◀─
+                                                 └─▶ 30 s ring buffer (48 kHz)
+                                                       └─ every 1.5 s, last 3 s ─▶ BirdNET ─▶ timestamped detections
+  GPS, photos, UI ◀── state/events ────  tools: add/remove/get checklist, ignore, recent_sounds,       iNaturalist API
+                                           nearby_species, identify_by_description, photo_id
+                                         BioCLIP 2 (photo ID, all taxa)
 ```
-- The backend holds the Boson key, forwards audio both ways and executes tools. The **checklist state lives on the backend**; the UI reflects tool results, never the model's claims.
-- BirdNET runs on the same mic stream. A new species above the confidence threshold → inject `[NOTIFY] BirdNET heard X (conf)` → the assistant speaks up (tested: about 0.4 s to start speaking).
+- The backend holds the Boson key and executes all tools. The **checklist state lives on the backend**; the UI reflects tool results, never the model's claims.
+- **One mic, two consumers.** The phone captures at **48 kHz** (bird songs reach 8-12 kHz+; BirdNET analyzes up to 15 kHz). The backend downsamples a copy to 24 kHz for Realtime and keeps the original in a ring buffer for BirdNET. BirdNET on CPU: ~40 ms per 3 s window.
+- Browser mic processing must be **off** (echoCancellation / noiseSuppression / autoGainControl = false), or noise suppression removes bird sounds → use earphones so the assistant's voice isn't picked up.
 
-### Audio gating: always listening, but only talking when addressed
-Higgs Realtime **always replies** after it detects the end of a speech turn (there is no "listen silently" mode), and it closes a session after 5 minutes without speech. So we must not stream the raw mic straight to it all the time.
-- **Backend receives the full mic stream** and forks it: (1) BirdNET always; (2) a local wake-word / speech gate; (3) Higgs Realtime **only while the gate is open**.
-- **Gate opens** on: wake word (e.g. openWakeWord on the backend; a pre-trained phrase for the demo, custom "hey <name>" later), a tap on the screen or headset button, or a proactive BirdNET suggestion (then keep it open for ~8 s for the answer).
-- On opening, send ~0.5 s of pre-roll audio so the first word isn't cut. **Gate closes** after the reply has finished and N seconds of silence.
-- **Barge-in** while the assistant talks: the gate is open, server VAD detects speech, the response is cancelled, and the client flushes queued playback (it must; the server generates audio ~6–8× faster than real time).
-- Reconnect on idle timeout. Checklist state lives on the backend, so a new session gets a short state summary injected.
-- Earphones avoid echo. Overheard conversations stay outside the gate.
+### Open mic by default: speak little, act a lot
+Birders rarely talk to themselves in the field. Speech is usually a sighting, a question, or chat with a companion (whose callouts are worth logging anyway). Wake words would put friction on the most frequent action, so:
+- **Everything goes to Realtime** (server VAD). The model gets an **`ignore()` tool**: if the speech is not for the assistant (chatter, phone call, noise), it calls only `ignore()`; the backend sends no `response.create`, so it stays silent.
+- **Logging = earcon, not speech.** After `add_observation` succeeds, the backend plays a *ding* and does not ask the model to speak. The model speaks only when something is ambiguous ("which duck?"). Quiet matters: talking scares birds.
+- **Sound ID is retrospective.** `recent_sounds(seconds)` queries BirdNET detections from the ring buffer, so "what was that?" works after the bird stops. Proactive suggestions fire only for new species above a threshold, with settings for all / rare only / off. A proactive question keeps the floor ~8 s for the answer.
+- **Barge-in**: server VAD detects speech while the assistant talks → cancel the response, and the client flushes queued audio (the server generates audio ~6-8x faster than real time).
+- **Group mode (optional)**: a wake word (openWakeWord) or tap-to-talk for noisy, chatty groups.
+- Sessions close after ~5 min without speech: reconnect automatically and inject a short checklist summary.
+- **Model**: `higgs-realtime-1.5-preview` (listed in /v1/models since Oct 23 evening; set it in both the URL and `session.model`, because the latter overrides the URL). Earlier tests ran on unversioned `higgs-realtime`; re-validating on 1.5.
 
 ## 4. Tools exposed to Higgs Realtime
 | Tool | Purpose |
 |---|---|
 | `add_observation(name, group, count, notes)` | resolves zh/en/scientific names via iNat autocomplete (filtered by group) |
 | `remove_observation(name)`, `get_checklist()` | edit/read |
+| `ignore()` | speech not addressed to the assistant → stay silent |
+| `recent_sounds(seconds)` | BirdNET detections from the last N seconds (ring buffer) |
 | `nearby_species(group)` | iNat species counts near GPS (birds, insects, plants, …) |
 | `identify_by_description(description, group)` | returns top-3 candidates + photo URLs; user confirms |
 | `photo_id(photo_id)` | BioCLIP 2 top-3 |
@@ -66,7 +73,8 @@ Higgs Realtime **always replies** after it detects the end of a speech turn (the
 | Bluetooth headset mic is narrowband + noise-suppressed → bird sounds lost | demo with wired earphones or the phone mic; pitch dual-mic (voice vs ambient) as future work |
 | Browser stops the mic when the phone locks | Wake Lock (screen on) for the demo; native app later |
 | HTTPS required for mic/GPS on phones | cloudflared/ngrok tunnel to the backend |
-| Bird calls triggering VAD/barge-in | far-field noise reduction, higher VAD threshold; test early |
+| Bird calls / chatter triggering replies | `ignore()` tool + earcons; VAD threshold; group mode with wake word (testing now) |
+| 1.5-preview not yet in docs; latency differs from unversioned | re-run tool/latency/barge-in tests on 1.5; fall back to `higgs-realtime` if worse |
 | Model says "added" without calling the tool | UI shows backend state only; instruction + check |
 | Noisy venue for live demo | play bird audio from a speaker near the mic; have a recorded backup video |
 
