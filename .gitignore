@@ -1,0 +1,9 @@
+.venv*/
+__pycache__/
+out/
+*.wav
+*.pcm
+*.src
+.env
+*.key
+node_modules/
