@@ -300,6 +300,14 @@ def valid_count(value):
     return value
 
 
+class TurnText(str):
+    """Transcript plus any already-committed audio item (never a newer turn)."""
+    def __new__(cls, text, item_ids=()):
+        obj = super().__new__(cls, text)
+        obj.item_ids = set(item_ids)
+        return obj
+
+
 class Session:
     def __init__(self, session_id):
         self.id = session_id
@@ -317,6 +325,10 @@ class Session:
         self.awaited_response_id = None
         self.conversation_ids = deque()
         self.history_lock = asyncio.Lock()
+        self.turn_items = None
+        self.item_owners = {}
+        self.response_owners = {}
+        self.tools_executed = False
         self.turn_task = None
         self.turn_in_progress = False
         self.epoch = 0
@@ -677,39 +689,59 @@ class Session:
             finally:
                 self.update_waiter = None
 
+    def own_item(self, item_id, owner=None):
+        owner = self.turn_items if owner is None else owner
+        if item_id and owner is not None:
+            owner.add(item_id)
+            self.item_owners[item_id] = owner
+
+    async def delete_items(self, items):
+        async with self.history_lock:
+            for item_id in list(items):
+                await self.rt_send({"type": "conversation.item.delete", "item_id": item_id})
+                if item_id in self.conversation_ids:
+                    self.conversation_ids.remove(item_id)
+                self.item_owners.pop(item_id, None)
+
     async def generate(self, phase):
         self.phase = phase
         await self.update_session(self.config(phase))
-        self.response_waiter = asyncio.get_running_loop().create_future()
-        self.awaited_response_id = None
         self.audio_allowed = phase == "answer" and self.may_speak()
         self.first_audio = False
-        try:
-            await self.rt_send({"type": "response.create"})
+        for attempt in range(2):
+            self.response_waiter = asyncio.get_running_loop().create_future()
+            self.awaited_response_id = None
             try:
-                response = await asyncio.wait_for(asyncio.shield(self.response_waiter), 8 if phase == "route" else 25)
-            except asyncio.TimeoutError:
-                # Seen live 10/23: a route response.create got no response at all (no error, no done).
-                self.log("response_timeout", phase=phase)
-                if self.awaited_response_id:
-                    self.cancelled_ids.append(self.awaited_response_id)
-                await self.rt_send({"type": "response.cancel"})
-                if phase != "route" or getattr(self, "_retrying", False):
-                    raise
-                self._retrying = True
+                await self.rt_send({"type": "response.create"})
                 try:
-                    return await self.generate(phase)
-                finally:
-                    self._retrying = False
-            if response.get("status") == "failed":
-                raise RuntimeError("Upstream generation failed")
-            return response
-        finally:
-            self.response_waiter = None
+                    response = await asyncio.wait_for(asyncio.shield(self.response_waiter), 8 if phase == "route" else 25)
+                except asyncio.TimeoutError:
+                    self.log("response_timeout", phase=phase)
+                    if self.awaited_response_id:
+                        self.cancelled_ids.append(self.awaited_response_id)
+                    await self.rt_send({"type": "response.cancel"})
+                    if phase != "route" or attempt or self.tools_executed:
+                        raise
+                    continue
+                for item in response.get("output", []):
+                    self.own_item(item.get("id"))
+                if response.get("status") == "failed":
+                    if phase == "route" and not attempt and not self.tools_executed:
+                        self.log("route_retry", reason="failed")
+                        await asyncio.sleep(.3)
+                        continue
+                    raise RuntimeError("Upstream generation failed")
+                return response
+            finally:
+                self.response_waiter = None
 
     async def inject(self, text):
-        await self.rt_send({"type": "conversation.item.create", "item": {"type": "message", "role": "user",
+        item_id = "item_" + uuid.uuid4().hex[:24]
+        self.own_item(item_id)
+        await self.rt_send({"type": "conversation.item.create", "item": {"id": item_id,
+                            "type": "message", "role": "user",
                             "content": [{"type": "input_text", "text": text}]}})
+        return item_id
 
     def suggestions_payload(self):
         return {"type": "suggestions", "items": [
@@ -764,12 +796,14 @@ class Session:
             if kind == "text" and stopped is not None:
                 # Merge consecutive queued utterances into one turn (backlog after a slow turn).
                 parts = [value]
+                merged_ids = set(getattr(value, "item_ids", ()))
                 while len(self.pending) > 1 and self.pending[1][0] == "text" and self.pending[1][2] is not None:
                     _, more, stopped = self.pending[1]
                     del self.pending[1]
                     parts.append(more)
+                    merged_ids.update(getattr(more, "item_ids", ()))
                 if len(parts) > 1:
-                    value = " ".join(parts)
+                    value = TurnText(" ".join(parts), merged_ids)
                     self.pending[0] = (kind, value, stopped)
                     self.log("turns_merged", n=len(parts))
             self.turn_stale = stopped is not None and time.monotonic() - stopped > 12
@@ -786,6 +820,10 @@ class Session:
             self.active = True
             self.turn_in_progress = True
             self.turn_stopped_at = stopped
+            self.turn_items = set(getattr(value, "item_ids", ()))
+            for item_id in self.turn_items:
+                self.item_owners[item_id] = self.turn_items
+            self.tools_executed = False
             try:
                 if kind == "vision":
                     await self.answer_vision(value)
@@ -811,8 +849,16 @@ class Session:
                 raise
             except Exception as exc:
                 self.log("turn_failed", error_type=type(exc).__name__)
+                try:
+                    await self.delete_items(self.turn_items)
+                except (ConnectionError, websockets.ConnectionClosed):
+                    # No next route on unreconciled history: reconnect starts clean.
+                    self.connected = False
+                    if self.rt is not None:
+                        await self.rt.close()
                 await self.error("Turn failed; please try again.")
             finally:
+                self.turn_items = None
                 self.proactive_turn = False
                 self.active = False
                 self.turn_in_progress = False
@@ -835,6 +881,7 @@ class Session:
         name = call["name"]
         try:
             args = json.loads(call.get("arguments") or "{}")
+            self.tools_executed = True
             result = {"ok": True} if name == "ignore" else (
                 {"ready_to_answer": True, "reason": args.get("reason")} if name == "speak"
                 else await self.tool(name, args))
@@ -884,6 +931,8 @@ class Session:
                     self.awaited_response_id = None
                     self.user_speaking = self.awaiting_transcript = False
                     self.conversation_ids.clear()
+                    self.item_owners.clear()
+                    self.response_owners.clear()
                     self.transcripts.clear()
                     # Higgs waits for the first update before emitting session.created.
                     await self.rt_send({"type": "session.update", "session": self.session()})
@@ -940,11 +989,19 @@ class Session:
                         "response.output_text.delta", "response.output_audio_transcript.done",
                         "response.audio_transcript.done", "response.output_text.done")
         if ty in ("conversation.item.created", "conversation.item.added"):
-            item_id = event.get("item", {}).get("id")
+            item = event.get("item", {})
+            item_id = item.get("id")
+            # User audio may arrive while an older turn is routing. Its transcript
+            # assigns ownership later; never sweep it into the active turn.
+            if item.get("role") != "user" and item_id not in self.item_owners:
+                self.own_item(item_id)
             if item_id and item_id not in self.conversation_ids:
                 self.conversation_ids.append(item_id)
             if not self.active:
                 await self.prune_history()
+            return
+        if ty == "response.output_item.added":
+            self.own_item(event.get("item", {}).get("id"), self.response_owners.get(rid))
             return
         if ty == "session.updated":
             if self.update_waiter is not None and not self.update_waiter.done():
@@ -998,7 +1055,7 @@ class Session:
             self.log("user_transcript", text=text)
             if text.strip():
                 self.input_revision += 1
-                self.pending.append(("text", text, self.speech_stopped_at))  # transcript as text; audio buffer is cleared
+                self.pending.append(("text", TurnText(text, [event["item_id"]] if event.get("item_id") else []), self.speech_stopped_at))  # transcript as text; audio buffer is cleared
                 await self.flush_pending()
         elif ty == "conversation.item.input_audio_transcription.failed":
             self.awaiting_transcript = False
@@ -1007,6 +1064,8 @@ class Session:
         elif ty == "response.created":
             self.active = True
             self.response_id = event["response"]["id"]
+            if self.turn_items is not None:
+                self.response_owners[self.response_id] = self.turn_items
             if self.response_id not in self.cancelled_ids and self.response_waiter is not None:
                 self.awaited_response_id = self.response_id
         elif ty in ("response.output_audio.delta", "response.audio.delta"):
@@ -1555,6 +1614,10 @@ class Session:
         self.last_proactive = float("-inf")
         self.user_speaking = self.awaiting_transcript = self.active = False
         self.response_id = self.awaited_response_id = None
+        self.turn_items = None
+        self.item_owners.clear()
+        self.response_owners.clear()
+        self.tools_executed = False
         self.play_until = self.echo_estimate = self.tap_at = 0
         self.ring.fill(0)
         self.echo_ring.fill(False)
