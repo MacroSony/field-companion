@@ -1,4 +1,4 @@
-"""Short local Higgs recordings for input receipt, tools and camera progress.
+"""Short local Higgs recordings for accepted tasks and camera progress.
 
 Regenerate explicitly with: python -B backend/tool_feedback.py --generate
 Runtime playback never makes a synthesis/model request.

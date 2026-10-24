@@ -54,11 +54,16 @@ One WebSocket per phone: `wss://<host>/ws`. The backend also serves the web app 
 - Model-routed checklist writes require grounded intent and an unchanged input
   focus/photo context. Unclear or stale writes produce a clarification rather
   than a write. Explicit manual buttons retain their direct authorization.
-- Accepted final voice transcripts and typed inputs receive a local cached spoken
-  receipt before routing or waiting for the turn worker. Echoes, empty/filler-only
-  speech and stop commands do not get a receipt; quiet rules still apply. Camera
-  confirmation uses its specific “Start taking photo.” cue instead. A receipt
-  means the input was heard, not that a tool succeeded or a sighting was logged.
+- Final voice transcripts and typed inputs are routed silently first. Only an
+  allowed, current task receives cached pre-tool feedback: visual/nearby queries
+  use their specific look/check cue; checklist, recent-sound and observation
+  queries may use “I heard you.” Ignore, rejected/failed routing, ordinary chat
+  and silent checklist writes get no generic receipt. Investigation actions use
+  their existing scheduled/status/result response. Bare Yes/Okay needs a matching
+  logging or investigation explanation offer; it cannot start an unrelated task.
+  Camera confirmation uses “Start taking photo.” directly, while early/repeated
+  Start reports opening/capture/analysis status. Quiet/playback/interrupt rules
+  still apply. Task feedback does not claim tool success or a logged sighting.
 - After a confirmed, valid JPEG upload the backend queues “Photo ready. Starting
   identification.” while inference proceeds. Progress waits for ongoing playback
   and conversation; the visual result waits until this cue drains. Cancelling or

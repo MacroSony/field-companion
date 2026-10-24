@@ -49,8 +49,11 @@ identification; a GPT investigation is separately scheduled only when required.
 
 Ready prompts use bundled Higgs recordings through the shared PCM queue, with no
 runtime synthesis call. They wait for ongoing speech/playback; quiet and interruption
-rules apply. Other accepted voice/text requests receive “I heard you.” / “听到了，
-我来处理。” before model routing, so a busy tool cannot delay the receipt.
+rules apply. Other voice/text input is classified before any task confirmation.
+Ignored chatter and unmatched Yes/Okay stay silent. Accepted identification tasks
+receive their look/check cue after routing, before the tool; normal chat answers
+directly. Early/repeated Start reports the actual camera phase, never a generic
+input receipt, and does not authorize another photo.
 Investigations and other questions can continue while
 the camera waits for confirmation.
 

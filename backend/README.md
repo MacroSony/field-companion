@@ -40,16 +40,21 @@ checks cover a blocked worker, processing queries and ambiguous-write rejection.
 The general browser regression passed too. A real Higgs check cancelled setup,
 then successfully routed a new fixed question and confirmed a capture command;
 it uploaded no photos, called no GPT, and did not play physical audio.
-Current build: `2026-10-24-log-fixes`.
+That build: `2026-10-24-log-fixes`.
 
-## Immediate receipt and camera progress (2026-10-24)
+## Task confirmation and camera progress (2026-10-24)
 
-Accepted voice transcripts and typed requests now play “I heard you.” / “听到了，
-我来处理。” immediately from cached audio, before routing or waiting for another
-tool. Empty input, filler-only speech, playback echoes, stop and quiet policies
-remain silent. An acknowledged turn skips the redundant pre-tool preamble.
-Receipt confirms that input was received; it does not claim a checklist write or
-successful result. It adds no runtime synthesis/model request.
+Voice transcripts and typed requests are classified silently before confirmation.
+Only a recognized task passing execution guards gets pre-tool feedback. Look and
+nearby queries use their specific cue; checklist, recent-sound and observation
+queries may use “I heard you.” / “听到了，我来处理。”. Ignore/chatter, rejected or
+failed routes, ordinary chat and silent logging get no generic receipt. Expert
+actions keep their existing scheduled/status/result response without a preamble.
+Bare Yes/Okay only consents to a matching latest logging/explanation offer; it
+cannot open a camera, start research or confirm an unrelated record. Older input
+revisions and stale queued turns do not get delayed confirmations. Existing
+quiet, playback and interruption policies still apply. Feedback uses bundled
+audio, adds no model request, and does not claim tool success or a logged sighting.
 
 For camera confirmation, “start” / “开始” and Identify both say “Start taking
 photo.” / “开始拍照。” before the capture request. Photo capture no longer waits
@@ -60,12 +65,11 @@ not a claim that every photo starts a GPT investigation. The photo cue waits for
 the previous playback and ongoing conversation and is discarded on cancellation
 or a changed focus. Results wait for the progress audio to drain.
 
-Earlier build: `2026-10-24-camera-progress`.
-Validation: 146 offline tests and both isolated browser suites passed. Coverage
-includes receipt while the worker is busy, camera acknowledgement before capture,
-photo progress before the result, playback draining, interruption, focus changes
-and cancellation. Browser media/classification are fixtures; physical phone
-playback and camera behavior still need user verification.
+Current build: `2026-10-24-task-receipts`.
+All 169 offline tests pass. Regressions replay the unwanted Yes/Okay receipts, preserve investigation consent,
+and check task confirmation ordering, invalid/cancelled/stale routes and camera
+phase feedback. Browser media/classification are fixtures; physical phone playback
+and camera behavior still need user verification.
 
 ## Camera confirmation (2026-10-24)
 

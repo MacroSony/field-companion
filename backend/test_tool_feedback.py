@@ -72,7 +72,7 @@ class FeedbackTests(unittest.IsolatedAsyncioTestCase):
         self.client.playback_pending = True
         await self.c.acknowledge_tool("look")
         self.client.playback_pending = False
-        for name in ("ignore", "add_observation", "get_checklist", "ask_expert", "get_investigations"):
+        for name in ("ignore", "speak", "add_observation", "ask_expert", "get_investigations"):
             await self.c.acknowledge_tool(name)
         self.assertFalse(self.events)
 
@@ -106,29 +106,29 @@ class FeedbackTests(unittest.IsolatedAsyncioTestCase):
         self.phone.send_bytes.assert_not_awaited()
         self.c.speak_expert.assert_awaited_once_with("Investigation R1 is scheduled.")
 
-    async def test_voice_receipt_is_immediate_even_when_another_tool_owns_worker(self):
+    async def test_voice_waits_for_routing_even_when_another_tool_owns_worker(self):
         self.c.active = True
         self.c.phase = "route"
         self.c.generate = AsyncMock()
         await self.c.handle_rt({"type": "conversation.item.input_audio_transcription.completed",
             "transcript": "How many species have I seen today?", "item_id": "question-2"})
-        self.assertIn("I heard you.", [e.get("text") for e in self.events])
-        self.phone.send_bytes.assert_awaited_once()
+        self.phone.send_bytes.assert_not_awaited()
         self.c.generate.assert_not_awaited()
-        self.assertTrue(self.c.pending[-1][1].acknowledged)
+        self.assertFalse(self.c.pending[-1][1].acknowledged)
         self.assertEqual(self.c.pending[-1][1].item_ids, {"question-2"})
 
-    async def test_typed_receipt_and_already_acknowledged_tool_do_not_duplicate_preamble(self):
+    async def test_typed_request_gets_one_task_specific_cue_after_routing(self):
         await self.c.handle_phone({"type": "text", "text": "这里有哪些鸟？"}, self.client)
-        self.assertTrue(any(e.get("text") == "听到了，我来处理。" for e in self.events))
-        self.assertTrue(self.c.transcript_is_echo("听到了，我来处理。"))
-        self.c.input_acknowledged = self.c.pending[-1][1].acknowledged
+        self.phone.send_bytes.assert_not_awaited()
+        self.c.turn_question = self.c.pending[-1][1]
         self.c.tool = AsyncMock(return_value={"ok": True})
         self.c.generate = AsyncMock()
-        before = self.phone.send_bytes.await_count
         await self.c.finish_route({"status": "completed", "output": [{"type": "function_call",
             "name": "nearby_species", "call_id": "check", "arguments": "{}"}]})
-        self.assertEqual(self.phone.send_bytes.await_count, before)
+        self.assertEqual([e.get("text") for e in self.events if e["type"] == "transcript" and e.get("role") == "assistant"], ["好的，我查一下。"])
+        self.assertTrue(self.c.transcript_is_echo("好的，我查一下。"))
+        await self.c.acknowledge_tool("nearby_species")
+        self.phone.send_bytes.assert_awaited_once()
         self.c.tool.assert_awaited_once()
 
     async def test_receipt_preserves_quiet_stop_filler_and_echo_policies(self):
@@ -142,12 +142,91 @@ class FeedbackTests(unittest.IsolatedAsyncioTestCase):
             "transcript": "stop", "item_id": "stop-1"})
         self.phone.send_bytes.assert_not_awaited()
         self.assertFalse(self.c.pending)
-        self.assertFalse(await self.c.acknowledge_input("uh"))
         self.c.remember_spoken(("received", "en"), "I heard you.")
         await self.c.handle_rt({"type": "conversation.item.input_audio_transcription.completed",
             "transcript": "I heard you.", "item_id": "echo-1"})
         self.phone.send_bytes.assert_not_awaited()
         self.assertFalse(self.c.pending)
+
+    async def route(self, text, name, arguments="{}", status="completed"):
+        self.c.turn_question = text
+        await self.c.finish_route({"status": status, "output": [{"type": "function_call",
+            "name": name, "call_id": "intent-check", "arguments": arguments}]})
+
+    async def test_logged_phantom_yes_and_okay_do_not_acknowledge_or_start_tasks(self):
+        self.c.tool = AsyncMock()
+        self.c.generate = AsyncMock()
+        for text, name in (("Yes.", "look"), ("Okay.", "get_observation"),
+                           ("Okay.", "look"), ("好的。", "get_checklist"),
+                           ("Yes.", "ask_expert"), ("Okay.", "manage_investigation")):
+            await self.c.handle_rt({"type": "conversation.item.input_audio_transcription.completed",
+                "transcript": text, "item_id": text})
+            self.phone.send_bytes.assert_not_awaited()
+            self.c.pending.clear()
+            await self.route(text, name)
+        self.phone.send_bytes.assert_not_awaited()
+        self.c.tool.assert_not_awaited()
+        self.c.generate.assert_not_awaited()
+        self.assertFalse(self.c.pending)
+
+    async def test_allowed_query_acknowledges_before_its_tool_but_ignore_and_chat_do_not(self):
+        self.c.tool = AsyncMock(side_effect=lambda *_: self.events.append({"type": "tool_started"}) or {"ok": True})
+        self.c.generate = AsyncMock()
+        await self.route("How many species today?", "get_checklist")
+        self.assertLess(next(i for i, e in enumerate(self.events) if e["type"] == "pcm"),
+                        next(i for i, e in enumerate(self.events) if e["type"] == "tool_started"))
+        self.assertEqual([e.get("text") for e in self.events if e.get("role") == "assistant"], ["I heard you."])
+        await self.c.flush_audio()
+        self.events.clear()
+        self.c.input_acknowledged = False
+        await self.route("I was talking to my friend.", "ignore")
+        await self.route("Hello!", "speak", '{"reason":"Greeting addressed to assistant"}')
+        self.assertFalse(any(e["type"] == "pcm" for e in self.events))
+        self.c.generate.assert_awaited()  # The greeting is still answered normally.
+
+    async def test_rejected_failed_and_invalid_routes_do_not_play_receipts(self):
+        self.c.tool = AsyncMock()
+        self.c.generate = AsyncMock()
+        for name, args in (("look", "null"), ("look", "[]"), ("look", "broken-json"),
+                           ("look", '{"group":"invalid"}'), ("describe", "{}"),
+                           ("recent_sounds", '{"seconds":"garbage"}'),
+                           ("recent_sounds", '{"seconds":null}'),
+                           ("recent_sounds", '{"seconds":NaN}'),
+                           ("unknown_tool", "{}"),
+                           ("confirm_observation", "{}"),
+                           ("speak", '{"reason":"unintelligible filler; ignore per routing rules"}')):
+            await self.route("Second.", name, args)
+        for status in ("cancelled", "failed", "deferred"):
+            await self.route("What is that?", "look", status=status)
+        self.phone.send_bytes.assert_not_awaited()
+        self.c.tool.assert_not_awaited()
+
+    async def test_outdated_route_does_not_acknowledge_under_a_newer_input_revision(self):
+        self.c.tool = AsyncMock(return_value={"ok": True})
+        self.c.generate = AsyncMock()
+        self.c.turn_revision = self.c.input_revision
+        self.c.input_revision += 1  # Another transcript arrived during routing.
+        await self.route("What is that?", "look")
+        self.phone.send_bytes.assert_not_awaited()
+        self.c.turn_revision = self.c.input_revision
+        self.c.turn_stopped_at = s.time.monotonic() - 13
+        await self.route("How many species today?", "get_checklist")
+        self.phone.send_bytes.assert_not_awaited()
+
+    async def test_okay_can_accept_latest_investigation_offer_without_extra_receipt(self):
+        self.c.tool = AsyncMock(return_value={"ok": True, "answer": "The requested result."})
+        self.c.speak_expert = AsyncMock()
+        # A retained offer id alone does not make a later unrelated Okay consent.
+        self.c.investigation_offer_ids = ["R1"]
+        self.c.last_assistant_text = "Camera ready. Say start to take a photo."
+        await self.route("Okay.", "get_investigations", '{"explain":true}')
+        self.c.tool.assert_not_awaited()
+        for text, offer in (("Okay.", "Also, investigation R1 is ready. Would you like me to explain?"),
+                            ("好的。", "另外，调查 R1 已完成。要我讲一下结果吗？")):
+            self.c.last_assistant_text = offer
+            await self.route(text, "get_investigations", '{"explain":true}')
+        self.assertEqual(self.c.speak_expert.await_count, 2)
+        self.phone.send_bytes.assert_not_awaited()
 
     def test_all_bundled_clips_are_short_valid_pcm(self):
         for key, text in CLIPS.items():

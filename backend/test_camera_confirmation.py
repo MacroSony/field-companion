@@ -80,6 +80,19 @@ class CameraConfirmationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request["phase"], "capturing")
         self.assertFalse(any(p[0] == "text" for p in self.c.pending))
 
+    async def test_early_and_repeated_start_report_camera_phase_without_generic_receipt(self):
+        await self.c.request_look()
+        request = self.c.camera_request
+        self.c.play_feedback = AsyncMock(return_value=True)
+        for phase, kind in (("opening", "camera-opening"), ("starting", "camera-taking"),
+                            ("capturing", "camera-taking"), ("classifying", "photo-processing")):
+            request["phase"] = phase
+            await self.c.camera_confirmation("Start.")
+            self.assertEqual(self.c.play_feedback.await_args.args, (kind,))
+            self.assertTrue(self.c.play_feedback.await_args.kwargs["guard"]())
+        self.assertFalse(request["confirmed"])
+        self.assertFalse(self.captures())
+
     async def test_idle_start_and_unrelated_consent_are_not_camera_commands(self):
         self.assertFalse(await self.c.camera_confirmation("start"))
         request = await self.ready()

@@ -17,14 +17,24 @@ def log_intent(text):
     return bool(re.search(r"\b(add|log|record|save|note)\b|加入|加进|记下|记录|记到", text, re.I))
 
 
-def route_guard(name, args, text, *, suggestions=False, log_offer=False):
+def route_guard(name, args, text, *, suggestions=False, log_offer=False, explanation_offer=False):
     """Return allow, ignore or clarify, with a stable audit reason."""
     text = str(text).strip()
     normalized = words(text)
     if not text:
         return "allow", "no_voice_context"  # trusted internal/manual calls
-    fillers = {"ah", "uh", "um", "oh", "okay", "ok", "mm", "mm hmm", "hmm", "好 的", "嗯"}
-    if normalized in fillers and name not in ("get_investigations", "manage_investigation"):
+    confirmations = {"okay", "ok", "yes", "yeah", "yes please", "sure", "go ahead", "好 的", "是 的"}
+    if normalized in confirmations:
+        # Short consent only has meaning while answering the matching offer.
+        # In particular a stray Yes must not open a camera or start research.
+        if name == "get_investigations" and args.get("explain") is True and explanation_offer:
+            return "allow", "explanation_confirmation"
+        if name in ("confirm_observation", "accept_suggestions") and log_offer and normalized in {"yes", "yeah", "yes please", "sure", "是 的"}:
+            pass  # Apply the normal write/suggestion checks below.
+        else:
+            return "ignore", "unprompted_acknowledgement"
+    fillers = {"ah", "uh", "um", "oh", "mm", "mm hmm", "hmm", "嗯"}
+    if normalized in fillers:
         return "ignore", "filler"
     if name == "speak":
         reason = str(args.get("reason", "")).lower()

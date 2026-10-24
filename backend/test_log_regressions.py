@@ -243,7 +243,7 @@ class EvidenceAndIntentTests(unittest.TestCase):
             self.assertNotEqual(route_guard("confirm_observation", {}, text)[0], "allow", text)
 
     def test_bare_yes_needs_an_actual_offer_and_questions_cannot_invent_sightings(self):
-        self.assertEqual(route_guard("accept_suggestions", {}, "yes", suggestions=True)[0], "clarify")
+        self.assertEqual(route_guard("accept_suggestions", {}, "yes", suggestions=True)[0], "ignore")
         self.assertEqual(route_guard("accept_suggestions", {}, "yes", suggestions=True, log_offer=True)[0], "allow")
         for text in ("What have I seen?", "Which mallard should I add?", "Can you hear me?"):
             self.assertEqual(route_guard("add_observation", {"name": "mallard"}, text)[0], "clarify")

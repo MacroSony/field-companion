@@ -399,6 +399,7 @@ class Session:
         self.turn_question = ""
         self.input_acknowledged = False
         self.turn_context = None
+        self.turn_revision = None
         self.generation = None
         self.cancel_barrier = None
         self.update_expected = None
@@ -848,9 +849,13 @@ class Session:
                 await self.cancel_speech()
             await self.queue_camera_start(request)
         else:
-            # A repeated/early start is still heard, but never takes a second
-            # photo or saves consent for a preview that is not ready yet.
-            await self.acknowledge_input(text)
+            # Recognized camera commands report the actual phase; they do not
+            # acknowledge arbitrary input or save early consent for later.
+            phase = request["phase"]
+            kind = ("camera-opening" if phase == "opening" else
+                    "photo-processing" if phase == "classifying" else "camera-taking")
+            await self.play_feedback(kind, language=request["language"],
+                guard=lambda: self.camera_request is request and request["phase"] == phase)
         # Early/duplicate confirmations never authorize a later capture.
         return True
 
@@ -927,17 +932,24 @@ class Session:
                                if c.role == "mic" or c.audio), return_exceptions=True)
 
     async def acknowledge_tool(self, name):
-        """Send a cached short phrase before a slow tool, through the PCM queue."""
+        """Confirm only a routed, allowed task, before executing its tool."""
         kind = FEEDBACK_TOOLS.get(name)
-        if kind:
-            return await self.play_feedback(kind)
-
-    async def acknowledge_input(self, text):
-        # Receipt must not wait for routing, another tool or a cold model load.
-        if self.filler_only(text) or self.stop_request(text):
+        if name in ("get_checklist", "recent_sounds", "get_observation"):
+            kind = "received"
+        if not kind or self.input_acknowledged:
             return False
-        return bool(await self.play_feedback("received",
-            language="zh" if self.chinese(text) else "en"))
+        revision = self.turn_revision
+        def current():
+            return ((revision is None or self.input_revision == revision)
+                    and not getattr(self, "turn_stale", False)
+                    and (self.turn_stopped_at is None or time.monotonic() - self.turn_stopped_at <= 12))
+        if not current():
+            return False
+        played = bool(await self.play_feedback(kind, guard=current))
+        self.input_acknowledged = self.input_acknowledged or played
+        if played:
+            self.log("task_acknowledged", tool=name, kind=kind, revision=revision)
+        return played
 
     async def play_feedback(self, kind, *, language=None, guard=None):
         revision = self.input_revision
@@ -1454,6 +1466,7 @@ class Session:
             self.turn_items = TurnItems(getattr(value, "item_ids", ()))
             self.input_acknowledged = getattr(value, "acknowledged", False)
             self.turn_context = getattr(value, "context", None)
+            self.turn_revision = self.input_revision
             for item_id in self.turn_items:
                 self.item_owners[item_id] = self.turn_items
             self.tools_executed = False
@@ -1520,6 +1533,7 @@ class Session:
                 self.turn_question = ""
                 self.input_acknowledged = False
                 self.turn_context = None
+                self.turn_revision = None
                 self.proactive_turn = False
                 self.active = False
                 self.turn_in_progress = False
@@ -1570,9 +1584,23 @@ class Session:
         name = call["name"]
         try:
             args = json.loads(call.get("arguments") or "{}")
+            if not isinstance(args, dict):
+                raise ValueError("Tool arguments must be an object")
+            if name not in {t["name"] for t in TOOLS}:
+                raise ValueError("Unknown routed tool")
+            if "group" in args and args["group"] not in GROUPS:
+                raise ValueError("invalid iconic group")
+            if name == "describe" and not isinstance(args.get("text"), str):
+                raise ValueError("describe requires text")
+            if name == "recent_sounds" and not np.isfinite(float(args.get("seconds", 15))):
+                raise ValueError("seconds must be finite")
+            offer = bool(self.investigation_offer_ids and re.search(
+                r"(?:would you like me to explain|which would you like me to explain|要我讲一下结果吗|你想先听哪一项)",
+                self.last_assistant_text, re.I))
             decision, reason = route_guard(name, args, self.turn_question,
                 suggestions=bool(self.suggestions),
-                log_offer=bool(re.search(r"(?:add|log|record|加入|记录).*(?:\?|？)$", self.last_assistant_text, re.I)))
+                log_offer=bool(re.search(r"(?:add|log|record|加入|记录).*(?:\?|？)$", self.last_assistant_text, re.I)),
+                explanation_offer=offer)
             if ((name in WRITE_TOOLS or name == "discard_observation") and self.turn_context is not None
                     and self.turn_context != self.input_context()):
                 decision, reason = "clarify", "stale_write_context"
@@ -1585,8 +1613,7 @@ class Session:
                     "type": "function_call_output", "call_id": call["call_id"],
                     "output": json.dumps(result)}})
                 return
-            if not self.input_acknowledged:
-                await self.acknowledge_tool(name)
+            await self.acknowledge_tool(name)
             self.tools_executed = True
             result = {"ok": True} if name == "ignore" else (
                 {"ready_to_answer": True, "reason": args.get("reason")} if name == "speak"
@@ -1815,9 +1842,8 @@ class Session:
                 if await self.camera_confirmation(text):
                     await self.flush_pending()
                     return
-                acknowledged = await self.acknowledge_input(text)
-                self.pending.append(("text", TurnText(text, [event["item_id"]] if event.get("item_id") else [], acknowledged,
-                                                       self.input_context()), self.speech_stopped_at))
+                self.pending.append(("text", TurnText(text, [event["item_id"]] if event.get("item_id") else [],
+                                                       context=self.input_context()), self.speech_stopped_at))
                 await self.flush_pending()
         elif ty == "conversation.item.input_audio_transcription.failed":
             self.awaiting_transcript = False
@@ -2373,8 +2399,7 @@ class Session:
                 return
             if self.assistant_audio_pending():
                 await self.cancel_speech()
-            acknowledged = await self.acknowledge_input(text)
-            self.pending.append(("text", TurnText(text, acknowledged=acknowledged, context=self.input_context()), None))
+            self.pending.append(("text", TurnText(text, context=self.input_context()), None))
             await self.flush_pending()
         elif ty == "look":
             self.input_revision += 1
