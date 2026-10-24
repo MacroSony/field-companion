@@ -8,3 +8,4 @@ out/
 *.key
 node_modules/
 backend/*.log
+web/testaudio/
