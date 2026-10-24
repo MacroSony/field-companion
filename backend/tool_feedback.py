@@ -21,13 +21,21 @@ CLIPS = {
     ("photo-ready", "zh"): "照片已拍好，开始识别。",
     ("received", "en"): "I heard you.",
     ("received", "zh"): "听到了，我来处理。",
+    ("clarify", "en"): "I didn't understand. Please say that again.",
+    ("clarify", "zh"): "我没听明白，请再说一次。",
+    ("photo-processing", "en"): "I'm still analyzing the photo. I'll tell you when it's ready.",
+    ("photo-processing", "zh"): "照片还在分析中，有结果我会告诉你。",
+    ("camera-opening", "en"): "Opening camera. Please wait.",
+    ("camera-opening", "zh"): "相机正在打开，请稍等。",
+    ("photo-failed", "en"): "I couldn't analyze that photo. Please try again.",
+    ("photo-failed", "zh"): "这张照片没能完成识别，请再试一次。",
 }
 TOOLS = {"look": "look", "new_observation": "look",
          "nearby_species": "check", "describe": "check"}
 DIRECTORY = Path(__file__).with_name("audio")
 
 
-@lru_cache(maxsize=12)
+@lru_cache(maxsize=20)
 def recording(kind, language):
     text = CLIPS[kind, language]
     with wave.open(str(DIRECTORY / f"{kind}-{language}.wav"), "rb") as source:

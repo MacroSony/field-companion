@@ -3,6 +3,45 @@
 The optional [GPT Naturalist expert path](../docs/EXPERT.md) handles complex
 comparisons and species-fact follow-ups without changing the logging fast path.
 
+## Phone-log fixes (2026-10-24)
+
+Camera confirmation sends its capture command directly on the phone socket after
+local feedback; it no longer waits for the conversation worker. Camera controls
+remain available while Higgs reconnects. Cancelling generation releases local
+waiters immediately, cancels setup before response creation, ignores late output,
+and recovers the model connection if a cancelled response cannot be correlated.
+A cancelled turn is never executed later as a completed tool call.
+
+`route_safety.py` checks model-selected writes against the actual user input and
+its focus/photo context. Ambiguous fragments, questions and stale confirmations
+cannot change records. A bare yes needs a matching logging offer; explicit “add
+it” / “记录” and manual buttons remain supported. A speak call whose own reason
+says to ignore an unintelligible fragment is suppressed. Rejected writes ask the
+user to repeat rather than guessing. These checks do not resolve ASR accuracy.
+
+Observations expose `analysis_status`, `analysis_request_id` and `image_revision`.
+Queries during capture/analysis use deterministic status feedback instead of
+generating an identity from previous evidence. Failed recognition reports failure.
+Ordinary identification questions do not restart an in-flight photo; an explicit
+retake does. Visual readouts are bound to the accepted photo revision, avoid
+duplicate results already read on request, and preserve a new Start arriving
+during an older result broadcast.
+
+Fusion ranks still include local priors, but a confident visual answer additionally
+requires latest-image raw support >=0.5 and margin >=0.2 for the fused winner.
+Repeated weak/correlated frames and strong abundance priors cannot bypass that
+gate. These remain heuristic ranking scores, not calibrated probabilities.
+Assistant final transcripts, feedback kinds and classification completion metadata
+are now logged for diagnosis; no image bytes, PCM or credentials are logged.
+
+Validation: all 163 offline tests passed, including regressions replaying the phone
+failures; isolated camera browser
+checks cover a blocked worker, processing queries and ambiguous-write rejection.
+The general browser regression passed too. A real Higgs check cancelled setup,
+then successfully routed a new fixed question and confirmed a capture command;
+it uploaded no photos, called no GPT, and did not play physical audio.
+Current build: `2026-10-24-log-fixes`.
+
 ## Immediate receipt and camera progress (2026-10-24)
 
 Accepted voice transcripts and typed requests now play “I heard you.” / “听到了，
@@ -21,7 +60,7 @@ not a claim that every photo starts a GPT investigation. The photo cue waits for
 the previous playback and ongoing conversation and is discarded on cancellation
 or a changed focus. Results wait for the progress audio to drain.
 
-Current build: `2026-10-24-camera-progress`.
+Earlier build: `2026-10-24-camera-progress`.
 Validation: 146 offline tests and both isolated browser suites passed. Coverage
 includes receipt while the worker is busy, camera acknowledgement before capture,
 photo progress before the result, playback draining, interruption, focus changes

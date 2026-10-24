@@ -989,7 +989,9 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual((await client.get(detection["thumb"])).status_code, 200)
                 self.assertEqual(obs.fused[0]["sci"], "a")
                 self.assertEqual(self.c.pending[0][:2], ("camera_photo", capture_id))
-                self.assertIn(("vision", obs.id, None), self.c.pending)
+                vision = next(p[1] for p in self.c.pending if p[0] == "vision")
+                self.assertEqual((vision["obs"], vision["image_revision"], vision["request_id"]),
+                                 (obs.id, 1, capture_id))
                 self.assertTrue(any(e["type"] == "observation" and e["detections"] for e in self.phone.events))
                 await self.c.request_look()
                 capture_id = await self.authorize_camera()

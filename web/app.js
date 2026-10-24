@@ -1,6 +1,6 @@
 'use strict';
 (() => {
-  const CLIENT_BUILD = '2026-10-24-camera-progress';
+  const CLIENT_BUILD = '2026-10-24-log-fixes';
   const $ = id => document.getElementById(id);
   const params = new URLSearchParams(location.search);
   const displayMode = params.get('display') === '1';
@@ -33,7 +33,7 @@
   const bars = document.querySelector('.soundscape');
   const nativeLittleEndian = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
   const camera = new FieldCamera({displayMode, session, send,
-    connected: () => state.running && state.connected, backendURL: websocketURL});
+    connected: () => state.running && socket?.readyState === WebSocket.OPEN && !replaced, backendURL: websocketURL});
 
   function notice(message) {
     $('notice').textContent = message;

@@ -26,6 +26,9 @@ def serve(port):
     from expert import Settings, NaturalistExpert
     from PIL import Image
     import uvicorn
+    import threading
+    classification_release = threading.Event()
+    classification_release.set()
 
     class FixtureSession(backend.Session):
         def __init__(self, session_id):
@@ -33,6 +36,8 @@ def serve(port):
             self.expert = NaturalistExpert(settings=Settings(enabled=False))
             self.names = {"Turdus migratorius": {"sci": "Turdus migratorius", "en": "American Robin"}}
             self.research_release = asyncio.Event()
+            self.worker_release = asyncio.Event()
+            self.worker_release.set()
 
         def allowed_species(self):
             return set()
@@ -52,10 +57,21 @@ def serve(port):
         async def generate(self, phase, *, guard=None):
             if guard is not None and not guard():
                 return {"status": "deferred"}
+            if phase == "route" and self.turn_question == "Fixture slow reply.":
+                await self.phone_json({"type": "fixture_busy"})
+                await self.worker_release.wait()
+                return {"status": "completed", "output": [{"type": "function_call",
+                    "name": "ignore", "call_id": "fixture-resumed", "arguments": "{}"}]}
             if phase == "route" and self.turn_question == "What is that?":
                 return {"status": "completed", "output": [{"type": "function_call",
                     "name": "look", "call_id": "fixture-look-" + uuid.uuid4().hex,
                     "arguments": "{}"}]}
+            if phase == "route" and self.turn_question == "What do you think?":
+                return {"status": "completed", "output": [{"type": "function_call",
+                    "name": "get_observation", "call_id": "fixture-progress", "arguments": "{}"}]}
+            if phase == "route" and self.turn_question == "Second.":
+                return {"status": "completed", "output": [{"type": "function_call",
+                    "name": "confirm_observation", "call_id": "fixture-ambiguous", "arguments": '{"count":1}'}]}
             if phase == "answer" and self.expert_readout:
                 await self.phone_json({"type": "transcript", "role": "assistant",
                                        "text": self.expert_readout, "final": True})
@@ -76,6 +92,19 @@ def serve(port):
                 elif text == "fixture:voice-start":
                     await self.handle_rt({"type": "conversation.item.input_audio_transcription.completed",
                         "transcript": "Start.", "item_id": "voice-" + uuid.uuid4().hex})
+                elif text in ("fixture:progress", "fixture:ambiguous"):
+                    await self.handle_rt({"type": "conversation.item.input_audio_transcription.completed",
+                        "transcript": "What do you think?" if text == "fixture:progress" else "Second.",
+                        "item_id": "voice-" + uuid.uuid4().hex})
+                elif text == "fixture:hold-photo":
+                    classification_release.clear()
+                elif text == "fixture:release-photo":
+                    classification_release.set()
+                elif text == "fixture:hold-worker":
+                    self.worker_release.clear()
+                    await super().handle_phone({"type": "text", "text": "Fixture slow reply."}, client)
+                elif text == "fixture:release-worker":
+                    self.worker_release.set()
                 elif text == "fixture:finish":
                     self.research_release.set()
                 elif text == "fixture:checklist":
@@ -91,6 +120,8 @@ def serve(port):
             return await super().handle_phone(event, client)
 
     def classify(jpeg, crop, allowed):
+        if not classification_release.wait(20):
+            raise RuntimeError("Fixture classification not released")
         image = Image.open(io.BytesIO(jpeg))
         if image.format != "JPEG" or max(image.size) > 1920:
             raise ValueError("Invalid camera JPEG")
@@ -244,7 +275,14 @@ async def test(port, cdp):
         results["groupChangeRearmsWithoutCapturing"] = True
         await js("document.getElementById('camera-zoom').value='2'; document.getElementById('camera-zoom').dispatchEvent(new Event('input')); document.getElementById('camera-viewport').dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true}))")
         before_manual = await js("window.__messages.length")
+        await js("window.__sockets[0].send(JSON.stringify({type:'text',text:'fixture:hold-photo'}))")
         await js("document.getElementById('camera-shutter').click()")
+        await until("document.getElementById('observation-status').textContent === 'Analyzing photo'")
+        await js("window.__sockets[0].send(JSON.stringify({type:'text',text:'fixture:progress'}))")
+        await until("window.__messages.slice(" + str(before_manual) + ").some(e=>e.text===\"I'm still analyzing the photo. I'll tell you when it's ready.\")")
+        assert await js("document.querySelectorAll('#observation-evidence img').length === 0")
+        results["processingQueryDoesNotInventIdentification"] = True
+        await js("window.__sockets[0].send(JSON.stringify({type:'text',text:'fixture:release-photo'}))")
         await until("document.querySelectorAll('#observation-evidence img').length === 1 && !document.getElementById('camera-shutter').disabled")
         await until("window.__messages.slice(" + str(before_manual) + ").some(e=>e.text==='Photo ready. Starting identification.')")
         manual_messages = await js("window.__messages.slice(" + str(before_manual) + ")")
@@ -253,6 +291,12 @@ async def test(port, cdp):
         ready = next(i for i, e in enumerate(manual_messages) if e.get("text") == "Photo ready. Starting identification.")
         assert taking < capture < ready
         results["identifySpeaksTakingThenPhotoReady"] = True
+        ambiguous_marker = await js("window.__messages.length")
+        await js("window.__sockets[0].send(JSON.stringify({type:'text',text:'fixture:ambiguous'}))")
+        await until("window.__messages.slice(" + str(ambiguous_marker) + ").some(e=>e.text===\"I didn't understand. Please say that again.\")")
+        assert await js("document.querySelectorAll('.counter output').length === 0")
+        assert await js("document.getElementById('observation-status').textContent !== 'Added to checklist'")
+        results["ambiguousSpeechCannotLogSightings"] = True
         upload = await js("window.__uploads[0]")
         assert upload["type"] == "image/jpeg" and 100 <= max(upload["width"], upload["height"]) <= 1920, (upload, await js("window.__geometry"))
         assert "x=0.275000" in upload["url"] and "w=0.450000" in upload["url"], upload
@@ -315,8 +359,12 @@ async def test(port, cdp):
         before_voice = len(events)
         await voice_ready(wait_for_drain=True)
         voice_marker = await js("window.__messages.length")
+        await js("window.__sockets[0].send(JSON.stringify({type:'text',text:'fixture:hold-worker'}))")
+        await until("window.__messages.slice(" + str(voice_marker) + ").some(e=>e.type==='fixture_busy')")
         await js("window.__sockets[0].send(JSON.stringify({type:'text',text:'fixture:voice-start'}))")
         await until("document.querySelectorAll('#observation-evidence img').length === 1 && !document.getElementById('camera-shutter').disabled")
+        results["captureBypassesBlockedConversationWorker"] = True
+        await js("window.__sockets[0].send(JSON.stringify({type:'text',text:'fixture:release-worker'}))")
         await until("window.__messages.slice(" + str(voice_marker) + ").some(e=>e.text==='Photo ready. Starting identification.')")
         feedback_before_capture(before_voice)
         before_voice = len(events)

@@ -14,6 +14,14 @@ out/
 !backend/audio/photo-ready-zh.wav
 !backend/audio/received-en.wav
 !backend/audio/received-zh.wav
+!backend/audio/clarify-en.wav
+!backend/audio/clarify-zh.wav
+!backend/audio/photo-processing-en.wav
+!backend/audio/photo-processing-zh.wav
+!backend/audio/camera-opening-en.wav
+!backend/audio/camera-opening-zh.wav
+!backend/audio/photo-failed-en.wav
+!backend/audio/photo-failed-zh.wav
 *.pcm
 *.src
 .env

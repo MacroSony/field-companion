@@ -72,6 +72,10 @@ capture loop or new frontend protocol message.
 - BioCLIP/fusion values are uncalibrated rankings. Multiple frames are correlated;
   a nearby BirdNET call need not belong to the photographed organism. Model prompts
   explicitly distinguish these cases and prohibit invented visible field marks.
+- Fusion rank alone does not establish visual certainty. The latest image must
+  support the fused winner with raw score >=0.5 and margin >=0.2; otherwise the
+  observation remains uncertain and follows the expert/evidence-request path.
+  Strong local abundance priors or repeated weak frames cannot remove this gate.
 - The expert cannot replace `fused`, select a different confirmed species, count
   organisms or log observations. Alternative-ID conflicts require more evidence
   or clarification. Confirmation still uses the current fusion top candidate.

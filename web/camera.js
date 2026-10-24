@@ -207,7 +207,9 @@ window.FieldCamera = class FieldCamera {
     if (this.focus && message.group) this.$('camera-group').value = message.group;
     const card = this.$('active-observation'); card.hidden = false;
     this.$('observation-status').textContent = message.status === 'open'
-      ? (this.focus ? (message.uncertain ? 'Tentative' : 'Awaiting confirmation') : 'Previous subject')
+      ? (this.focus ? (message.analysis_status === 'analyzing' ? 'Analyzing photo'
+        : message.analysis_status === 'capturing' ? 'Taking photo'
+        : message.uncertain ? 'Tentative' : 'Awaiting confirmation') : 'Previous subject')
       : message.status === 'confirmed' ? 'Added to checklist' : 'Closed';
     const hint = this.$('observation-hint');
     hint.textContent = message.hint || ''; hint.hidden = !message.hint;

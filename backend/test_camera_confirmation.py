@@ -62,7 +62,7 @@ class CameraConfirmationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request["phase"], "ready")
         await self.c.camera_confirmation("start")
         await self.c.camera_confirmation("start")
-        self.assertEqual([p[0] for p in self.c.pending], ["camera_start"])
+        self.assertFalse(any(p[0] == "camera_start" for p in self.c.pending))
         await self.c.start_camera_capture(request["id"])
         await self.c.start_camera_capture(request["id"])
         self.assertEqual(len(self.captures()), 1)
@@ -73,11 +73,11 @@ class CameraConfirmationTests(unittest.IsolatedAsyncioTestCase):
                 request = await self.ready()
                 await self.c.handle_rt({"type": "conversation.item.input_audio_transcription.completed",
                     "transcript": text, "item_id": "voice-start"})
-                self.assertEqual(request["phase"], "starting")
+                self.assertEqual(request["phase"], "capturing")
                 self.assertFalse(any(p[0] == "text" for p in self.c.pending))
         request = await self.ready()
         await self.c.handle_phone({"type": "text", "text": "start"}, self.client)
-        self.assertEqual(request["phase"], "starting")
+        self.assertEqual(request["phase"], "capturing")
         self.assertFalse(any(p[0] == "text" for p in self.c.pending))
 
     async def test_idle_start_and_unrelated_consent_are_not_camera_commands(self):
@@ -96,7 +96,7 @@ class CameraConfirmationTests(unittest.IsolatedAsyncioTestCase):
         await self.c.start_camera_capture(request["id"])
         self.assertFalse(self.captures())
         await self.c.camera_ready({"request_id": request["id"]})
-        self.assertEqual(request["phase"], "starting")
+        self.assertEqual(request["phase"], "capturing")
         await self.c.start_camera_capture(request["id"])
         self.assertEqual(len(self.captures()), 1)
 
@@ -204,6 +204,7 @@ class CameraConfirmationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_photo_progress_precedes_result_and_waits_for_previous_playback(self):
         request = await self.capture()
+        self.c.play_until = 0
         self.c.camera_feedback_request = request
         self.c.camera_request = None  # Fast classification already finished.
         self.c.pending = s.deque([("vision", request["obs"], None),
@@ -255,7 +256,7 @@ class CameraConfirmationTests(unittest.IsolatedAsyncioTestCase):
             "transcript": "Start.", "item_id": "busy-start"})
         self.assertTrue(any(e.get("text") == "Start taking photo." for e in self.phone.events))
         self.assertTrue(request["start_acknowledged"])
-        self.assertFalse(self.captures())  # Worker is still owned by another task.
+        self.assertEqual(len(self.captures()), 1)  # Capture bypasses the busy worker.
         self.c.active = False
         await self.c.start_camera_capture(request["id"])
         self.assertEqual(len(self.captures()), 1)

@@ -58,6 +58,16 @@ The display receives the same observation card and evidence, without requesting
 a camera or microphone. Its observation panel shares the right column with the
 map, detections and captions.
 
+Photo confirmation executes directly on the phone connection, independently of
+the chat worker and Higgs recovery. Asking about an in-flight photo gives a
+capture/analysis status instead of an answer from old evidence, and ordinary
+identification questions do not silently restart it. Explicit retake commands
+still prepare another photo. Failed analysis requests a retry. Readouts carry the
+photo request/revision so an older result cannot be announced as a newer photo.
+Ambiguous speech cannot confirm an observation or cancel its pending photo through
+a mistaken checklist write; it asks for clarification. Manual confirmation still
+requires a finished identification.
+
 ## Run and validate
 
 The real backend also needs a running `backend/vision_service.py` service at its

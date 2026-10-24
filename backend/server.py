@@ -31,6 +31,7 @@ from fastapi.staticfiles import StaticFiles
 from expert import NaturalistExpert, revision as expert_revision
 from investigations import ACTIVE, InvestigationQueue, QueueFull
 from tool_feedback import TOOLS as FEEDBACK_TOOLS, recording as feedback_recording
+from route_safety import route_guard
 
 MODEL = "higgs-realtime-1.5-preview"
 SR = 48000
@@ -119,6 +120,9 @@ class Observation:
     group: str = "Aves"
     touched: float = field(default_factory=time.monotonic, repr=False)
     awaiting_answer: bool = field(default=False, repr=False)
+    analysis_status: str = "idle"
+    analysis_request_id: str | None = None
+    image_revision: int = 0
 
     def payload(self):
         return {k: v for k, v in asdict(self).items() if k not in ("touched", "awaiting_answer")}
@@ -153,7 +157,18 @@ def fuse(detections, allowed=None, priors=None):
               "photo": names[sci].get("photo", ""), "p": weights[sci] / total}
              for sci in sorted(weights, key=lambda s: (-weights[s], s))]
     margin = fused[0]["p"] - (fused[1]["p"] if len(fused) > 1 else 0)
-    return fused, fused[0]["p"] < .5 or margin < .2
+    uncertain = fused[0]["p"] < .5 or margin < .2
+    images = [d for d in detections if d.kind == "image"]
+    if images:
+        # Local abundance and renormalization may reorder ranks, but cannot turn
+        # weak visual evidence into a confident identity. Frames are correlated.
+        image = images[-1]
+        raw = {c["sci"]: float(c["p"]) for c in image.candidates}
+        winner = fused[0]["sci"]
+        support = raw.get(winner, 0)
+        alternative = max((p for sci, p in raw.items() if sci != winner), default=0)
+        uncertain |= support < .5 or support - alternative < .2
+    return fused, uncertain
 
 
 def classify_frame(jpeg, crop, candidates):
@@ -248,6 +263,8 @@ For total count corrections use set_count; for deletion use remove_observation.
 Never claim to have logged anything without a successful tool call. Logging has an earcon,
 not speech. Never give delayed logging acknowledgements, including "I've logged X".
 For "what's that?", "look again", or visual identification call look, NOT speak.
+If the latest camera photo is still being captured/analyzed, read get_observation
+for its status instead of starting over, unless the user explicitly asks to retake.
 Look prepares the camera; it never takes a photo until the camera is ready and
 the user explicitly says start/开始 or taps Identify. Never claim a photo has
 already been taken while camera confirmation is pending.
@@ -282,6 +299,8 @@ Questions about birds heard, sounds, calls, or 'anything else' use recent_sounds
 Greetings, mic checks and general questions addressed to you use speak; sound/checklist questions use their read tools.
 For local ID candidates use nearby_species.
 Filler-only speech and unintelligible fragments (including "As for you, for me.") use ignore.
+Your selected tool must match your reason: an input you decide to ignore uses
+ignore, never speak. Ambiguous fragments/ordinals never authorize checklist writes.
 Questions such as "Did you hear them?" never approve pending suggestions: use recent_sounds.
 """
 ROUTING = INSTRUCTIONS + """
@@ -337,10 +356,11 @@ class TurnItems(set):
 
 class TurnText(str):
     """Transcript plus any already-committed audio item (never a newer turn)."""
-    def __new__(cls, text, item_ids=(), acknowledged=False):
+    def __new__(cls, text, item_ids=(), acknowledged=False, context=None):
         obj = super().__new__(cls, text)
         obj.item_ids = set(item_ids)
         obj.acknowledged = acknowledged
+        obj.context = context
         return obj
 
 
@@ -378,6 +398,12 @@ class Session:
         self.turn_stopped_at = None
         self.turn_question = ""
         self.input_acknowledged = False
+        self.turn_context = None
+        self.generation = None
+        self.cancel_barrier = None
+        self.update_expected = None
+        self.vision_answered = set()
+        self.last_assistant_text = ""
         self.expert_readout = None
         self.investigation_offer_ids = []
         self.first_audio = False
@@ -632,9 +658,17 @@ class Session:
             self.expert_readout = None
 
     async def answer_vision(self, observation_id):
+        expected = observation_id if isinstance(observation_id, dict) else None
+        observation_id = expected["obs"] if expected else observation_id
         obs = self.observations.get(observation_id)
         input_revision = self.input_revision
         if not obs or obs.status != "open" or self.focus != obs.id:
+            return
+        identity = (obs.id, obs.image_revision)
+        if (obs.analysis_status not in ("idle", "ready") or (expected and identity in self.vision_answered)
+                or (expected and (expected["image_revision"] != obs.image_revision
+                                 or expected["request_id"] != obs.analysis_request_id))):
+            self.log("stale_vision_answer_skipped", observation_id=obs.id)
             return
         if obs.uncertain and self.expert.available:
             question = "根据现有证据，这是什么？不确定时告诉我还需要拍什么。" if self.lang.startswith("zh") else (
@@ -644,13 +678,16 @@ class Session:
             except ValueError:
                 result = {"ok": False}  # A full research queue preserves basic Look.
             if result.get("ok"):
+                self.vision_answered.add(identity)
                 if self.may_speak() and self.input_revision == input_revision and self.focus == obs.id:
                     await self.speak_expert(result["answer"])
                 return
         if (self.focus == obs.id and obs.status == "open" and self.may_speak()
                 and self.input_revision == input_revision):
             await self.inject("[VISION] " + json.dumps({"top3": obs.fused[:3], "uncertain": obs.uncertain, "hint": obs.hint}))
-            await self.generate("answer")
+            response = await self.generate("answer")
+            if response and response.get("status") == "completed" and self.input_revision == input_revision:
+                self.vision_answered.add(identity)
 
     @property
     def items(self):
@@ -690,6 +727,7 @@ class Session:
 
     async def new_focus(self, group="Aves"):
         await self.cancel_camera_request()
+        self.last_assistant_text = ""
         old = self.observations.get(self.focus)
         if old and old.status == "open":
             old.status = "discarded"
@@ -727,6 +765,8 @@ class Session:
         self.camera_feedback_request = None
         if request and (obs := self.observations.get(request["obs"])):
             obs.awaiting_answer = False
+            if obs.analysis_status != "ready":
+                obs.analysis_status = "cancelled"
         self.pending = deque(p for p in self.pending if p[0] not in ("camera_ready", "camera_start", "camera_photo"))
         if request and self.mic:
             try:
@@ -744,10 +784,12 @@ class Session:
             obs.group = group
         obs.hint = str(hint or obs.hint)[:500]
         obs.awaiting_answer = False
+        obs.analysis_status = "awaiting_confirmation"
         obs.touched = time.monotonic()
         request = self.camera_request = {"id": uuid.uuid4().hex, "obs": obs.id,
             "phase": "opening", "confirmed": confirmed, "open_id": open_id,
             "language": "zh" if self.chinese(self.turn_question) or (not self.turn_question and self.lang.startswith("zh")) else "en"}
+        obs.analysis_request_id = request["id"]
         await self.broadcast_observation(obs)
         if self.mic:
             await self.mic.send_json({"type": "camera_prepare", "obs": obs.id,
@@ -782,8 +824,9 @@ class Session:
             guard=lambda: self.camera_request is request and request["phase"] == "starting"))
         if self.camera_request is not request:
             return
-        self.pending.append(("camera_start", request["id"], None))
-        self.work_ready.set()
+        # This path only sends local feedback/capture commands. It must not sit
+        # behind a Higgs response or another tool in the conversation worker.
+        await self.start_camera_capture(request["id"])
 
     async def camera_confirmation(self, text):
         request = self.camera_request
@@ -821,6 +864,7 @@ class Session:
             return
         obs.touched = time.monotonic()
         obs.awaiting_answer = True
+        obs.analysis_status = "capturing"
         if not request.get("start_acknowledged"):
             await self.play_feedback("camera-taking", language=request["language"],
                 guard=lambda: self.camera_request is request and request["phase"] == "starting")
@@ -832,6 +876,7 @@ class Session:
         # Sound evidence is fused with the photo after its upload is accepted.
         if self.camera_request is request and self.focus == obs.id and obs.status == "open" and self.mic:
             request["phase"] = "capturing"
+            await self.broadcast_observation(obs)
             await self.mic.send_json({"type": "capture", "obs": obs.id, "n": 3,
                 "hint": obs.hint, "request_id": request_id})
             self.log("camera_capture_requested", request_id=request_id)
@@ -897,7 +942,8 @@ class Session:
     async def play_feedback(self, kind, *, language=None, guard=None):
         revision = self.input_revision
         def current():
-            return (not self.closed and self.connected and self.may_speak()
+            local = kind not in ("look", "check") and self.mic is not None
+            return (not self.closed and (self.connected or local) and self.may_speak()
                     and not self.auto_speech_paused and not self.user_speaking
                     and not self.awaiting_transcript and self.input_revision == revision
                     and (guard is None or guard()))
@@ -922,6 +968,8 @@ class Session:
         self.play_until = max(time.monotonic(), self.play_until) + len(pcm) / 48000
         self.echo_estimate = self.play_until
         self.remember_spoken((playback_id, "feedback"), text)
+        if kind != "received":
+            self.last_assistant_text = text
         await self.phone_json({"type": "transcript", "role": "assistant", "text": text, "final": True})
         await self.phone_audio(pcm, guard=audible)
         played = False
@@ -930,6 +978,8 @@ class Session:
             self.total_audio_out += len(pcm)
             await self.end_audio()
             self.latency("tool_feedback")
+            self.log("feedback_played", kind=kind, revision=revision,
+                     request_id=self.camera_request["id"] if self.camera_request else None)
         elif self.audio_playback_id == playback_id:
             await self.flush_audio()
         if self.playback_task is None or self.playback_task.done():
@@ -1014,7 +1064,7 @@ class Session:
             if row[0] == key:
                 self.spoken.remove(row)
                 break
-        self.spoken.append((key, text, time.monotonic()))
+        self.spoken.append((key, text, max(time.monotonic(), self.play_until)))
 
     def transcript_is_echo(self, text):
         if self.stop_request(text):
@@ -1023,9 +1073,12 @@ class Session:
         if not words:
             return False
         now = time.monotonic()
-        recent = [line for _, line, at in self.spoken
-                  if now - max(at, self.play_until, self.echo_estimate,
-                               max((c.playback_end for c in self.clients), default=0)) <= 10]
+        recent = []
+        for key, line, at in self.spoken:
+            related = [c for c in self.clients if c.playback_id == key[0]]
+            end = max([at] + [c.playback_end for c in related])
+            if any(c.playback_active or c.playback_pending for c in related) or now - end <= 10:
+                recent.append(line)
         # Echo = a long CONTIGUOUS run of the assistant's own words. Bag-of-words overlap
         # misfired on answers like "Yes, add them" to "...add them?" or "Cardinal." (10/23).
         minimum = 6 if self.chinese(text) else 3
@@ -1043,6 +1096,23 @@ class Session:
                 "speaking": time.monotonic() < self.play_until,
                 "model": MODEL, "connected": self.connected, "echo_guard": self.echo_guard,
                 "session": self.id, "server_build": SERVER_BUILD}
+
+    def input_context(self):
+        obs = self.observations.get(self.focus)
+        return {"focus": self.focus, "image_revision": obs.image_revision if obs else None,
+                "camera": self.camera_request["id"] if self.camera_request else None}
+
+    def queue_feedback(self, kind, *, status=None):
+        value = {"kind": kind, "revision": self.input_revision,
+                 "language": "zh" if self.chinese(self.turn_question) else "en",
+                 "focus": self.focus, "status": status}
+        self.pending.append(("feedback", value, None))
+        self.work_ready.set()
+
+    def feedback_current(self, value):
+        obs = self.observations.get(value["focus"])
+        return (value["revision"] == self.input_revision and value["focus"] == self.focus
+                and (not value["status"] or (obs and obs.analysis_status == value["status"])))
 
     async def state(self):
         await self.phone_json(self.state_payload())
@@ -1066,6 +1136,7 @@ class Session:
     def config(self, phase):
         focus = self.observations.get(self.focus)
         focus_context = ({"id": focus.id, "status": focus.status, "top3": focus.fused[:3],
+                          "analysis_status": focus.analysis_status,
                           "uncertain": focus.uncertain,
                           "image_detections": sum(d.kind == "image" for d in focus.detections)}
                          if focus and focus.status != "discarded" else None)
@@ -1134,6 +1205,7 @@ class Session:
         # Reader resolves the echo future; no waiting inside the reader.
         async with self.update_lock:
             self.update_waiter = asyncio.get_running_loop().create_future()
+            self.update_expected = config
             try:
                 await self.rt_send({"type": "session.update", "session": config})
                 echo = await asyncio.wait_for(self.update_waiter, 12)
@@ -1143,6 +1215,7 @@ class Session:
                 self.log("session_updated", phase=self.phase)
             finally:
                 self.update_waiter = None
+                self.update_expected = None
 
     def own_item(self, item_id, owner=None):
         owner = self.turn_items if owner is None else owner
@@ -1162,8 +1235,56 @@ class Session:
                 self.deleted_item_ids.append(item_id)
 
     async def generate(self, phase, *, guard=None):
+        token = {"cancelled": False, "requested": False, "response_id": None,
+                 "cancel": asyncio.get_running_loop().create_future()}
+        self.generation = token
+        try:
+            return await self.generate_response(phase, token, guard=guard)
+        finally:
+            if self.generation is token:
+                self.generation = None
+
+    async def wait_cancel_boundary(self, token):
+        barrier = self.cancel_barrier
+        if barrier is None:
+            return
+        waiters = [barrier["future"]] + ([token["cancel"]] if "cancel" in token else [])
+        await asyncio.wait(waiters, timeout=1, return_when=asyncio.FIRST_COMPLETED)
+        if token["cancelled"]:
+            return
+        acknowledged = barrier["future"].done()
+        if (not acknowledged or barrier["unknown"]) and self.rt is barrier["rt"] and hasattr(barrier["rt"], "close"):
+            # No response ID means a late response cannot be correlated safely.
+            # Recover the model connection before starting another generation;
+            # local camera/PCM controls continue on the phone socket.
+            old = barrier["rt"]
+            self.log("cancel_transport_recovery", unknown_response=barrier["unknown"])
+            try:
+                await asyncio.wait_for(old.close(), 2)
+            except asyncio.TimeoutError:
+                if getattr(old, "transport", None) is not None:
+                    old.transport.abort()
+            async with asyncio.timeout(10):
+                while (self.rt is old or not self.connected) and not token["cancelled"]:
+                    await asyncio.sleep(.02)
+        if self.cancel_barrier is barrier:
+            self.cancel_barrier = None
+
+    async def generate_response(self, phase, token, *, guard=None):
+        await self.wait_cancel_boundary(token)
+        if token["cancelled"]:
+            return {"status": "cancelled", "output": []}
         self.phase = phase
-        await self.update_session(self.config(phase))
+        updating = asyncio.create_task(self.update_session(self.config(phase)))
+        try:
+            await asyncio.wait((updating, token["cancel"]), return_when=asyncio.FIRST_COMPLETED)
+            if token["cancelled"]:
+                return {"status": "cancelled", "output": []}
+            await updating
+        finally:
+            if not updating.done():
+                updating.cancel()
+            await asyncio.gather(updating, return_exceptions=True)
         if phase == "answer" and self.auto_speech_paused:
             return {"status": "deferred"}  # A stop during setup must not restart speech.
         if guard is not None and not guard():
@@ -1173,9 +1294,14 @@ class Session:
         self.first_audio = False
         for attempt in range(2):
             prior_items = set(self.turn_items or ())
+            self.response_id = None
+            token["response_id"] = None
             self.response_waiter = asyncio.get_running_loop().create_future()
             self.awaited_response_id = None
             try:
+                if token["cancelled"]:
+                    return {"status": "cancelled", "output": []}
+                token["requested"] = True
                 await self.rt_send({"type": "response.create"})
                 try:
                     response = await asyncio.wait_for(asyncio.shield(self.response_waiter), 8 if phase == "route" else 25)
@@ -1190,10 +1316,16 @@ class Session:
                         raise
                     await self.delete_items(set(self.turn_items or ()) - prior_items)
                     continue
+                if token["cancelled"]:
+                    response = {"status": "cancelled", "output": []}
                 for item in response.get("output", []):
                     self.own_item(item.get("id"))
+                if response.get("status") == "cancelled":
+                    await self.delete_items(set(self.turn_items or ()) - prior_items)
                 if response.get("status") == "failed":
                     if phase == "route" and not attempt and not self.tools_executed:
+                        if token["response_id"]:
+                            self.cancelled_ids.append(token["response_id"])
                         self.log("route_retry", reason="failed")
                         # A partial failed function call must not poison the retry.
                         await self.delete_items(set(self.turn_items or ()) - prior_items)
@@ -1262,13 +1394,18 @@ class Session:
                 self.pending.remove(user)
                 self.pending.appendleft(user)
             else:
-                progress = next((p for p in self.pending if p[0] == "camera_start"), None)
+                progress = next((p for p in self.pending if p[0] == "feedback"), None)
+                progress = progress or next((p for p in self.pending if p[0] == "camera_start"), None)
                 progress = progress or next((p for p in self.pending if p[0] == "camera_photo"), None)
                 vision = progress or next((p for p in self.pending if p[0] == "vision"), None)
                 if vision is not None:
                     self.pending.remove(vision)
                     self.pending.appendleft(vision)
             kind, value, stopped = self.pending[0]
+            if kind == "feedback" and not self.feedback_current(value):
+                self.pending.popleft()
+                self.work_ready.set()
+                continue
             if kind == "text" and stopped is not None:
                 # Merge consecutive queued utterances into one turn (backlog after a slow turn).
                 parts = [value]
@@ -1281,17 +1418,17 @@ class Session:
                     acknowledged = acknowledged or getattr(more, "acknowledged", False)
                     merged_ids.update(getattr(more, "item_ids", ()))
                 if len(parts) > 1:
-                    value = TurnText(" ".join(parts), merged_ids, acknowledged)
+                    value = TurnText(" ".join(parts), merged_ids, acknowledged, getattr(parts[-1], "context", None))
                     self.pending[0] = (kind, value, stopped)
                     self.log("turns_merged", n=len(parts))
             self.turn_stale = stopped is not None and time.monotonic() - stopped > 12
-            if kind in ("notify", "investigation", "camera_ready", "camera_photo", "vision") and self.auto_speech_paused:
+            if kind in ("notify", "investigation", "camera_ready", "camera_photo", "vision", "feedback") and self.auto_speech_paused:
                 continue
             start_acknowledged = (kind == "camera_start" and self.camera_request
                                   and self.camera_request.get("start_acknowledged"))
-            if kind in ("notify", "investigation", "camera_ready", "camera_start", "camera_photo", "vision") and self.playback_pending() and not start_acknowledged:
+            if kind in ("notify", "investigation", "camera_ready", "camera_start", "camera_photo", "vision", "feedback") and self.playback_pending() and not start_acknowledged:
                 continue
-            if kind in ("camera_start", "camera_photo", "vision") and (self.awaiting_transcript
+            if kind in ("camera_start", "camera_photo", "vision", "feedback") and (self.awaiting_transcript
                     or (time.monotonic() < self.play_until and not start_acknowledged)):
                 continue
             if kind == "camera_ready" and (self.awaiting_transcript or not self.may_speak()
@@ -1316,11 +1453,15 @@ class Session:
             self.turn_stopped_at = stopped if kind in ("text", "audio") else None
             self.turn_items = TurnItems(getattr(value, "item_ids", ()))
             self.input_acknowledged = getattr(value, "acknowledged", False)
+            self.turn_context = getattr(value, "context", None)
             for item_id in self.turn_items:
                 self.item_owners[item_id] = self.turn_items
             self.tools_executed = False
             try:
-                if kind == "camera_ready":
+                if kind == "feedback":
+                    await self.play_feedback(value["kind"], language=value["language"],
+                        guard=lambda: self.feedback_current(value))
+                elif kind == "camera_ready":
                     request = self.camera_request
                     if request and request["id"] == value and request["phase"] == "ready":
                         played = await self.play_feedback("camera-ready", language=request["language"],
@@ -1378,6 +1519,7 @@ class Session:
                 self.turn_items = None
                 self.turn_question = ""
                 self.input_acknowledged = False
+                self.turn_context = None
                 self.proactive_turn = False
                 self.active = False
                 self.turn_in_progress = False
@@ -1428,12 +1570,38 @@ class Session:
         name = call["name"]
         try:
             args = json.loads(call.get("arguments") or "{}")
+            decision, reason = route_guard(name, args, self.turn_question,
+                suggestions=bool(self.suggestions),
+                log_offer=bool(re.search(r"(?:add|log|record|加入|记录).*(?:\?|？)$", self.last_assistant_text, re.I)))
+            if ((name in WRITE_TOOLS or name == "discard_observation") and self.turn_context is not None
+                    and self.turn_context != self.input_context()):
+                decision, reason = "clarify", "stale_write_context"
+            if decision != "allow":
+                self.log("route_guard", requested_tool=name, decision=decision, reason=reason)
+                result = {"ok": False, "suppress_answer": True, "guard": reason}
+                if decision == "clarify":
+                    self.queue_feedback("clarify")
+                await self.rt_send({"type": "conversation.item.create", "item": {
+                    "type": "function_call_output", "call_id": call["call_id"],
+                    "output": json.dumps(result)}})
+                return
             if not self.input_acknowledged:
                 await self.acknowledge_tool(name)
             self.tools_executed = True
             result = {"ok": True} if name == "ignore" else (
                 {"ready_to_answer": True, "reason": args.get("reason")} if name == "speak"
                 else await self.tool(name, args))
+            if name == "get_observation" and result.get("analysis_status") in ("awaiting_confirmation", "capturing", "analyzing", "failed"):
+                status = result["analysis_status"]
+                ready = self.camera_request and self.camera_request["phase"] == "ready"
+                kind = ("camera-ready" if ready else "camera-opening") if status == "awaiting_confirmation" else (
+                    "camera-taking" if status == "capturing" else "photo-failed" if status == "failed" else "photo-processing")
+                self.queue_feedback(kind, status=status)
+                result["suppress_answer"] = True
+            if result.get("analysis_pending"):
+                status = result.get("analysis_status", "analyzing")
+                self.queue_feedback("camera-taking" if status == "capturing" else "photo-processing")
+                result["suppress_answer"] = True
         except (ValueError, TypeError, KeyError) as exc:
             result = {"ok": False, "error": str(exc)[:180]}
         except Exception as exc:
@@ -1444,7 +1612,7 @@ class Session:
             if result.get("ok"):
                 await self.phone_json({"type": "earcon", "kind": "logged"})
                 self.latency("earcon")
-            else:
+            elif not result.get("analysis_pending"):
                 await self.error(result.get("error", "Checklist change failed"))
         await self.rt_send({"type": "conversation.item.create", "item": {
             "type": "function_call_output", "call_id": call["call_id"],
@@ -1460,7 +1628,13 @@ class Session:
             if name in ("ask_expert", "get_investigations", "manage_investigation") and result.get("answer"):
                 await self.speak_expert(result["answer"])
             else:
-                await self.generate("answer")
+                read_identity = (result.get("observation", {}).get("id"),
+                                 result.get("observation", {}).get("image_revision"))
+                response = await self.generate("answer")
+                if name == "get_observation" and response and response.get("status") == "completed":
+                    if ((obs := self.observations.get(self.focus)) and obs.analysis_status == "ready"
+                            and (obs.id, obs.image_revision) == read_identity):
+                        self.vision_answered.add((obs.id, obs.image_revision))
 
     def latency(self, target):
         if self.turn_stopped_at is not None:
@@ -1476,6 +1650,7 @@ class Session:
                         additional_headers={"Authorization": "Bearer " + key}, max_size=None,
                         open_timeout=20, ping_interval=20, ping_timeout=20) as ws:
                     self.rt = ws
+                    self.connected = False
                     self.active = False
                     self.response_id = None
                     self.awaited_response_id = None
@@ -1559,6 +1734,10 @@ class Session:
             return
         if ty == "response.output_item.added":
             item_id = event.get("item", {}).get("id")
+            if rid in self.cancelled_ids:
+                if item_id:
+                    await self.delete_items([item_id])
+                return
             owner = self.response_owners.get(rid)
             self.own_item(item_id, owner)
             if owner is not None and getattr(owner, "failed", False) and item_id:
@@ -1566,7 +1745,12 @@ class Session:
             return
         if ty == "session.updated":
             if self.update_waiter is not None and not self.update_waiter.done():
-                self.update_waiter.set_result(event.get("session", {}))
+                echo = event.get("session", {})
+                if self.update_expected and any(echo.get(k) != self.update_expected[k]
+                        for k in ("tool_choice", "output_modalities", "instructions") if k in self.update_expected):
+                    self.log("stale_session_update_ignored")
+                else:
+                    self.update_waiter.set_result(echo)
             return
         if ty in output_types and (self.phase != "answer" or not self.audio_allowed):
             return
@@ -1580,6 +1764,10 @@ class Session:
             except RuntimeError:
                 pass
             self.log("realtime_error", code=code, message=message)
+            if code == "response_not_active" and self.cancel_barrier is not None:
+                future = self.cancel_barrier["future"]
+                if not future.done():
+                    future.set_result(None)
             if code != "response_not_active" and "cancel" not in str(code):
                 for waiter in (self.update_waiter, self.response_waiter):
                     if waiter is not None and not waiter.done():
@@ -1628,13 +1816,21 @@ class Session:
                     await self.flush_pending()
                     return
                 acknowledged = await self.acknowledge_input(text)
-                self.pending.append(("text", TurnText(text, [event["item_id"]] if event.get("item_id") else [], acknowledged), self.speech_stopped_at))  # transcript as text; audio buffer is cleared
+                self.pending.append(("text", TurnText(text, [event["item_id"]] if event.get("item_id") else [], acknowledged,
+                                                       self.input_context()), self.speech_stopped_at))
                 await self.flush_pending()
         elif ty == "conversation.item.input_audio_transcription.failed":
             self.awaiting_transcript = False
             await self.error("Input transcription failed.")
             await self.flush_pending()
         elif ty == "response.created":
+            response_id = event["response"]["id"]
+            if response_id in self.cancelled_ids or (self.generation and self.generation["cancelled"]):
+                self.cancelled_ids.append(response_id)
+                self.log("late_response_ignored", response_id=response_id)
+                return
+            if self.generation is not None:
+                self.generation["response_id"] = response_id
             self.active = True
             self.response_id = event["response"]["id"]
             if self.turn_items is not None:
@@ -1680,8 +1876,17 @@ class Session:
                     self.remember_spoken((rid, event.get("item_id", ""), "audio"), event.get("transcript", ""))
                 await self.phone_json({"type": "transcript", "role": "assistant",
                                        "text": event.get("transcript", event.get("text", "")), "final": True})
+                self.log("assistant_transcript", response_id=rid,
+                         text=event.get("transcript", event.get("text", ""))[:1200])
+                self.last_assistant_text = event.get("transcript", event.get("text", ""))
         elif ty == "response.done":
             response = event["response"]
+            if self.cancel_barrier is not None and response.get("id") == self.cancel_barrier.get("response_id"):
+                future = self.cancel_barrier["future"]
+                if not future.done():
+                    future.set_result(None)
+            if response.get("id") in self.cancelled_ids:
+                return  # A late completion must not finish newer cached audio.
             expected = self.awaited_response_id or self.response_id
             if expected is not None and response.get("id") != expected:
                 return
@@ -1729,6 +1934,10 @@ class Session:
         if name in ("get_investigations", "manage_investigation"):
             return await self.investigation_tool(name, args)
         if name == "look":
+            if (self.camera_request and self.camera_request["phase"] in ("capturing", "classifying")
+                    and not re.search(r"look again|another photo|retake|different|new subject|再拍|重拍|重新|换一个|再看", self.turn_question, re.I)):
+                return {"ok": True, "analysis_pending": True,
+                        "analysis_status": self.observations[self.focus].analysis_status}
             return await self.request_look(args.get("hint", ""), args.get("group"))
         if name == "new_observation":
             group = args.get("group", "Aves")
@@ -1741,12 +1950,14 @@ class Session:
             if not obs:
                 return {"ok": False, "error": "No focus observation; look first"}
             if name == "get_observation":
-                return {"observation": obs.payload()}
+                return {"observation": obs.payload(), "analysis_status": obs.analysis_status}
             if name == "ask_expert":
                 # The router can paraphrase Chinese into English or add claims.
                 # Use this turn's actual text/STT transcript when available.
                 return await self.ask_expert(self.turn_question or args["question"], obs)
             if name in ("confirm_observation", "discard_observation"):
+                if name == "confirm_observation" and obs.analysis_status in ("awaiting_confirmation", "capturing", "analyzing"):
+                    return {"ok": False, "analysis_pending": True, "error": "Wait for the current photo before confirming"}
                 await self.cancel_camera_request()
             if name == "discard_observation":
                 obs.status = "discarded"
@@ -2163,7 +2374,7 @@ class Session:
             if self.assistant_audio_pending():
                 await self.cancel_speech()
             acknowledged = await self.acknowledge_input(text)
-            self.pending.append(("text", TurnText(text, acknowledged=acknowledged), None))
+            self.pending.append(("text", TurnText(text, acknowledged=acknowledged, context=self.input_context()), None))
             await self.flush_pending()
         elif ty == "look":
             self.input_revision += 1
@@ -2214,6 +2425,8 @@ class Session:
         # Checklist is derived: mutating self.items would only clear a temporary list.
         self.epoch += 1
         self.input_revision += 1  # invalidate in-flight expert/frame work
+        self.vision_answered.clear()
+        self.last_assistant_text = ""
         await self.cancel_camera_request()
         async with self.item_lock:
             self.observations.clear()
@@ -2291,7 +2504,21 @@ class Session:
             self.cancelled_ids.append(self.response_id)
         self.audio_allowed = False
         self.play_until = 0
-        if self.connected and self.active:
+        token = self.generation
+        send_cancel = self.connected and self.active and self.cancel_barrier is None
+        if token is not None:
+            send_cancel = self.connected and token["requested"] and not token["cancelled"]
+            token["cancelled"] = True
+            if not token["cancel"].done():
+                token["cancel"].set_result(None)
+            if self.response_waiter is not None and not self.response_waiter.done():
+                self.response_waiter.set_result({"status": "cancelled", "output": []})
+            if send_cancel:
+                self.cancel_barrier = {"future": asyncio.get_running_loop().create_future(),
+                    "unknown": token["response_id"] is None, "rt": self.rt,
+                    "response_id": token["response_id"]}
+            self.log("generation_cancelled", response_id=token["response_id"], requested=token["requested"])
+        if send_cancel:
             await self.rt_send({"type": "response.cancel"})
         await self.flush_audio()
         await self.state()
@@ -2458,6 +2685,11 @@ async def post_frame(request: Request, session: str, obs: str, x: float | None =
     if s.camera_request is not camera or camera["phase"] != "capturing":
         raise HTTPException(409, "Capture cancelled or already submitted")
     camera["phase"] = "classifying"
+    camera["uploaded_at"] = time.monotonic()
+    observation.analysis_status = "analyzing"
+    await s.broadcast_observation(observation)
+    if s.camera_request is not camera:
+        raise HTTPException(409, "Capture cancelled before classification")
     s.camera_feedback_request = camera
     s.pending.append(("camera_photo", camera["id"], None))
     await s.flush_pending()
@@ -2469,6 +2701,8 @@ async def post_frame(request: Request, session: str, obs: str, x: float | None =
         if s.camera_request is camera:
             camera["phase"], camera["confirmed"] = "ready", False
             observation.awaiting_answer = False
+            observation.analysis_status = "failed"
+            await s.broadcast_observation(observation)
         if s.camera_feedback_request is camera:
             s.camera_feedback_request = None
             s.pending = deque(p for p in s.pending if p[0] != "camera_photo")
@@ -2491,14 +2725,24 @@ async def post_frame(request: Request, session: str, obs: str, x: float | None =
     detection = Detection(detection_id, "image", now_iso(), candidates, thumb="/api/frame/" + detection_id + ".jpg")
     s.frames[detection_id] = thumb.getvalue()
     observation.detections.append(detection)
+    observation.image_revision += 1
     await s.refusion(observation)
     if s.camera_request is not camera:
         raise HTTPException(409, "Capture cancelled while updating evidence")
     s.camera_request = None
+    observation.analysis_status = "ready"
+    s.log("classification_completed", request_id=camera["id"], observation_id=obs,
+          image_revision=observation.image_revision, uncertain=observation.uncertain,
+          duration_ms=round((time.monotonic() - camera["uploaded_at"]) * 1000),
+          raw_top=result["candidates"][:2], fused_top=observation.fused[:2])
     if observation.awaiting_answer:
         observation.awaiting_answer = False
-        s.pending.append(("vision", obs, None))
-        await s.flush_pending()
+        s.pending.append(("vision", {"obs": obs, "image_revision": observation.image_revision,
+                                     "request_id": camera["id"]}, None))
+    # Publish the result only after committing flags/queue atomically. A new
+    # Start arriving during the broadcast must retain its own awaiting flag.
+    await s.broadcast_observation(observation)
+    await s.flush_pending()
     return {"detection": asdict(detection)}
 
 

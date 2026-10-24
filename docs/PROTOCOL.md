@@ -43,6 +43,17 @@ One WebSocket per phone: `wss://<host>/ws`. The backend also serves the web app 
     See [INVESTIGATIONS.md](INVESTIGATIONS.md) for all states and retention rules.
 
 ## Notes
+- Observation payloads additionally expose `analysis_status` (`idle`,
+  `awaiting_confirmation`, `capturing`, `analyzing`, `ready`, `failed`, `cancelled`),
+  `analysis_request_id` and integer `image_revision`. Previous candidates are not
+  the result of a new photo while its status is capturing/analyzing. Ready is
+  published only after fusion and result-queue flags are committed together.
+- Camera readiness/capture uses the phone transport independently of Higgs
+  `state.connected`; the latter describes the voice-model connection. Camera
+  confirmation never waits for a conversation turn to finish.
+- Model-routed checklist writes require grounded intent and an unchanged input
+  focus/photo context. Unclear or stale writes produce a clarification rather
+  than a write. Explicit manual buttons retain their direct authorization.
 - Accepted final voice transcripts and typed inputs receive a local cached spoken
   receipt before routing or waiting for the turn worker. Echoes, empty/filler-only
   speech and stop commands do not get a receipt; quiet rules still apply. Camera

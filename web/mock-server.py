@@ -23,7 +23,7 @@ from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Response
 
 ROOT = Path(__file__).resolve().parent
-CLIENT_BUILD = '2026-10-24-camera-progress'
+CLIENT_BUILD = '2026-10-24-log-fixes'
 PHOTOS = {}
 SESSIONS = {}
 SPECIES = [
