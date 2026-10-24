@@ -53,10 +53,11 @@ never substitutes for a successful tool result. State is in memory, not a databa
 - `ignore()` keeps chatter/fillers silent. Validated checklist writes play only
   an earcon; read-only questions and approved tasks can speak. Routing is not
   infallible, so stale/ungrounded writes are rejected or clarified.
-- **Interruptions:** earphones cancel at voice onset; speaker/audio-display mode
-  waits for a non-echo transcript (Tap cancels immediately). Playback tracking,
-  transcript echo filtering and BirdNET playback-window exclusion limit feedback.
-  Realtime mic input stays open; speaker interruption is not instantaneous.
+- **Interruptions:** with earphones, speaking cancels the reply at voice onset
+  ("stop" / "等一下" works). Speaker mode and audio-enabled displays are
+  half-duplex: mic audio is not sent to Higgs while the assistant plays (plus a
+  short tail), so tap to interrupt. Transcript echo filtering and BirdNET
+  playback-window exclusion keep the assistant from hearing itself.
 - English/Chinese input and code-switching are supported; STT and routing can
   still misinterpret short confirmations in noise.
 - A bounded conversation window uses `conversation.item.delete` (last eight
@@ -118,14 +119,15 @@ Live fixtures use `img/cardinal.jpg`, or `testmix/{cardinal,robin,bluejay}_best.
 for `--chorus`. Override with `FIELD_COMPANION_TEST_DATA`, `--image` or
 `--chorus-file`. Missing fixtures print **SKIP**, not a successful live result.
 [Submission verification](docs/SUBMISSION.md) records the fresh-clone commands,
-173 passing offline tests, dependency sizes and what was **not** tested.
+235 passing offline tests, dependency sizes and what was **not** tested.
 
 ## Known limitations
 - BirdNET runs on the **server**, not the phone; core-only installation omits it.
 - Bluetooth headsets force call-mode capture on tested hardware, killing birdsong
   detail. Separate phone-mic/Bluetooth-output selection still needs device testing.
-- Speaker mode is **half-duplex-ish**: voice input stays open, but interruptions
-  wait for STT and BirdNET skips windows overlapping assistant playback.
+- Speaker mode is **half-duplex**: you cannot interrupt by voice while the
+  assistant speaks (tap instead), and BirdNET skips windows overlapping playback.
+  Full-duplex over a loudspeaker without browser echo cancellation was unreliable.
 - Bird vision is restricted to a local species list when available: out-of-range
   birds can be confidently forced to a local look-alike. Nonbirds use open rankings;
   scores/fusion are uncalibrated, not field-accuracy guarantees.

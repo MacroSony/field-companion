@@ -11,7 +11,7 @@ This is a setup/offline verification, not a new phone or field-accuracy benchmar
   `~/.config/boson/api_key` was read; the key was never printed or copied into Git.
 - Owned server at `127.0.0.1:8794`: `/` returned HTTP **200** with HTML.
   Process stopped afterward; rebinding 8794 confirmed release.
-- Full backend suite: **173 tests passed**, both in the supplied development venv
+- Full backend suite: **173 tests passed** (at commit 3175db2; 235 after merging the final feat/look-ui, development venv), both in the supplied development venv
   and the fresh core-only venv. This includes four portability regression tests.
 - `node --check web/*.js` succeeded; each `web/*.js` was also checked individually
   (Node does not reliably treat multiple arguments as multiple files to check).
