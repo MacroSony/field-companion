@@ -1,4 +1,4 @@
-# Phone ↔ backend protocol (v0.1)
+# Phone ↔ backend protocol (v0.2)
 
 One WebSocket per phone: `wss://<host>/ws`. The backend also serves the web app (`web/`) at `/` on the same port, so one HTTPS tunnel covers both.
 
@@ -33,3 +33,16 @@ One WebSocket per phone: `wss://<host>/ws`. The backend also serves the web app 
 ## Notes
 - Audio direction asymmetry is intentional: 48 kHz in (BirdNET needs it), 24 kHz out (Higgs output).
 - All checklist state lives on the backend; reconnecting phones receive `state` + `checklist` right after `hello`.
+
+## v0.2: Observations and Look mode (see docs/PLAN.md)
+### Backend → clients
+- `{"type":"observation","id":"ob3","focus":true,"status":"open"|"confirmed"|"discarded","count":null|2,"notes":"","t_start":"<iso>","lat":..,"lng":..,
+   "detections":[{"id":"d7","kind":"sound"|"image"|"description","t":"<iso>","thumb":"/api/frame/d7.jpg"?,"text":"..."?,"candidates":[{"sci":"..","en":"..","p":0.62}]}],
+   "fused":[{"sci":"..","en":"..","photo":"https://..","p":0.71}],"uncertain":true|false,"hint":"Check the bill length"?}`
+  Sent on every change. `checklist` messages continue as before; they are derived from confirmed observations.
+- `{"type":"capture","obs":"ob3","n":3,"hint":"Zoom on the head","zoom":2.0?}`: the phone should switch to Look mode (if not already), grab n frames over ~1 s, and POST them.
+
+### Phone → backend
+- `POST /api/frame?session=<id>&obs=<id>[&x=..&y=..&w=..&h=..]`, body = JPEG (≤ 1920 px long side). Optional crop is normalized 0..1 (from a tap on the bird). One request per frame. Response: `{"detection": {...}}`. The backend then broadcasts the updated `observation`.
+- `{"type":"look"}`: the user opened Look mode / pressed the shutter without speaking. Equivalent to "what's that?" (opens a new focus if none is open).
+- `{"type":"observation_action","id":"ob3","action":"confirm"|"discard"|"focus","count":2?}`: UI buttons.

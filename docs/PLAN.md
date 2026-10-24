@@ -29,14 +29,20 @@ score(species) = Σ log p_image(frames) + w_s · log p_sound + log prior(local i
 - `ask_expert(question)` → a stronger LLM with the focus observation's evidence + candidate species facts (iNat taxon summary / Wikipedia extract) as grounding → returns ≤3 short sentences. Higgs says "let me check" first (latency 2–5 s).
 - Its best use is the **discriminating follow-up**: given the top-2 candidates, say what to look at ("Downy vs Hairy: check the bill length relative to the head"). This becomes the `hint` for the next `capture`.
 - Also covers questions Higgs gets wrong (it described Blue Jay as having a blue-green crown).
-- Open: which model/key (GPT? Claude? Boson's understanding-v3.5 with thinking if hackathon.boson.ai comes up), and whether non-Boson LLMs are OK with the organizers.
+- **Owner: teammate** picks the model/key (GPT? Claude? Boson understanding-v3.5 if hackathon.boson.ai comes up) and checks with the organizers whether non-Boson LLMs are OK. Decide at the next sync. Backend exposes `ask_expert` with a pluggable provider.
 
 ## Split
 | Who | Owns |
 |---|---|
-| **Teammate** | Look mode in the phone UI: camera preview, zoom, tap-to-crop, capture → POST frames, Observation card (evidence timeline, top-3 bars), display-mode observation panel. Expert-path prompt design (he proposed it). |
+| **Teammate** | Look mode in the phone UI: camera preview, zoom, tap-to-crop, capture → POST frames, Observation card (evidence timeline, top-3 bars), display-mode observation panel. **Expert path: model choice + prompt** (he proposed it). |
 | **Zihan** | Integration and demo owner: end-to-end testing on the Android phone + projector, demo script and recorded backup, pitch slides. Final say on router prompt/tool behavior. |
 | **Mika (+ subagents)** | Backend: Observation/Detection model + focus + fusion, `/api/frame` + BioCLIP service (local-list text embeddings precomputed and cached; ~0.7 s/frame CPU), router tools, `ask_expert` plumbing, tests. Keeps PROTOCOL.md current. |
+
+## Git workflow
+- `main` = always demoable (the live tunnel runs from it). No direct pushes of WIP to `main`.
+- Branches: `feat/observation-backend` (Mika), `feat/look-ui` (teammate), `feat/expert` (teammate). Open PRs into `main`; Zihan merges after testing on the phone.
+- Contract between branches = `docs/PROTOCOL.md`. Change it in a small PR first, then implement.
+- Teammate can develop UI against `web/mock-server.py` (extend it with `capture`/`observation` messages) without the real backend.
 
 ## Timeline
 - **Tonight**: Observation model + `/api/frame` + BioCLIP service (Mika); camera UI v0 against a mock (teammate); demo script draft (Zihan).
