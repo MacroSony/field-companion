@@ -3,6 +3,29 @@
 The optional [GPT Naturalist expert path](../docs/EXPERT.md) handles complex
 comparisons and species-fact follow-ups without changing the logging fast path.
 
+## Camera confirmation (2026-10-24)
+
+Opening the camera or asking “What is that?” now prepares a live preview without
+encoding/uploading a photo or running the range lookup. After usable video is
+acknowledged, a queued local recording says “Camera ready. Say start to take a
+photo.” / “相机已就绪。说开始就拍照。” Only a subsequent “start” / “开始”, or an explicit
+Identify/Look again/New subject click, authorizes capture. Confirmation is handled
+directly from final STT or typed input; it does not need another Higgs tool choice.
+Other conversation and investigations remain available while waiting.
+
+Each request has a single-use ID enforced by the frame endpoint. Closing,
+backgrounding, resetting, replacing/disconnecting the mic, or changing/closing focus
+invalidates pending confirmation/capture. “Cancel” / “取消” leaves only the preview.
+“Yes” / “go ahead” does not accidentally consent to a photo. See
+[CAMERA.md](../docs/CAMERA.md) and [PROTOCOL.md](../docs/PROTOCOL.md) for the handshake.
+New ready clips are bundled alongside existing feedback; regenerate just those
+with `python -B backend/tool_feedback.py --generate --kind camera-ready`.
+Validation: 138 offline backend tests and both isolated browser suites passed.
+The camera suite checks no JPEG encoding/upload before a second STT confirmation,
+including with an existing preview, plus stale confirmation after backgrounding.
+These use fake media/classification; physical phone audio/camera remains to verify.
+Current build: `2026-10-24-camera-confirmation`.
+
 ## Feedback before slow tools (2026-10-24)
 
 Voice-routed Look/new-subject requests say "Let me take a look." / "好的，我看一下。"
@@ -26,7 +49,7 @@ two fixed English/Chinese text questions also sent feedback before a held fixtur
 tool: first PCM at 532 / 391 ms (two samples, no physical playback). No GPT calls
 or photo uploads were made in that live check. Evidence: ignored
 `out/tool-feedback-checks/live-results.json` and `out/merge-checks/`.
-Current build: `2026-10-24-tool-feedback`.
+Earlier build: `2026-10-24-tool-feedback`.
 
 ## Current round-two integration (2026-10-24)
 

@@ -73,6 +73,9 @@ def serve(port):
                 if text == "fixture:voice-look":
                     await self.handle_rt({"type": "conversation.item.input_audio_transcription.completed",
                         "transcript": "What is that?", "item_id": "voice-" + uuid.uuid4().hex})
+                elif text == "fixture:voice-start":
+                    await self.handle_rt({"type": "conversation.item.input_audio_transcription.completed",
+                        "transcript": "Start.", "item_id": "voice-" + uuid.uuid4().hex})
                 elif text == "fixture:finish":
                     self.research_release.set()
                 elif text == "fixture:checklist":
@@ -158,7 +161,7 @@ async def test(port, cdp):
         await call("Emulation.setDeviceMetricsOverride", width=390, height=844, deviceScaleFactor=1, mobile=True)
         await call("Browser.grantPermissions", permissions=["audioCapture", "videoCapture", "geolocation"], origin=origin)
         await call("Page.addScriptToEvaluateOnNewDocument", source="""
-          window.__streams = []; window.__uploads = []; window.__requests = []; window.__sockets = [];
+          window.__streams = []; window.__uploads = []; window.__requests = []; window.__sockets = []; window.__messages = [];
           window.__encodes = [];
           const encode = HTMLCanvasElement.prototype.toBlob;
           HTMLCanvasElement.prototype.toBlob = function(...args) { window.__encodes.push([this.width,this.height]); return encode.apply(this,args); };
@@ -203,7 +206,9 @@ async def test(port, cdp):
             return fetchOriginal(url, options);
           };
           const WS = window.WebSocket;
-          window.WebSocket = class extends WS { constructor(...args) { super(...args); window.__sockets.push(this); } };
+          window.WebSocket = class extends WS { constructor(...args) { super(...args); window.__sockets.push(this);
+            this.addEventListener('message', e => { if(typeof e.data === 'string') window.__messages.push(JSON.parse(e.data)); });
+          } };
         """)
         await call("Page.navigate", url=origin + "/?session=" + session)
         await until("document.readyState === 'complete' && typeof FieldCamera === 'function'")
@@ -227,12 +232,23 @@ async def test(port, cdp):
         await js("window.__denyCamera=false; document.getElementById('camera-toggle').click()")
         await until("!document.getElementById('camera-shutter').disabled")
         await until("document.getElementById('camera-preview').videoWidth >= 64 && document.getElementById('camera-preview').videoHeight >= 64")
+        await until("window.__messages.some(e=>e.text==='Camera ready. Say start to take a photo.')")
+        assert await js("window.__encodes.length === 0 && window.__uploads.length === 0")
+        results["manualOpenWaitsForConfirmation"] = True
+        await js("document.getElementById('camera-group').value='Plantae'; document.getElementById('camera-group').dispatchEvent(new Event('change'))")
+        await until("window.__messages.at(-1)?.type==='camera_prepare' || window.__messages.some(e=>e.type==='observation' && e.group==='Plantae')")
+        await until("window.__messages.some(e=>e.type==='observation' && e.group==='Plantae')")
+        assert await js("window.__encodes.length === 0 && window.__uploads.length === 0")
+        await js("document.getElementById('camera-group').value='Aves'; document.getElementById('camera-group').dispatchEvent(new Event('change'))")
+        await until("window.__messages.filter(e=>e.type==='observation').at(-1)?.group==='Aves'")
+        results["groupChangeRearmsWithoutCapturing"] = True
         await js("document.getElementById('camera-zoom').value='2'; document.getElementById('camera-zoom').dispatchEvent(new Event('input')); document.getElementById('camera-viewport').dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true}))")
         await js("document.getElementById('camera-shutter').click()")
         await until("document.querySelectorAll('#observation-evidence img').length === 1 && !document.getElementById('camera-shutter').disabled")
         upload = await js("window.__uploads[0]")
         assert upload["type"] == "image/jpeg" and 100 <= max(upload["width"], upload["height"]) <= 1920, (upload, await js("window.__geometry"))
         assert "x=0.275000" in upload["url"] and "w=0.450000" in upload["url"], upload
+        assert "capture=" in upload["url"], upload
         assert await js("window.__uploads.length") == 1
         assert await js("window.__encodes.length") == 3
         assert await js("document.getElementById('observation-candidates').textContent.includes('American Robin')")
@@ -268,11 +284,18 @@ async def test(port, cdp):
         await js("window.__failUpload=false; document.getElementById('camera-toggle').click()")
         assert await js("window.__streams.filter(s=>s.getVideoTracks().length).every(s=>s.getTracks().every(t=>t.readyState==='ended'))")
         assert await js("window.__streams[0].getAudioTracks()[0].readyState === 'live'")
-        # A completed voice transcript routes to Look and emits feedback BEFORE
-        # capture, both with the camera closed and with an existing preview.
-        before_voice = len(events)
-        await js("window.__sockets[0].send(JSON.stringify({type:'text',text:'fixture:voice-look'}))")
-        await until("document.querySelectorAll('#observation-evidence img').length === 1 && !document.getElementById('camera-shutter').disabled")
+        # Look opens a usable preview and announces readiness, without even
+        # encoding a frame. A second completed STT turn authorizes the photo.
+        async def voice_ready(wait_for_drain=False):
+            marker = await js("window.__messages.length")
+            uploads = await js("window.__uploads.length")
+            encodes = await js("window.__encodes.length")
+            await js("window.__sockets[0].send(JSON.stringify({type:'text',text:'fixture:voice-look'}))")
+            await until("window.__messages.slice(" + str(marker) + ").some(e=>e.text==='Camera ready. Say start to take a photo.') && !document.getElementById('camera-shutter').disabled")
+            await asyncio.sleep(3.6 if wait_for_drain else .3)
+            assert await js("window.__uploads.length") == uploads
+            assert await js("window.__encodes.length") == encodes
+
         def feedback_before_capture(start):
             messages = [json.loads(e["params"]["response"]["payloadData"]) for e in events[start:]
                         if e.get("method") == "Network.webSocketFrameReceived" and e["params"]["response"]["opcode"] == 1]
@@ -280,16 +303,30 @@ async def test(port, cdp):
             capture = next(i for i, e in enumerate(messages) if e.get("type") == "capture")
             assert feedback < capture
             assert any(e.get("type") == "audio_end" and e["id"].startswith("feedback-") for e in messages[:capture])
+
+        before_voice = len(events)
+        await voice_ready(wait_for_drain=True)
+        await js("window.__sockets[0].send(JSON.stringify({type:'text',text:'fixture:voice-start'}))")
+        await until("document.querySelectorAll('#observation-evidence img').length === 1 && !document.getElementById('camera-shutter').disabled")
         feedback_before_capture(before_voice)
         before_voice = len(events)
-        await js("window.__sockets[0].send(JSON.stringify({type:'text',text:'fixture:voice-look'}))")
+        await voice_ready()
+        await js("window.__sockets[0].send(JSON.stringify({type:'text',text:'fixture:voice-start'}))")
         await until("document.querySelectorAll('#observation-evidence img').length === 2 && !document.getElementById('camera-shutter').disabled")
         feedback_before_capture(before_voice)
-        results["voiceFeedbackBeforeCaptureWithCameraClosedAndOpen"] = True
+        results["voiceCameraReadyThenStartWithCameraClosedAndOpen"] = True
+        await voice_ready()
+        uploads = await js("window.__uploads.length")
         await js("Object.defineProperty(document,'hidden',{configurable:true,value:true}); document.dispatchEvent(new Event('visibilitychange'))")
         assert await js("window.__streams.filter(s=>s.getVideoTracks().length).every(s=>s.getTracks().every(t=>t.readyState==='ended'))")
         assert await js("window.__streams[0].getAudioTracks()[0].readyState === 'live'")
-        await js("delete document.hidden; window.__sockets[0].send(JSON.stringify({type:'text',text:'fixture:voice-look'}))")
+        await js("delete document.hidden; window.__sockets[0].send(JSON.stringify({type:'text',text:'fixture:voice-start'}))")
+        await asyncio.sleep(.4)
+        assert await js("window.__uploads.length") == uploads
+        assert await js("document.getElementById('camera-panel').hidden")
+        results["backgroundInvalidatesConfirmation"] = True
+        await voice_ready()
+        await js("window.__sockets[0].send(JSON.stringify({type:'text',text:'fixture:voice-start'}))")
         await until("document.querySelectorAll('#observation-evidence img').length === 3 && !document.getElementById('camera-shutter').disabled")
         results["backgroundStopsCameraOnly"] = True
         await js("document.getElementById('stop').click()")

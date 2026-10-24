@@ -14,6 +14,8 @@ window.FieldCamera = class FieldCamera {
     this.observation = null;
     this.focus = false;
     this.wasConnected = false;
+    this.prepared = null;
+    this.openId = null;
     this.$('camera-toggle').addEventListener('click', () => {
       if (this.stream || this.opening) this.close(); else this.open();
     });
@@ -23,6 +25,10 @@ window.FieldCamera = class FieldCamera {
     this.$('observation-confirm').addEventListener('click', () => this.action('confirm'));
     this.$('observation-discard').addEventListener('click', () => this.action('discard'));
     this.$('camera-clear-crop').addEventListener('click', () => this.selectCrop(null));
+    this.$('camera-group').addEventListener('change', () => {
+      if (this.stream && this.connected() && !this.busy) this.send({type: 'camera_ready',
+        open_id: this.openId, group: this.$('camera-group').value});
+    });
     this.$('camera-zoom').addEventListener('input', () => {
       this.$('camera-preview').style.transform = `scale(${this.zoom()})`;
       this.$('camera-zoom-value').textContent = `${this.zoom().toFixed(1)}×`;
@@ -59,8 +65,12 @@ window.FieldCamera = class FieldCamera {
     ++this.job;
     this.upload?.abort(); this.upload = null;
     this.busy = false;
+    this.prepared = null;
   }
   close() {
+    const request = this.prepared, openId = this.openId;
+    this.openId = null;
+    if (this.connected() && (request || openId)) this.send({type: 'camera_closed', request_id: request?.request_id, open_id: openId});
     ++this.revision;
     this.cancelCapture(); this.opening = null;
     this.stream?.getTracks().forEach(track => track.stop()); this.stream = null;
@@ -94,16 +104,17 @@ window.FieldCamera = class FieldCamera {
     this.$('camera-group').disabled = this.busy;
     this.$('camera-clear-crop').disabled = this.busy;
     const active = live && this.focus && this.observation?.status === 'open';
-    this.$('observation-again').disabled = !active || this.busy;
+    this.$('observation-again').disabled = !active || !this.stream || this.busy;
     this.$('observation-discard').disabled = !active || this.busy;
     this.$('observation-confirm').disabled = !active || this.busy || !this.observation?.fused?.length;
     this.$('observation-count').disabled = !active || this.busy;
     document.body.classList.toggle('has-observation', !this.$('active-observation').hidden);
   }
-  async open() {
+  async open(notify = true) {
     if (this.displayMode || !this.connected() || document.hidden) return false;
     if (this.stream) return true;
     if (this.opening) return this.opening;
+    const openId = this.openId = crypto.randomUUID();
     const revision = ++this.revision;
     this.$('camera-panel').hidden = false;
     this.status('Opening camera…');
@@ -136,7 +147,8 @@ window.FieldCamera = class FieldCamera {
             this.status('Camera stopped. Tap Open camera to resume.', true);
           }
         });
-        this.status('Ready. Tap the subject, then Identify.');
+        this.status('Camera ready. Aim at the subject, then say “start” or tap Identify.');
+        if (notify) this.send({type: 'camera_ready', open_id: openId, group: this.$('camera-group').value});
         return true;
       } catch (error) {
         input?.getTracks().forEach(track => track.stop());
@@ -166,8 +178,8 @@ window.FieldCamera = class FieldCamera {
     if (this.crop) Object.assign(box.style, {left: `${this.crop.x * 100}%`, top: `${this.crop.y * 100}%`, width: '45%', height: '45%'});
   }
   look() {
-    if (!this.connected() || this.displayMode || this.busy) return;
-    this.send({type: 'look', group: this.$('camera-group').value});
+    if (!this.connected() || this.displayMode || this.busy || !this.stream) return;
+    this.send({type: 'look', group: this.$('camera-group').value, confirmed: true});
   }
   newSubject() {
     if (!this.connected() || this.displayMode || this.busy) return;
@@ -254,14 +266,40 @@ window.FieldCamera = class FieldCamera {
     if (!blob || blob.size > 8 * 1024 * 1024) throw new Error('Could not prepare the photo. Try again.');
     return {blob, sharpness};
   }
+  async prepare(message) {
+    if (this.displayMode || !this.connected() || document.hidden || typeof message.request_id !== 'string') return;
+    if (!this.focus || this.observation?.id !== message.obs || this.observation.status !== 'open') return;
+    if (message.open_id && message.open_id !== this.openId) {
+      this.send({type: 'camera_closed', request_id: message.request_id}); return;
+    }
+    this.cancelCapture();
+    const request = this.prepared = message;
+    const opened = await this.open(false);
+    if (this.prepared !== request) return;
+    if (!opened || !this.stream || document.hidden || !this.connected()) {
+      this.send({type: 'camera_closed', request_id: message.request_id});
+      this.prepared = null; return;
+    }
+    this.status(`${message.hint ? message.hint + ' · ' : ''}Camera ready. Say “start” or tap Identify when ready.`);
+    this.send({type: 'camera_ready', request_id: message.request_id});
+    this.updateConnection();
+  }
+  cancelled(message) {
+    if (this.prepared?.request_id === message.request_id) {
+      this.cancelCapture();
+      if (this.stream) this.status('Preview only. Ask to identify, or tap Identify when ready.');
+    }
+    this.updateConnection();
+  }
   async requestCapture(message) {
     if (this.displayMode || !this.connected() || document.hidden || typeof message.obs !== 'string') return;
     if (!this.focus || this.observation?.id !== message.obs || this.observation.status !== 'open' || this.busy) return;
+    if (!this.stream || this.prepared?.request_id !== message.request_id) return;
     const job = ++this.job;
     this.busy = true; this.updateConnection();
     const current = () => job === this.job && this.connected() && this.focus && this.observation?.id === message.obs && this.observation.status === 'open';
     try {
-      if (!(await this.open()) || !current()) return;
+      if (!current()) return;
       const n = Math.max(1, Math.min(3, Math.floor(Number(message.n) || 3)));
       const crop = this.crop && {...this.crop}, zoom = this.zoom();
       let best;
@@ -276,6 +314,7 @@ window.FieldCamera = class FieldCamera {
       this.status('Identifying the clearest photo…');
       const url = this.endpoint('/api/frame');
       url.searchParams.set('session', this.session); url.searchParams.set('obs', message.obs);
+      url.searchParams.set('capture', message.request_id);
       if (crop) for (const [key, value] of Object.entries(crop)) url.searchParams.set(key, value.toFixed(6));
       const controller = this.upload = new AbortController();
       let timedOut = false;
@@ -296,6 +335,7 @@ window.FieldCamera = class FieldCamera {
         throw new Error(messages[response.status] || 'Photo could not be identified. Try again.');
       }
       this.status('Photo added to this observation. Review the candidates below.');
+      this.prepared = null;
     } catch (error) {
       if (current() && error.name !== 'AbortError') this.status(error.message || 'Photo upload failed. Try again.', true);
     } finally {

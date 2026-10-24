@@ -1,6 +1,6 @@
 'use strict';
 (() => {
-  const CLIENT_BUILD = '2026-10-24-tool-feedback';
+  const CLIENT_BUILD = '2026-10-24-camera-confirmation';
   const $ = id => document.getElementById(id);
   const params = new URLSearchParams(location.search);
   const displayMode = params.get('display') === '1';
@@ -442,6 +442,8 @@
         if (audioEnabled && message.id === playbackId) { playbackComplete = true; reportPlayback(playbackReported); }
         break;
       case 'capture': camera.requestCapture(message); break;
+      case 'camera_prepare': camera.prepare(message); break;
+      case 'camera_cancelled': camera.cancelled(message); break;
       case 'observation': camera.observe(message); break;
       case 'reset': clearSessionUI(); break;
       case 'flush': flush(); break;

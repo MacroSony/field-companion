@@ -6,6 +6,8 @@ out/
 !backend/audio/look-zh.wav
 !backend/audio/check-en.wav
 !backend/audio/check-zh.wav
+!backend/audio/camera-ready-en.wav
+!backend/audio/camera-ready-zh.wav
 *.pcm
 *.src
 .env

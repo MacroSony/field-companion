@@ -111,7 +111,7 @@ class FeedbackTests(unittest.IsolatedAsyncioTestCase):
             actual, pcm = recording(*key)
             self.assertEqual(actual, text)
             self.assertEqual(len(pcm) % 2, 0)
-            self.assertTrue(0 < len(pcm) <= 4 * 48000)
+            self.assertTrue(0 < len(pcm) <= 6 * 48000)
 
 
 if __name__ == "__main__":

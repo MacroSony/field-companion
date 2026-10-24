@@ -80,6 +80,15 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         await self.c.finish_route({"status": "completed", "output": [{"type": "function_call",
             "name": name, "call_id": "c1", "arguments": json.dumps(args or {})}]})
 
+    async def authorize_camera(self):
+        request = self.c.camera_request
+        if request["phase"] == "opening":
+            await self.c.camera_ready({"request_id": request["id"]})
+        await self.c.camera_confirmation("start")
+        self.c.pending = s.deque(p for p in self.c.pending if p[0] != "camera_start")
+        await self.c.start_camera_capture(request["id"])
+        return request["id"]
+
     async def test_router_wording_and_remove_all(self):
         instructions = self.c.config("route")["instructions"]
         self.assertIn("recent_sounds(seconds=15)", instructions)
@@ -834,7 +843,8 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
     async def test_focus_capture_expiry_and_confirmed_retention(self):
         await self.route("look", {"hint": "bill"})
         obs = self.c.observations[self.c.focus]
-        self.assertIn({"type": "capture", "obs": obs.id, "n": 3, "hint": "bill"}, self.phone.events)
+        self.assertTrue(any(e["type"] == "camera_prepare" and e["obs"] == obs.id and e["hint"] == "bill" for e in self.phone.events))
+        self.assertFalse(any(e["type"] == "capture" for e in self.phone.events))
         await self.route("look")
         self.assertEqual(self.c.focus, obs.id)
         obs.touched -= 121
@@ -856,10 +866,10 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(target.id, saved.id)
         self.assertEqual(target.group, "Insecta")
         self.assertEqual(target.detections, [])
-        self.assertTrue(target.awaiting_answer)
+        self.assertFalse(target.awaiting_answer)
         self.assertEqual(saved.status, "confirmed")
         self.assertEqual(self.c.items[0]["count"], 2)
-        self.assertIn({"type": "capture", "obs": target.id, "n": 3, "hint": ""}, self.phone.events)
+        self.assertTrue(any(e["type"] == "camera_prepare" and e["obs"] == target.id and not e["hint"] for e in self.phone.events))
 
         target.hint = "Old target's bill"
         self.phone.events.clear()
@@ -868,8 +878,8 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(target.status, "discarded")
         self.assertEqual(next_target.group, "Plantae")
         self.assertEqual(next_target.hint, "")
-        self.assertTrue(next_target.awaiting_answer)
-        self.assertIn({"type": "capture", "obs": next_target.id, "n": 3, "hint": ""}, self.phone.events)
+        self.assertFalse(next_target.awaiting_answer)
+        self.assertTrue(any(e["type"] == "camera_prepare" and e["obs"] == next_target.id and not e["hint"] for e in self.phone.events))
         self.assertEqual(len(self.c.items), 1)
 
         before = list(self.c.observations)
@@ -960,7 +970,8 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_frame_endpoint_mock_service_and_thumbnail(self):
         obs = await self.c.new_focus()
-        obs.awaiting_answer = True
+        await self.c.request_look()
+        capture_id = await self.authorize_camera()
         image = io.BytesIO()
         Image.new("RGB", (64, 64), "red").save(image, format="JPEG")
         s.SESSIONS[self.c.id] = self.c
@@ -970,7 +981,7 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
             async with ASGIClient() as client:
                 with patch.object(s.requests, "post") as post:
                     post.return_value.json.return_value = {"candidates": [{"sci": "a", "p": .8}], "sharpness": 5, "ms": 10}
-                    response = await client.post("/api/frame", params={"session": self.c.id, "obs": obs.id, "x": 0, "y": 0, "w": .5, "h": .5}, content=image.getvalue())
+                    response = await client.post("/api/frame", params={"session": self.c.id, "obs": obs.id, "capture": capture_id, "x": 0, "y": 0, "w": .5, "h": .5}, content=image.getvalue())
                     self.assertEqual(response.status_code, 200, response.text)
                     self.assertEqual(post.call_args.kwargs["json"]["crop"], [0, 0, .5, .5])
                     self.assertIsNone(post.call_args.kwargs["json"]["candidates"])
@@ -979,13 +990,16 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(obs.fused[0]["sci"], "a")
                 self.assertEqual(self.c.pending[0][:2], ("vision", obs.id))
                 self.assertTrue(any(e["type"] == "observation" and e["detections"] for e in self.phone.events))
+                await self.c.request_look()
+                capture_id = await self.authorize_camera()
                 with patch.object(s.requests, "post", side_effect=s.requests.ConnectionError):
-                    response = await client.post("/api/frame", params={"session": self.c.id, "obs": obs.id}, content=image.getvalue())
+                    response = await client.post("/api/frame", params={"session": self.c.id, "obs": obs.id, "capture": capture_id}, content=image.getvalue())
                     self.assertEqual(response.status_code, 503)
                     self.assertIn("Vision service unavailable", response.text)
-                response = await client.post("/api/frame", params={"session": self.c.id, "obs": obs.id}, content=b"not jpeg")
+                await self.authorize_camera()
+                response = await client.post("/api/frame", params={"session": self.c.id, "obs": obs.id, "capture": capture_id}, content=b"not jpeg")
                 self.assertEqual(response.status_code, 422)
-                response = await client.post("/api/frame", params={"session": self.c.id, "obs": obs.id, "x": .9, "y": 0, "w": .5, "h": 1}, content=image.getvalue())
+                response = await client.post("/api/frame", params={"session": self.c.id, "obs": obs.id, "capture": capture_id, "x": .9, "y": 0, "w": .5, "h": 1}, content=image.getvalue())
                 self.assertEqual(response.status_code, 422)
                 obs.status = "confirmed"
                 response = await client.post("/api/frame", params={"session": self.c.id, "obs": obs.id}, content=image.getvalue())

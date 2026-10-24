@@ -129,14 +129,23 @@ async def run(url):
                 await wait_for(lambda: any(e.get("type") == "transcript" and e.get("role") == "user"
                                           for e in events["mic"][before_events:]))
                 if label == "look":
+                    await wait_for(lambda: any(e.get("type") == "camera_prepare" for e in events["mic"][before_events:]), timeout=60)
+                    prepared = next(e for e in events["mic"][before_events:] if e.get("type") == "camera_prepare")
+                    assert not any(e.get("type") == "capture" for e in events["mic"][before_events:])
+                    # This protocol test simulates preview readiness; it does
+                    # not request a physical camera. Consent is a separate turn.
+                    await mic.send(json.dumps({"type": "camera_ready", "request_id": prepared["request_id"]}))
+                    await wait_for(lambda: any(e.get("text") == "Camera ready. Say start to take a photo."
+                                              for e in events["mic"][before_events:]), timeout=30)
+                    assert not any(e.get("type") == "capture" for e in events["mic"][before_events:])
+                    await mic.send(json.dumps({"type": "text", "text": "start"}))
                     await wait_for(lambda: any(e.get("type") == "capture" for e in events["mic"][before_events:]), timeout=60)
-                    assert audio == before_audio, "look spoke before receiving frames"
                     capture = next(e for e in events["mic"][before_events:] if e.get("type") == "capture")
                     assert capture["n"] == 3
                     http_url = urlunsplit(parts._replace(scheme="http" if parts.scheme == "ws" else "https", path="/api/frame", query=""))
                     jpeg = Path("/data/build/birding-demo/img/cardinal.jpg").read_bytes()
                     response = await asyncio.to_thread(requests.post, http_url,
-                        params={"session": sid, "obs": capture["obs"]}, data=jpeg,
+                        params={"session": sid, "obs": capture["obs"], "capture": capture["request_id"]}, data=jpeg,
                         headers={"Content-Type": "image/jpeg"}, timeout=90)
                     assert response.status_code == 200, "frame endpoint status " + str(response.status_code)
                     assert response.json()["detection"]["kind"] == "image"

@@ -1,7 +1,7 @@
 # Camera and visual follow-up
 
-The phone uses the existing v0.2 `capture`, `observation`, `/api/frame` and
-`observation_action` contracts. No model or API credential is placed in the browser.
+The phone uses the v0.2 observation routes with a two-step camera confirmation
+handshake. No model or API credential is placed in the browser.
 
 ## Use
 
@@ -9,17 +9,13 @@ The phone uses the existing v0.2 `capture`, `observation`, `/api/frame` and
    camera have separate permission requests. A denied camera does not stop audio.
 2. Choose the taxon group. Use the 1–4× digital zoom and optionally tap the subject
    to select a region. **Full frame** clears the selection.
-3. Tap **Identify this subject**, or ask “What is that?” while listening. The
-   server opens/reuses the focus and requests a capture. The browser takes up to
-   three frames ~400 ms apart, selects the sharpest within the selected region,
-   and uploads one JPEG. The long side is at most 1920 pixels. Crop coordinates
-   refer to the already digitally zoomed JPEG, matching the preview.
-
-Voice requests first play a short "Let me take a look." / "好的，我看一下。" before
-the slow lookup and capture request, with the camera either closed or open.
-This uses bundled Higgs audio through the normal playback queue; it adds no
-runtime synthesis request. Quiet and interruption rules still apply. Button
-requests retain the visible photo-capture progress without an extra spoken line.
+3. Asking “What is that?” opens/reuses the preview without taking a photo. Once
+   video is usable, the assistant says **“Camera ready. Say start to take a photo.”**
+   (Chinese: “相机已就绪。说开始就拍照。”). Manually opening the camera uses the same
+   flow. Aim first, then say **“start” / “开始”**, or tap **Identify this subject**.
+   Only then does the browser take up to three frames ~400 ms apart, select the
+   sharpest within the selected region, and upload one JPEG. The long side is at
+   most 1920 pixels. Crop coordinates refer to the digitally zoomed JPEG.
 4. The **Current observation** card shows up to three ranked candidates, the last
    six evidence items and any expert hint. Rankings are uncalibrated scores.
    **Look again** adds evidence to the same focus. **New subject** closes an open,
@@ -33,6 +29,22 @@ pending uploads. Late permission results are also stopped. Reopen explicitly
 after returning to the foreground. A changed/closed focus or lost socket cancels
 pending capture. Uploads time out after 35 seconds and are not retried silently.
 An unavailable vision service leaves existing checklist records intact.
+
+The short confirmation is handled directly from final STT or typed text, without
+another model routing decision. It only applies to a ready, current camera request;
+an early “start” is not saved for later, and “yes” / “go ahead” do not authorize a
+photo. “Cancel” / “取消” cancels the request while leaving the preview open. A new
+identification request is required after cancellation or a successful photo.
+Identify, Look again and New subject buttons count as explicit confirmation.
+Closing, backgrounding, changing/closing focus, resetting or replacing/disconnecting
+the microphone invalidates the old confirmation. The frame endpoint requires the
+matching single-use request ID. Old clients cannot upload without this handshake.
+
+Ready prompts use bundled Higgs recordings through the shared PCM queue, with no
+runtime synthesis call. They wait for ongoing speech/playback; quiet and interruption
+rules apply. The existing short acknowledgement still precedes voice Look requests
+and confirmed capture work. Investigations and other questions can continue while
+the camera waits for confirmation.
 
 The display receives the same observation card and evidence, without requesting
 a camera or microphone. Its observation panel shares the right column with the
@@ -57,7 +69,9 @@ ignored `out/camera-checks/`.
 Keep Windows browser profiles short, for example `out/c-12345678`, because deeply
 nested Service Worker cache files can exceed filesystem path limits.
 
-The browser test covers camera denial/mic isolation, 3-frame/one-upload capture,
+The browser test covers preview-only opening, ready prompts, a separate voice
+confirmation with closed/open cameras, stale confirmation after backgrounding,
+camera denial/mic isolation, 3-frame/one-upload capture,
 digital zoom and normalized crop, same-focus follow-up, cancellation on a changed
 focus, explicit count confirmation, service failure, track release, late camera
 permission, display-only observation rendering and runtime errors. It also covers

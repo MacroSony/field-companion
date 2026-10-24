@@ -52,11 +52,16 @@ One WebSocket per phone: `wss://<host>/ws`. The backend also serves the web app 
    "detections":[{"id":"d7","kind":"sound"|"image"|"description","t":"<iso>","thumb":"/api/frame/d7.jpg"?,"text":"..."?,"candidates":[{"sci":"..","en":"..","p":0.62}]}],
    "fused":[{"sci":"..","en":"..","photo":"https://..","p":0.71}],"uncertain":true|false,"hint":"Check the bill length"?}`
   Sent on every change. `checklist` messages continue as before; they are derived from confirmed observations.
-- `{"type":"capture","obs":"ob3","n":3,"hint":"Zoom on the head","zoom":2.0?}`: the phone should switch to Look mode (if not already) and grab n frames over ~1 s. The current UI caps n at 3, selects the sharpest within the chosen region and POSTs one JPEG. Zoom is user-controlled digital zoom in this version; the optional server zoom field is not applied.
+- `{"type":"camera_prepare","obs":"ob3","request_id":"<id>","hint":"Zoom on the head","open_id":null}`: open/reuse the preview only. Do not encode or upload a frame. Echo `camera_ready` with this request ID only after usable video is available. An optional `open_id` ties the preparation to a manually opened preview; ignore/cancel it if that preview was already closed.
+- `{"type":"camera_cancelled","request_id":"<id>"}`: cancel matching preparation, capture or upload; the preview may remain open.
+- `{"type":"capture","obs":"ob3","request_id":"<id>","n":3,"hint":"Zoom on the head","zoom":2.0?}`: sent only after ready-video handshake and explicit user confirmation. Require the same prepared request ID and a live preview. Grab at most 3 frames over ~1 s, select the sharpest within the chosen region and POST one JPEG. Zoom is user-controlled digital zoom; optional server zoom is not applied.
 
 ### Phone → backend
-- `POST /api/frame?session=<id>&obs=<id>[&x=..&y=..&w=..&h=..]`, body = JPEG (≤ 1920 px long side). Optional crop is normalized 0..1 (from a tap on the bird). One request per frame. Response: `{"detection": {...}}`. The backend then broadcasts the updated `observation`.
-- `{"type":"look"}`: the user opened Look mode / pressed the shutter without speaking. Equivalent to "what's that?" (opens a new focus if none is open).
+- `{"type":"camera_ready","open_id":"<preview id>","group":"Aves"}`: current mic only; a manually opened preview is usable. The backend creates a preparation request tied to this preview ID, without authorization to take a photo.
+- `{"type":"camera_ready","request_id":"<id>"}`: current mic only; acknowledge matching preparation. The backend queues “Camera ready. Say start to take a photo.”, waiting for ongoing conversation/playback to finish. It then waits for final STT or typed “start” / “开始”. An early confirmation is not saved; unrelated “yes” / “go ahead” remains available for other consent flows.
+- `{"type":"camera_closed","request_id":"<id>","open_id":"<preview id>"}`: current mic only; either matching ID invalidates the request and any pending capture.
+- `POST /api/frame?session=<id>&obs=<id>&capture=<request id>[&x=..&y=..&w=..&h=..]`, body = JPEG (≤ 1920 px long side). Optional crop is normalized 0..1. Only the current confirmed capture accepts one upload; absent, stale, unconfirmed or consumed IDs return 409 before inference. Response: `{"detection": {...}}`; the backend broadcasts the updated `observation`. Recognition failure requires a fresh confirmation or another Identify request.
+- `{"type":"look","confirmed":false,"group":"Aves"}`: prepare preview and wait for confirmation, equivalent to voice "what's that?". Identify/Look again/New subject buttons send `confirmed:true`; that click authorizes capture once the matching preview-ready handshake completes. A new open focus is created if needed.
 - `{"type":"observation_action","id":"ob3","action":"confirm"|"discard"|"focus","count":2?}`: UI buttons.
 
 The phone uploads only on a requested capture. A frame's crop is normalized to the

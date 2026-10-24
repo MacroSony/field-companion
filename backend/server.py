@@ -203,7 +203,7 @@ OBSERVATION = {"type": "object", "properties": {
 WRITE_TOOLS = ("add_observation", "add_observations", "accept_suggestions",
                "dismiss_suggestions", "set_count", "remove_observation", "confirm_observation")
 TOOLS = [
-    tool_schema("look", "Identify what the user is looking at ('what is that?'); request camera frames. Stay silent until frames arrive. Set group for nonbirds.", {"hint": NAME, "group": {"type": "string", "enum": GROUPS}}),
+    tool_schema("look", "Prepare the camera for visual identification ('what is that?'). The phone opens a preview and asks the user to say start; no photo before confirmation. Set group for nonbirds.", {"hint": NAME, "group": {"type": "string", "enum": GROUPS}}),
     tool_schema("get_observation", "Read focus evidence for pronouns and follow-up naturalist questions."),
     tool_schema("confirm_observation", "Add it / log it / two of them: confirm the focus, not a new named sighting. No speech.", {"count": COUNT, "notes": NAME}),
     tool_schema("discard_observation", "Discard the focus; do not log it."),
@@ -248,6 +248,9 @@ For total count corrections use set_count; for deletion use remove_observation.
 Never claim to have logged anything without a successful tool call. Logging has an earcon,
 not speech. Never give delayed logging acknowledgements, including "I've logged X".
 For "what's that?", "look again", or visual identification call look, NOT speak.
+Look prepares the camera; it never takes a photo until the camera is ready and
+the user explicitly says start/开始 or taps Identify. Never claim a photo has
+already been taken while camera confirmation is pending.
 Use the current focus snapshot for "add it", "two of them", "add them", or "log that":
 call confirm_observation with the count, NEVER add_observation/add_observations.
 This preserves the focus's existing photo evidence; do not create a named sighting
@@ -348,6 +351,7 @@ class Session:
         self.observations = {}
         self.focus = None
         self.frames = {}
+        self.camera_request = None
         self.sound_windows = deque(maxlen=30)
         self.item_lock = asyncio.Lock()
         self.expiry_task = None
@@ -669,6 +673,7 @@ class Session:
     async def expire_focus(self):
         obs = self.observations.get(self.focus)
         if obs and time.monotonic() - obs.touched >= FOCUS_TTL:
+            await self.cancel_camera_request()
             self.focus = None
             if obs.status == "open":
                 obs.status = "discarded"
@@ -681,6 +686,7 @@ class Session:
             await self.expire_focus()
 
     async def new_focus(self, group="Aves"):
+        await self.cancel_camera_request()
         old = self.observations.get(self.focus)
         if old and old.status == "open":
             old.status = "discarded"
@@ -712,22 +718,110 @@ class Session:
             obs.touched = time.monotonic()
         await self.broadcast_observation(obs)
 
-    async def request_look(self, hint="", group=None):
+    async def cancel_camera_request(self):
+        request = self.camera_request
+        self.camera_request = None
+        if request and (obs := self.observations.get(request["obs"])):
+            obs.awaiting_answer = False
+        self.pending = deque(p for p in self.pending if p[0] not in ("camera_ready", "camera_start"))
+        if request and self.mic:
+            try:
+                await self.mic.send_json({"type": "camera_cancelled", "request_id": request["id"]})
+            except (ConnectionError, WebSocketDisconnect, RuntimeError):
+                pass
+
+    async def request_look(self, hint="", group=None, *, confirmed=False, open_id=None):
         if group is not None and group not in GROUPS:
             raise ValueError("invalid iconic group")
+        await self.cancel_camera_request()
         obs = await self.current_focus(create=True)
         if group is not None:
             obs.group = group
         obs.hint = str(hint or obs.hint)[:500]
+        obs.awaiting_answer = False
+        obs.touched = time.monotonic()
+        request = self.camera_request = {"id": uuid.uuid4().hex, "obs": obs.id,
+            "phase": "opening", "confirmed": confirmed, "open_id": open_id,
+            "language": "zh" if self.chinese(self.turn_question) or (not self.turn_question and self.lang.startswith("zh")) else "en"}
+        await self.broadcast_observation(obs)
+        if self.mic:
+            await self.mic.send_json({"type": "camera_prepare", "obs": obs.id,
+                "request_id": request["id"], "hint": obs.hint, "open_id": open_id})
+        return {"ok": True, "observation": obs.payload(), "waiting_for_confirmation": True}
+
+    async def camera_ready(self, event):
+        request = self.camera_request
+        if not event.get("request_id"):
+            # A manually opened preview follows the same confirmation handshake.
+            if not isinstance(event.get("open_id"), str) or not 0 < len(event["open_id"]) <= 128:
+                raise ValueError("camera_ready requires a preview id")
+            await self.request_look(group=event.get("group"), open_id=event.get("open_id"))
+            return
+        if not request or event["request_id"] != request["id"] or request["phase"] != "opening":
+            return
+        request["phase"] = "ready"
+        if request["confirmed"]:
+            self.queue_camera_start(request)
+        else:
+            self.pending.append(("camera_ready", request["id"], None))
+            await self.flush_pending()
+
+    def queue_camera_start(self, request):
+        if self.camera_request is not request or request["phase"] != "ready":
+            return
+        request["phase"], request["confirmed"] = "starting", True
+        self.pending = deque(p for p in self.pending if p[0] != "camera_ready")
+        self.pending.append(("camera_start", request["id"], None))
+        self.work_ready.set()
+
+    async def camera_confirmation(self, text):
+        request = self.camera_request
+        if not request:
+            return False
+        words = " ".join(self.normalized_words(text))
+        if words in ("cancel", "never mind", "not now", "取 消", "先 不 拍", "算 了", "不 要 拍"):
+            await self.cancel_camera_request()
+            return True
+        if words not in ("start", "start please", "take a photo", "take the photo",
+                         "开 始", "开 始 吧", "拍 吧", "开 始 拍 照", "可 以 拍 了"):
+            return False
+        obs = self.observations.get(request["obs"])
+        if not obs or obs.status != "open" or self.focus != obs.id:
+            await self.cancel_camera_request()
+            return True
+        if request["phase"] == "ready":
+            if self.assistant_audio_pending():
+                await self.cancel_speech()
+            self.queue_camera_start(request)
+        # Early/duplicate confirmations never authorize a later capture.
+        return True
+
+    async def start_camera_capture(self, request_id):
+        request = self.camera_request
+        if not request or request["id"] != request_id or request["phase"] != "starting":
+            return
+        obs = self.observations.get(request["obs"])
+        if not obs or obs.status != "open" or self.focus != obs.id:
+            await self.cancel_camera_request()
+            return
+        obs.touched = time.monotonic()
         obs.awaiting_answer = True
+        await self.play_feedback("look", language=request["language"])
         known = {d.id for d in obs.detections}
         for stamp, detection in self.sound_windows:
             if abs(time.monotonic() - stamp) <= 10 and detection.id not in known:
                 obs.detections.append(detection)
-        await self.refusion(obs)
-        if self.mic:
-            await self.mic.send_json({"type": "capture", "obs": obs.id, "n": 3, "hint": obs.hint})
-        return {"ok": True, "observation": obs.payload(), "waiting_for_frames": True}
+        try:
+            await self.refusion(obs)
+        except Exception:
+            if self.camera_request is request:
+                request["phase"], request["confirmed"] = "ready", False
+                obs.awaiting_answer = False
+            raise
+        if self.camera_request is request and self.focus == obs.id and obs.status == "open" and self.mic:
+            request["phase"] = "capturing"
+            await self.mic.send_json({"type": "capture", "obs": obs.id, "n": 3,
+                "hint": obs.hint, "request_id": request_id})
 
     async def change_checklist(self, item_id, count=None):
         row = next((r for r in self.items if r["id"] == item_id), None)
@@ -760,14 +854,19 @@ class Session:
     async def acknowledge_tool(self, name):
         """Send a cached short phrase before a slow tool, through the PCM queue."""
         kind = FEEDBACK_TOOLS.get(name)
+        if kind:
+            return await self.play_feedback(kind)
+
+    async def play_feedback(self, kind, *, language=None, guard=None):
         revision = self.input_revision
         def current():
             return (not self.closed and self.connected and self.may_speak()
                     and not self.auto_speech_paused and not self.user_speaking
-                    and not self.awaiting_transcript and self.input_revision == revision)
+                    and not self.awaiting_transcript and self.input_revision == revision
+                    and (guard is None or guard()))
         if not kind or not current() or self.playback_pending() or time.monotonic() < self.play_until:
             return
-        language = "zh" if self.chinese(self.turn_question) or (not self.turn_question and self.lang.startswith("zh")) else "en"
+        language = language or ("zh" if self.chinese(self.turn_question) or (not self.turn_question and self.lang.startswith("zh")) else "en")
         try:
             text, pcm = feedback_recording(kind, language)
         except (OSError, ValueError) as exc:
@@ -788,7 +887,9 @@ class Session:
         self.remember_spoken((playback_id, "feedback"), text)
         await self.phone_json({"type": "transcript", "role": "assistant", "text": text, "final": True})
         await self.phone_audio(pcm, guard=audible)
+        played = False
         if audible():
+            played = True
             self.total_audio_out += len(pcm)
             await self.end_audio()
             self.latency("tool_feedback")
@@ -797,6 +898,7 @@ class Session:
         if self.playback_task is None or self.playback_task.done():
             self.playback_task = asyncio.create_task(self.playback_finished())
         await self.state()
+        return played
 
     @property
     def speaker_mode(self):
@@ -943,6 +1045,8 @@ class Session:
                                  + json.dumps([r["en"] for r in self.suggestions.values()])
                                  + "\nCurrent focus snapshot (context only, not a new sighting): "
                                  + json.dumps(focus_context)
+                                 + "\nCamera confirmation state (start takes a photo ONLY after ready): "
+                                 + json.dumps(self.camera_request)
                                  + "\nLatest investigation explanation offer (accept only if it is the latest assistant question): "
                                  + json.dumps(self.investigation_offer_ids)
                                  + "\nInvestigations (context only; never invent progress): "
@@ -1140,9 +1244,12 @@ class Session:
                     self.pending[0] = (kind, value, stopped)
                     self.log("turns_merged", n=len(parts))
             self.turn_stale = stopped is not None and time.monotonic() - stopped > 12
-            if kind in ("notify", "investigation") and self.auto_speech_paused:
+            if kind in ("notify", "investigation", "camera_ready") and self.auto_speech_paused:
                 continue
-            if kind in ("notify", "investigation") and self.playback_pending():
+            if kind in ("notify", "investigation", "camera_ready") and self.playback_pending():
+                continue
+            if kind == "camera_ready" and (self.awaiting_transcript or not self.may_speak()
+                    or time.monotonic() < self.play_until):
                 continue
             if kind == "notify" and (self.awaiting_transcript or self.quiet
                                      or time.monotonic() < self.play_until
@@ -1166,7 +1273,16 @@ class Session:
                 self.item_owners[item_id] = self.turn_items
             self.tools_executed = False
             try:
-                if kind == "investigation":
+                if kind == "camera_ready":
+                    request = self.camera_request
+                    if request and request["id"] == value and request["phase"] == "ready":
+                        played = await self.play_feedback("camera-ready", language=request["language"],
+                            guard=lambda: self.camera_request is request and request["phase"] == "ready")
+                        if not played and self.camera_request is request and request["phase"] == "ready":
+                            self.pending.append(("camera_ready", value, None))
+                elif kind == "camera_start":
+                    await self.start_camera_capture(value)
+                elif kind == "investigation":
                     job = self.investigations.jobs.get(value)
                     if job is not None:
                         await self.investigation_notice(job)
@@ -1457,6 +1573,9 @@ class Session:
                     await self.flush_pending()
                     return  # Stay listening; a stop command needs no spoken reply.
                 self.auto_speech_paused = False
+                if await self.camera_confirmation(text):
+                    await self.flush_pending()
+                    return
                 self.pending.append(("text", TurnText(text, [event["item_id"]] if event.get("item_id") else []), self.speech_stopped_at))  # transcript as text; audio buffer is cleared
                 await self.flush_pending()
         elif ty == "conversation.item.input_audio_transcription.failed":
@@ -1575,6 +1694,8 @@ class Session:
                 # The router can paraphrase Chinese into English or add claims.
                 # Use this turn's actual text/STT transcript when available.
                 return await self.ask_expert(self.turn_question or args["question"], obs)
+            if name in ("confirm_observation", "discard_observation"):
+                await self.cancel_camera_request()
             if name == "discard_observation":
                 obs.status = "discarded"
                 obs.awaiting_answer = False
@@ -1911,6 +2032,15 @@ class Session:
         if ty == "reset":
             await self.reset()
             return
+        if ty in ("camera_ready", "camera_closed"):
+            if client is None or client is not self.mic:
+                raise ValueError("Only the current microphone controls its camera")
+            if ty == "camera_ready":
+                await self.camera_ready(event)
+            elif self.camera_request and (event.get("request_id") == self.camera_request["id"]
+                    or (event.get("open_id") and event["open_id"] == self.camera_request.get("open_id"))):
+                await self.cancel_camera_request()
+            return
         if ty in ("hello", "location"):
             if ty == "location" and (event.get("lat") is None or event.get("lng") is None):
                 raise ValueError("location requires lat and lng")
@@ -1975,12 +2105,17 @@ class Session:
                 await self.flush_pending()
                 return
             self.auto_speech_paused = False
+            if await self.camera_confirmation(text):
+                await self.flush_pending()
+                return
             self.pending.append(("text", text, None))
             await self.flush_pending()
         elif ty == "look":
             self.input_revision += 1
             self.auto_speech_paused = False
-            await self.request_look(event.get("hint", ""), event.get("group"))
+            if not isinstance(event.get("confirmed", False), bool):
+                raise ValueError("confirmed must be boolean")
+            await self.request_look(event.get("hint", ""), event.get("group"), confirmed=event.get("confirmed", False))
         elif ty == "observation_action":
             obs = self.observations.get(event.get("id"))
             if not obs or obs.status == "discarded":
@@ -1989,6 +2124,7 @@ class Session:
             if action not in ("focus", "confirm", "discard"):
                 raise ValueError("Unknown observation action")
             old = self.observations.get(self.focus)
+            await self.cancel_camera_request()
             self.focus = obs.id
             obs.touched = time.monotonic()
             if old and old is not obs:
@@ -2021,6 +2157,7 @@ class Session:
         # Checklist is derived: mutating self.items would only clear a temporary list.
         self.epoch += 1
         self.input_revision += 1  # invalidate in-flight expert/frame work
+        await self.cancel_camera_request()
         async with self.item_lock:
             self.observations.clear()
             self.focus = None
@@ -2155,6 +2292,7 @@ class Client:
         s.clients.add(self)
         if self.role == "mic":
             old = s.mic
+            await s.cancel_camera_request()
             s.mic = self
             if old is not None:
                 s.clients.discard(old)
@@ -2200,6 +2338,7 @@ class Client:
         finally:
             s.clients.discard(self)
             if s.mic is self:
+                await s.cancel_camera_request()
                 s.mic = None
             await s.state()
             if not s.clients:
@@ -2226,7 +2365,8 @@ async def phone_socket(ws: WebSocket):
 
 @app.post("/api/frame")
 async def post_frame(request: Request, session: str, obs: str, x: float | None = None,
-                     y: float | None = None, w: float | None = None, h: float | None = None):
+                     y: float | None = None, w: float | None = None, h: float | None = None,
+                     capture: str | None = None):
     s = SESSIONS.get(session)
     if not s:
         raise HTTPException(404, "Unknown session; connect WebSocket first")
@@ -2234,6 +2374,10 @@ async def post_frame(request: Request, session: str, obs: str, x: float | None =
     observation = s.observations.get(obs)
     if not observation or observation.status != "open" or s.focus != obs:
         raise HTTPException(409, "Frame requires the current open focus observation")
+    camera = s.camera_request
+    if (not camera or capture != camera["id"] or camera["obs"] != obs
+            or not camera["confirmed"] or camera["phase"] != "capturing"):
+        raise HTTPException(409, "Confirm the ready camera before taking a photo")
     crop = None
     if any(v is not None for v in (x, y, w, h)):
         if any(v is None or not math.isfinite(v) for v in (x, y, w, h)) or not (0 <= x < 1 and 0 <= y < 1 and 0 < w <= 1 and 0 < h <= 1 and x + w <= 1 and y + h <= 1):
@@ -2252,8 +2396,19 @@ async def post_frame(request: Request, session: str, obs: str, x: float | None =
         image.convert("RGB").save(thumb, format="JPEG", quality=80)
     except Exception:
         raise HTTPException(422, "Expected valid JPEG with long side <=1920 pixels")
-    allowed = await asyncio.get_running_loop().run_in_executor(s.executor, s.allowed_species) if observation.group == "Aves" else None
-    result = await asyncio.to_thread(classify_frame, jpeg, crop, sorted(allowed) if allowed else None)
+    # Reading the body yields: another upload or a close may have consumed the
+    # confirmation in the meantime. Claim it exactly once before any inference.
+    if s.camera_request is not camera or camera["phase"] != "capturing":
+        raise HTTPException(409, "Capture cancelled or already submitted")
+    camera["phase"] = "classifying"
+    try:
+        allowed = await asyncio.get_running_loop().run_in_executor(s.executor, s.allowed_species) if observation.group == "Aves" else None
+        result = await asyncio.to_thread(classify_frame, jpeg, crop, sorted(allowed) if allowed else None)
+    except Exception:
+        if s.camera_request is camera:
+            camera["phase"], camera["confirmed"] = "ready", False
+            observation.awaiting_answer = False
+        raise
     candidates = []
     for candidate in result["candidates"]:
         sci = candidate["sci"]
@@ -2266,13 +2421,16 @@ async def post_frame(request: Request, session: str, obs: str, x: float | None =
         candidates.append({**s.names[sci], "sci": sci, "p": float(candidate["p"])})
     # Vision is slow: discard late frames if focus changed while inference ran.
     await s.expire_focus()
-    if observation.status != "open" or s.focus != obs:
+    if observation.status != "open" or s.focus != obs or s.camera_request is not camera:
         raise HTTPException(409, "Observation closed or focus changed during classification")
     detection_id = "d" + uuid.uuid4().hex[:12]
     detection = Detection(detection_id, "image", now_iso(), candidates, thumb="/api/frame/" + detection_id + ".jpg")
     s.frames[detection_id] = thumb.getvalue()
     observation.detections.append(detection)
     await s.refusion(observation)
+    if s.camera_request is not camera:
+        raise HTTPException(409, "Capture cancelled while updating evidence")
+    s.camera_request = None
     if observation.awaiting_answer:
         observation.awaiting_answer = False
         s.pending.append(("vision", obs, None))
