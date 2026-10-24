@@ -184,18 +184,30 @@ class TaskStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assert_no_findings(result)
         self.assert_no_camera_commands()
 
-    async def test_ambiguity_accepts_short_task_selection_only_after_its_own_question(self):
+    async def test_current_task_selection_offer_is_supplied_as_model_context(self):
         await self.photo("analyzing")
         self.research("R1")
         result = await self.c.speak_task_status({})
         self.c.last_assistant_text = result["answer"]  # Actual final output transcript.
-        self.assertEqual(self.c.status_selector("R1"), {"id": "R1"})
-        self.assertEqual(self.c.status_selector("Photo."), {"scope": "camera"})
-        self.assertEqual(self.c.status_selector("照片"), {"scope": "camera"})
+        context = self.c.task_status_context()
+        self.assertEqual(context["question"], result["answer"])
+        self.assertEqual({r["id"] for r in context["tasks"]},
+                         {r["id"] for r in result["tasks"]})
+        instructions = self.c.config("route")["instructions"]
+        self.assertIn(result["answer"], instructions)
+        self.assertIn("R1", instructions)
+        self.assert_no_findings(context)
         self.c.last_assistant_text = "Investigation R1 is ready. Would you like me to explain?"
-        self.assertIsNone(self.c.status_selector("Yes."))
-        self.assertIsNone(self.c.status_selector("R1"))
+        self.assertIsNone(self.c.task_status_context())
         self.assert_no_camera_commands()
+
+    async def test_expired_task_selection_offer_is_not_model_context(self):
+        await self.photo("analyzing")
+        self.research("R1")
+        result = await self.c.speak_task_status({})
+        self.c.last_assistant_text = result["answer"]
+        self.c.task_status_offer["at"] -= 31
+        self.assertIsNone(self.c.task_status_context())
 
     async def test_explicit_all_scope_can_summarize_camera_and_research_together(self):
         await self.photo()
@@ -235,13 +247,14 @@ class TaskStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.c.investigations.jobs)
         self.c.generate.assert_not_awaited()
 
-    async def test_logged_ready_status_phrase_cannot_restart_camera_or_erase_unread_work(self):
+    async def test_model_selected_status_read_preserves_ready_unread_work(self):
         obs = await self.photo()
         vision = ("vision", {"obs": obs.id, "image_revision": 1,
                             "request_id": obs.analysis_request_id}, None)
         self.c.pending.append(vision)
-        for wrong_tool in ("look", "get_observation", "get_investigations", "speak", "ignore"):
-            await self.route("Check out the identification process.", wrong_tool)
+        for question in ("Check out the identification process.", "How is the picture coming along?",
+                         "Any progress on that photograph?"):
+            await self.route(question, "get_task_status", {"scope": "camera"})
             self.assertEqual(obs.analysis_status, "ready")
             self.assertEqual(obs.analysis_request_id, "original-photo")
             self.assertEqual(obs.image_revision, 1)
@@ -250,20 +263,20 @@ class TaskStatusTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn((obs.id, 1), self.c.vision_answered)
             self.assert_no_camera_commands()
         self.c.generate.assert_not_awaited()
-        self.assertEqual(self.c.speak_expert.await_count, 5)
+        self.assertEqual(self.c.speak_expert.await_count, 3)
 
     async def test_progress_query_during_photo_inference_preserves_capture_request(self):
         obs = await self.photo("analyzing")
         request = self.c.camera_request = {"id": "original-photo", "obs": obs.id,
             "phase": "classifying", "confirmed": True, "language": "en"}
-        await self.route("Check out the identification process.", "look")
+        await self.route("Check out the identification process.", "get_task_status", {"scope": "camera"})
         self.assertIs(self.c.camera_request, request)
         self.assertEqual(request["phase"], "classifying")
         self.assertEqual(obs.analysis_status, "analyzing")
         self.assert_no_camera_commands()
         self.c.generate.assert_not_awaited()
 
-    async def test_clear_status_request_bypasses_model_routing_and_preserves_ready_work(self):
+    async def test_status_input_uses_model_route_and_preserves_ready_work(self):
         obs = await self.photo()
         vision = ("vision", {"obs": obs.id, "image_revision": 1,
                             "request_id": obs.analysis_request_id}, None)
@@ -276,10 +289,13 @@ class TaskStatusTests(unittest.IsolatedAsyncioTestCase):
             return {"status": "completed"}
         self.c.speak_expert.side_effect = speak
         self.c.answer_vision = AsyncMock()
+        self.c.generate.return_value = {"status": "completed", "output": [{
+            "type": "function_call", "name": "get_task_status", "call_id": "model-status",
+            "arguments": '{"scope":"camera"}'}]}
         self.c.tasks.append(asyncio.create_task(self.c.turn_worker()))
         await self.c.handle_phone({"type": "text", "text": "Check out the identification process."}, self.client)
         await asyncio.wait_for(delivered.wait(), 1)
-        self.c.generate.assert_not_awaited()
+        self.c.generate.assert_awaited_once_with("route")
         self.assertIn(vision, pending_at_delivery)
         self.assertEqual(obs.analysis_status, "ready")
         self.assertEqual(obs.analysis_request_id, "original-photo")
@@ -295,7 +311,7 @@ class TaskStatusTests(unittest.IsolatedAsyncioTestCase):
             guards.append(guard())
             return {"status": "deferred"}
         self.c.speak_expert.side_effect = change_before_speaking
-        await self.route("What is the identification status?", "look")
+        await self.route("What is the identification status?", "get_task_status", {"scope": "camera"})
         self.assertEqual(guards, [False, False])
         self.assertTrue(any(p[0] == "task_status" for p in self.c.pending))
         latest = await self.c.task_status({"scope": "camera"})
@@ -315,48 +331,43 @@ class TaskStatusTests(unittest.IsolatedAsyncioTestCase):
             return {"status": "completed" if guards[-1] else "deferred"}
         self.c.speak_expert.side_effect = setup_delay
         with patch.object(s, "time", SimpleNamespace(monotonic=lambda: now[0])):
-            await self.route("What is the identification status?", "look")
+            await self.route("What is the identification status?", "get_task_status", {"scope": "camera"})
         self.assertEqual(guards, [True])
         self.assertFalse(any(p[0] == "task_status" for p in self.c.pending))
 
     async def test_ready_unread_identification_reads_existing_photo_until_explicit_retake(self):
         obs = await self.photo()
-        await self.route("What is that?", "look")
+        await self.route("What is that?", "get_observation")
         self.assertEqual(obs.analysis_status, "ready")
         self.assertEqual(obs.analysis_request_id, "original-photo")
         self.assertIsNone(self.c.camera_request)
         self.assert_no_camera_commands()
-        await self.route("Look again, take another photo.", "look")
+        await self.route("Look again, take another photo.", "look", {"target": "current"})
         self.assertIsNotNone(self.c.camera_request)
         self.assertNotEqual(self.c.camera_request["id"], "original-photo")
         self.assertEqual(obs.analysis_status, "awaiting_confirmation")
         self.assertTrue(any(e.get("type") == "camera_prepare" for e in self.phone.events))
 
-    async def test_mistaken_new_observation_cannot_discard_ready_unread_focus(self):
+    async def test_new_observation_alias_starts_new_target_without_wording_whitelist(self):
         obs = await self.photo()
-        self.c.turn_question = "What is that?"
-        result = await self.c.tool("new_observation", {"group": "Aves"})
-        self.assertEqual(self.c.focus, obs.id)
-        self.assertEqual(obs.status, "open")
-        self.assertEqual(obs.analysis_status, "ready")
+        obs.hint = "Previous eagle's head"
+        self.c.turn_question = "I saw a plant."
+        result = await self.c.tool("new_observation", {"group": "Plantae"})
+        self.assertTrue(result["ok"])
+        fresh = self.assert_fresh_subject(obs)
+        self.assertEqual(fresh.group, "Plantae")
         self.assertEqual(obs.analysis_request_id, "original-photo")
-        self.assertIsNone(self.c.camera_request)
-        self.assert_no_camera_commands()
-        self.assertFalse(result["ok"])
-        self.assertTrue(result["suppress_answer"])
-        self.assertTrue(result["requires_clarification"])
-        self.assertTrue(any(p[0] == "feedback" and p[1]["kind"] == "clarify" for p in self.c.pending))
+        self.assertEqual(obs.fused[0]["sci"], "Haliaeetus leucocephalus")
         self.c.generate.assert_not_awaited()
 
-    async def test_unproven_new_observation_route_clarifies_without_reading_old_species(self):
+    async def test_model_selected_new_target_prepares_plant_without_old_species_answer(self):
         obs = await self.photo()
-        await self.route("What is that?", "new_observation")
-        self.assertEqual(self.c.focus, obs.id)
-        self.assertEqual(obs.analysis_status, "ready")
+        obs.hint = "Old eagle on a branch"
+        await self.route("I saw a plant, but I don't know what.", "look", {
+            "target": "new", "group": "Plantae"})
+        fresh = self.assert_fresh_subject(obs)
+        self.assertEqual(fresh.group, "Plantae")
         self.assertEqual(obs.image_revision, 1)
-        self.assertIsNone(self.c.camera_request)
-        self.assert_no_camera_commands()
-        self.assertTrue(any(p[0] == "feedback" and p[1]["kind"] == "clarify" for p in self.c.pending))
         self.c.generate.assert_not_awaited()
         self.c.speak_expert.assert_not_awaited()
 
@@ -378,10 +389,10 @@ class TaskStatusTests(unittest.IsolatedAsyncioTestCase):
         self.c.generate.assert_not_awaited()
         self.c.speak_expert.assert_not_awaited()
 
-    async def test_status_wording_cannot_explain_a_completed_result_even_if_router_requests_it(self):
+    async def test_model_selected_status_tool_cannot_explain_a_completed_result(self):
         job = self.research("R1", status="completed", stage="completed")
         self.c.investigation_offer_ids = ["R1"]
-        await self.route("What is the status of R1?", "get_investigations", {"id": "R1", "explain": True})
+        await self.route("What is the status of R1?", "get_task_status", {"id": "R1"})
         self.assertFalse(job.announced)
         self.assertEqual(self.c.investigation_offer_ids, ["R1"])
         self.assert_no_findings(self.c.speak_expert.await_args.args[0])
@@ -397,17 +408,15 @@ class TaskStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(job.announced)
         self.assertEqual(self.c.investigation_offer_ids, [])
 
-    async def test_logged_new_subject_overrides_old_photo_routes_without_inheriting_evidence(self):
-        for wrong_tool in ("look", "get_observation", "speak"):
-            with self.subTest(wrong_tool=wrong_tool):
+    async def test_new_target_routes_do_not_inherit_previous_evidence(self):
+        for chosen_tool, args in (("new_observation", {}), ("look", {"target": "new"})):
+            with self.subTest(chosen_tool=chosen_tool):
                 old = await self.photo()
                 old.hint = "Old eagle's bill on the original branch"
                 old_vision = ("vision", {"obs": old.id, "image_revision": old.image_revision,
                                          "request_id": old.analysis_request_id}, None)
                 self.c.pending.append(old_vision)
-                args = {"hint": old.hint} if wrong_tool == "look" else (
-                    {"reason": "Help identify the animal"} if wrong_tool == "speak" else {})
-                await self.route(self.NEW_SUBJECT, wrong_tool, args)
+                await self.route(self.NEW_SUBJECT, chosen_tool, args)
                 fresh = self.assert_fresh_subject(old)
                 self.assertNotIn(old_vision, self.c.pending)
                 self.assertEqual(old.status, "discarded")
@@ -422,11 +431,11 @@ class TaskStatusTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(fresh.fused, [])
 
     async def test_bare_generic_new_animal_notice_cannot_reuse_the_previous_photo(self):
-        for chosen_tool in ("new_observation", "look", "get_observation"):
+        for chosen_tool, args in (("new_observation", {}), ("look", {"target": "new"})):
             with self.subTest(chosen_tool=chosen_tool):
                 old = await self.photo()
                 old.hint = "Old chicken on the previous screen"
-                await self.route("I saw another animal.", chosen_tool)
+                await self.route("I saw another animal.", chosen_tool, args)
                 self.assert_fresh_subject(old)
                 self.assertEqual(old.status, "discarded")
                 self.assertEqual(old.image_revision, 1)
@@ -472,17 +481,16 @@ class TaskStatusTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_direct_photo_request_on_ready_result_prepares_retake_without_old_identity_answer(self):
         for text in ("Take a photo for me.", "Take the photo for me.", "Take photo for me."):
-            for wrong_tool in ("look", "get_observation", "speak"):
-                with self.subTest(text=text, wrong_tool=wrong_tool):
-                    old = await self.photo()
-                    await self.route(text, wrong_tool, {"reason": "Photo requested"} if wrong_tool == "speak" else {})
-                    self.assertEqual(self.c.focus, old.id)
-                    self.assertIsNotNone(self.c.camera_request)
-                    self.assertNotEqual(self.c.camera_request["id"], "original-photo")
-                    self.assertEqual(self.c.camera_request["phase"], "opening")
-                    self.assertEqual(old.analysis_status, "awaiting_confirmation")
-                    self.assertTrue(any(e.get("type") == "camera_prepare" for e in self.phone.events))
-                    self.assertFalse(any(e.get("type") == "capture" for e in self.phone.events))
+            with self.subTest(text=text):
+                old = await self.photo()
+                await self.route(text, "look", {"target": "current"})
+                self.assertEqual(self.c.focus, old.id)
+                self.assertIsNotNone(self.c.camera_request)
+                self.assertNotEqual(self.c.camera_request["id"], "original-photo")
+                self.assertEqual(self.c.camera_request["phase"], "opening")
+                self.assertEqual(old.analysis_status, "awaiting_confirmation")
+                self.assertTrue(any(e.get("type") == "camera_prepare" for e in self.phone.events))
+                self.assertFalse(any(e.get("type") == "capture" for e in self.phone.events))
         self.c.generate.assert_not_awaited()
         self.c.speak_expert.assert_not_awaited()
 
@@ -491,7 +499,7 @@ class TaskStatusTests(unittest.IsolatedAsyncioTestCase):
         old.hint = "The original eagle's tail"
         old.status, old.count = "confirmed", 2
         before = deepcopy(old.payload())
-        await self.route(self.NEW_SUBJECT, "look")
+        await self.route(self.NEW_SUBJECT, "look", {"target": "new"})
         self.assert_fresh_subject(old)
         self.assertEqual(old.payload(), before)
         self.assertEqual(old.status, "confirmed")
@@ -504,7 +512,7 @@ class TaskStatusTests(unittest.IsolatedAsyncioTestCase):
         job = self.research("R1", stage="analyzing")
         job.observation = deepcopy(old.payload())
         snapshot = deepcopy(job.observation)
-        await self.route(self.NEW_SUBJECT, "get_observation")
+        await self.route(self.NEW_SUBJECT, "look", {"target": "new"})
         self.assert_fresh_subject(old)
         self.assertIs(self.c.investigations.jobs["R1"], job)
         self.assertEqual((job.status, job.stage), ("running", "analyzing"))
@@ -536,7 +544,7 @@ class TaskStatusTests(unittest.IsolatedAsyncioTestCase):
             work = asyncio.create_task(self.upload(old_request, jpeg))
             try:
                 self.assertTrue(await asyncio.to_thread(started.wait, 1))
-                await self.route(self.NEW_SUBJECT, "look")
+                await self.route(self.NEW_SUBJECT, "look", {"target": "new"})
                 fresh = self.assert_fresh_subject(old_obs)
                 newer = self.c.camera_request
                 rejected = await self.upload(old_request, jpeg)
@@ -569,7 +577,7 @@ class TaskStatusTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(await asyncio.to_thread(started.wait, 1))
                 self.assertEqual(obs.analysis_stage, "recognizing")
                 self.assertEqual(request["phase"], "classifying")
-                await self.route("Check out the identification process.", "look")
+                await self.route("Check out the identification process.", "get_task_status", {"scope": "camera"})
                 self.assertIs(self.c.camera_request, request)
                 status = await self.c.task_status({"scope": "camera"})
                 self.assertEqual(status["tasks"][0]["stage"], "recognizing")
@@ -612,7 +620,7 @@ class TaskStatusTests(unittest.IsolatedAsyncioTestCase):
             try:
                 self.assertTrue(await asyncio.to_thread(started.wait, 1))
                 self.c.turn_question = "Look again, take another photo."
-                await self.c.tool("look", {})
+                await self.c.tool("look", {"target": "current"})
                 newer = self.c.camera_request
                 self.assertIsNot(newer, old)
                 self.assertEqual(obs.analysis_request_id, newer["id"])

@@ -32,7 +32,6 @@ from expert import NaturalistExpert, revision as expert_revision
 from investigations import ACTIVE, InvestigationQueue, QueueFull
 from tool_feedback import TOOLS as FEEDBACK_TOOLS, recording as feedback_recording
 from route_safety import route_guard
-from task_status import parse_status_query, explicit_retake, new_subject_request
 
 MODEL = "higgs-realtime-1.5-preview"
 SR = 48000
@@ -224,13 +223,15 @@ OBSERVATION = {"type": "object", "properties": {
 WRITE_TOOLS = ("add_observation", "add_observations", "accept_suggestions",
                "dismiss_suggestions", "set_count", "remove_observation", "confirm_observation")
 TOOLS = [
-    tool_schema("look", "Prepare the camera for visual identification ('what is that?'). The phone opens a preview and asks the user to say start; no photo before confirmation. Set group for nonbirds.", {"hint": NAME, "group": {"type": "string", "enum": GROUPS}}),
-    tool_schema("get_observation", "Read focus evidence for pronouns and follow-up naturalist questions."),
+    tool_schema("look", "Prepare a photo: target=new identifies a new unknown organism with independent evidence; target=current takes another photo of the existing organism. Always wait for Start/Identify before capture. Set group for nonbirds. To read an existing result use get_observation; to check progress use get_task_status.",
+                {"target": {"type": "string", "enum": ["current", "new"]},
+                 "hint": NAME, "group": {"type": "string", "enum": GROUPS}}, ("target",)),
+    tool_schema("get_observation", "Read the existing focus evidence/identification without taking a new photo. For progress use get_task_status; for species facts or comparisons use ask_expert."),
     tool_schema("get_task_status", "Read actual photo identification or expert investigation progress without restarting work or explaining results. Use for identification process, status, progress, is it done; select a task when ambiguous.",
                 {**TASK_SELECTOR, "scope": {"type": "string", "enum": ["auto", "camera", "investigations", "all"]}}),
     tool_schema("confirm_observation", "Add it / log it / two of them: confirm the focus, not a new named sighting. No speech.", {"count": COUNT, "notes": NAME}),
     tool_schema("discard_observation", "Discard the focus; do not log it."),
-    tool_schema("new_observation", "Look at a different organism: start a new focus and request camera frames.", {"group": {"type": "string", "enum": GROUPS}}),
+    tool_schema("new_observation", "Start identifying a new unknown organism, even when the user does not say new/another. Creates independent evidence and prepares a preview; waits for Start/Identify. Set group for nonbirds. Equivalent to look(target=new).", {"group": {"type": "string", "enum": GROUPS}}),
     tool_schema("describe", "Attach a user description to the focus; resolve only explicit species names.", {"text": NAME, "name": NAME}, ("text",)),
     tool_schema("ask_expert", "Start a background investigation about the current focus: comparisons, conflicting evidence, diet, habitat or behaviour. Returns immediately; never log.", {"question": NAME}, ("question",)),
     tool_schema("get_investigations", "Read investigations or explain a requested result. Prefer get_task_status for progress. Set explain=true ONLY when the user asks to hear/explain a result or accepts the latest explanation offer. Use id (R1 etc.) or first/latest/all.",
@@ -261,7 +262,10 @@ INSTRUCTIONS = """You are a concise hands-free birding/naturalist companion with
 Reply in English by default; the user may speak Chinese: answer in the language of the question.
 Classify ONLY the latest user turn. Ordinary off-topic remarks/questions to a companion,
 self-talk, phone calls, noise and pet-dog chatter are NOT addressed to you: call ignore.
-Nature sighting reports are addressed even without a wake word: call add_observation.
+Named species sighting reports are addressed even without a wake word: call add_observation.
+An unknown organism category (animal, plant, flower, insect, etc.) is not an identified
+species to log. A user reporting an unknown organism or asking to identify it needs
+a new observation/preview, including when an old photo is still in the context.
 Multiple species in one report: call add_observations with all items in ONE call.
 When the latest assistant question asks to log BirdNET suggestions: yes / yes both / add them all -> accept_suggestions
 with omitted species (all pending); just the cardinal -> accept_suggestions with that species.
@@ -270,14 +274,22 @@ Only accept explicit user confirmation, never a BirdNET notification itself.
 For total count corrections use set_count; for deletion use remove_observation.
 Never claim to have logged anything without a successful tool call. Logging has an earcon,
 not speech. Never give delayed logging acknowledgements, including "I've logged X".
-For "what's that?", "look again", or visual identification call look, NOT speak.
+Choose the operation semantically from the latest request and the supplied state.
+Do not require particular command words or repeat an old species for a newly reported subject.
+For visual identification call look with an explicit target, NOT speak:
+target=new for a newly encountered unknown organism; target=current for another
+photo of the same organism. A different group starts independent evidence.
+Use get_observation for a question about the existing photo/result without a new
+capture; use get_task_status for progress. Existing evidence does not prevent a
+new subject or a requested retake. If the referent is genuinely unclear, ask a
+short clarifying question with speak; do not guess from an old identification.
 For task progress/status, including "Check out the identification process", use
 get_task_status. This reads the existing photo/investigation; never call look,
 new_observation or ask_expert to check progress. Completion is still an existing
 task, including before its result is spoken. Only an explicit request for a new
 photo, look again, retake or different subject may restart photo preparation.
-If the latest camera photo is still being captured/analyzed, read get_observation
-for its status instead of starting over, unless the user explicitly asks to retake.
+If the latest camera photo is still being captured/analyzed, use get_task_status
+for its status. Only a requested retake or new subject may replace that capture.
 Look prepares the camera; it never takes a photo until the camera is ready and
 the user explicitly says start/开始 or taps Identify. Never claim a photo has
 already been taken while camera confirmation is pending.
@@ -306,11 +318,11 @@ their findings without the user's request or acceptance.
 "Try R1 again" / "继续查第一个" uses manage_investigation(action=retry).
 An explicit request to start another investigation uses ask_expert, not a status read.
 Never invent progress, percentages, results or completion times.
-For a different organism ("look at a different bird") call new_observation, even if
-an earlier focus exists. "Look again" keeps that focus with look. Discard unwanted IDs with discard_observation.
-"I found another animal. Could you help me check it out?" requests a NEW subject:
-call new_observation, never answer using the previous subject's photo or candidate.
-Prepare the new camera preview and wait for Start/Identify before photographing it.
+For a newly encountered organism call new_observation or look(target=new), even if
+an earlier focus exists. This includes ordinary reports with an indefinite noun,
+without the words new/another. Set the appropriate group, such as Plantae for plants.
+"Look again" keeps that focus with look(target=current). Discard unwanted IDs with discard_observation.
+Prepare the preview and wait for Start/Identify before photographing it.
 Never invent sightings or identify from insufficient evidence; request camera evidence with look.
 Questions about birds heard, sounds, calls, or 'anything else' use recent_sounds(seconds=15). Only explicit questions about logged sightings/counts use get_checklist.
 Greetings, mic checks and general questions addressed to you use speak; sound/checklist questions use their read tools.
@@ -322,7 +334,8 @@ Questions such as "Did you hear them?" never approve pending suggestions: use re
 """
 ROUTING = INSTRUCTIONS + """
 ROUTING PHASE ONLY: select exactly ONE function call with NO text or audio.
-Chatter -> ignore; sighting -> add_observation; addressed question -> speak or a read tool.
+Chatter -> ignore; named species sighting -> add_observation; unknown subject ->
+new_observation/look(target=new); addressed question -> the appropriate tool.
 Earlier tool outputs are already handled. Do not invent sightings from questions.
 [TAP] means the next utterance is addressed to you.
 """
@@ -792,30 +805,13 @@ class Session:
                 answer += f" 另有 {len(rows) - 3} 项可在屏幕查看。" if zh else f" There are {len(rows) - 3} more tasks."
         return {"ok": True, "answer": answer, "tasks": rows, "requires_selection": ambiguous}
 
-    def status_selector(self, text):
-        selector = parse_status_query(str(text))
-        if selector is not None:
-            self.task_status_offer = None
-            return selector
+    def task_status_context(self):
+        """Expose a live clarification to the semantic router, without parsing speech."""
         offer = self.task_status_offer
         if (offer and time.monotonic() - offer["at"] <= 30
                 and self.normalized_words(self.last_assistant_text) == self.normalized_words(offer["question"])):
-            value = re.sub(r"\br\s+(\d+)\b", r"r\1", " ".join(self.normalized_words(str(text))))
-            rows = offer["tasks"]
-            if re.fullmatch(r"(?:the )?(?:photo|camera|identification|photo identification)|照 片|相 机|照 片 识 别", value):
-                return {"scope": "camera"}
-            if value in ("all", "both", "all of them", "全 部", "都 要"):
-                return {"scope": "all"}
-            for row in rows:
-                if value in (row["id"].lower(), "investigation " + row["id"].lower(),
-                             "调 查 " + row["id"].lower()):
-                    return {"id": row["id"]}
-            if value in ("first", "the first", "the first one", "第 一 个"):
-                return {"id": rows[0]["id"]}
-            if value in ("last", "the last one", "latest", "最 后 一 个"):
-                return {"id": rows[-1]["id"]}
-        # A different user turn or a newer assistant offer ends this clarification.
-        self.task_status_offer = None
+            return {"question": offer["question"],
+                    "tasks": [{"id": r["id"], "kind": r["kind"]} for r in offer["tasks"]]}
         return None
 
     async def speak_task_status(self, args):
@@ -864,8 +860,19 @@ class Session:
                 result = {"ok": False}  # A full research queue preserves basic Look.
             if result.get("ok"):
                 self.vision_answered.add(identity)
-                if self.may_speak() and self.input_revision == input_revision and self.focus == obs.id:
-                    await self.speak_expert(result["answer"])
+                def current():
+                    return (self.input_revision == input_revision and self.focus == obs.id
+                            and obs.status == "open" and obs.analysis_status == "ready"
+                            and (obs.id, obs.image_revision) == identity)
+                if self.may_speak() and current():
+                    # This is a background event, possibly after a progress
+                    # answer consumed the latest user input. Give the speech
+                    # response its own event instead of re-answering that turn.
+                    await self.inject("[VISION_INVESTIGATION_SCHEDULED] " + json.dumps({
+                        "observation_id": obs.id, "image_revision": obs.image_revision,
+                        "answer": result["answer"]}, ensure_ascii=False))
+                    if current():
+                        await self.speak_expert(result["answer"], guard=current)
                 return
         if (self.focus == obs.id and obs.status == "open" and self.may_speak()
                 and self.input_revision == input_revision):
@@ -929,7 +936,9 @@ class Session:
         await self.expire_focus()
         obs = self.observations.get(self.focus)
         if create and (not obs or obs.status != "open"):
-            obs = await self.new_focus()
+            # A confirmed entry stays immutable; another photo opens a record
+            # in the same category instead of silently defaulting back to birds.
+            obs = await self.new_focus(obs.group if obs else "Aves")
         if obs:
             obs.touched = time.monotonic()
         return obs
@@ -964,6 +973,11 @@ class Session:
     async def request_look(self, hint="", group=None, *, confirmed=False, open_id=None):
         if group is not None and group not in GROUPS:
             raise ValueError("invalid iconic group")
+        # A category change is a real evidence boundary, regardless of whether it
+        # came from voice, the preview selector or the Identify button.
+        active = self.observations.get(self.focus)
+        if active and group is not None and active.group != group:
+            await self.new_focus(group)
         await self.cancel_camera_request()
         self.pending = deque(p for p in self.pending if p[0] != "vision")
         obs = await self.current_focus(create=True)
@@ -1094,7 +1108,7 @@ class Session:
             await self.play_feedback("camera-taking", language=request["language"],
                 guard=lambda: self.camera_request is request and request["phase"] == "starting")
         known = {d.id for d in obs.detections}
-        for stamp, detection in self.sound_windows:
+        for stamp, detection in (self.sound_windows if obs.group == "Aves" else ()):
             if abs(time.monotonic() - stamp) <= 10 and detection.id not in known:
                 obs.detections.append(detection)
         # Camera capture must not wait for the first BirdNET/range-model load.
@@ -1417,6 +1431,23 @@ class Session:
         return {"focus": self.focus, "image_revision": obs.image_revision if obs else None,
                 "camera": self.camera_request["id"] if self.camera_request else None}
 
+    def camera_route_current(self, name, args):
+        """Validate ownership of a semantic camera action, never its wording."""
+        if self.turn_revision is not None and self.turn_revision != self.input_revision:
+            return False
+        if self.turn_context is None:
+            return True
+        current = self.input_context()
+        if self.turn_context["focus"] != current["focus"]:
+            return False
+        if self.turn_context["camera"] == current["camera"]:
+            return True
+        obs = self.observations.get(self.focus)
+        # Completing the same capture is progress, not a new user operation.
+        return (current["camera"] is None and obs is not None
+                and obs.analysis_status == "ready"
+                and obs.analysis_request_id == self.turn_context["camera"])
+
     def queue_feedback(self, kind, *, status=None):
         value = {"kind": kind, "revision": self.input_revision,
                  "language": "zh" if self.chinese(self.turn_question) else "en",
@@ -1451,6 +1482,7 @@ class Session:
     def config(self, phase):
         focus = self.observations.get(self.focus)
         focus_context = ({"id": focus.id, "status": focus.status, "top3": focus.fused[:3],
+                          "group": focus.group,
                           "analysis_status": focus.analysis_status,
                           "uncertain": focus.uncertain,
                           "image_detections": sum(d.kind == "image" for d in focus.detections)}
@@ -1474,6 +1506,8 @@ class Session:
                                  + json.dumps(self.camera_request)
                                  + "\nCurrent task status (authoritative stages, no findings; never restart to check progress): "
                                  + json.dumps(self.task_status_snapshot())
+                                 + "\nActive task-selection question (a short reply selects one of these real IDs; otherwise null): "
+                                 + json.dumps(self.task_status_context())
                                  + "\nLatest investigation explanation offer (accept only if it is the latest assistant question): "
                                  + json.dumps(self.investigation_offer_ids)
                                  + "\nInvestigations (context only; never invent progress): "
@@ -1823,13 +1857,8 @@ class Session:
                         self.log("route_skipped_filler")
                         await self.delete_items(self.turn_items)
                         continue
-                    selector = self.status_selector(self.turn_question)
-                    if selector is not None:
-                        self.log("task_status_query", source="direct", selector=selector)
-                        await self.speak_task_status(selector)
-                    else:
-                        response = await self.generate("route")
-                        await self.finish_route(response)
+                    response = await self.generate("route")
+                    await self.finish_route(response)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -1898,7 +1927,6 @@ class Session:
             return
         call = calls[0]
         name = call["name"]
-        selector = self.status_selector(self.turn_question)
         words = " ".join(self.normalized_words(str(self.turn_question)))
         idle_start = (not self.camera_request and words in ("start", "start please", "开 始", "开 始 吧"))
         if idle_start:
@@ -1906,34 +1934,6 @@ class Session:
             self.queue_feedback("clarify")
             call = {**call, "name": "ignore", "arguments": "{}"}
             name = "ignore"
-        elif new_subject_request(str(self.turn_question)):
-            # New-target intent must be checked before protecting the previous
-            # photo. Preserve only a valid category, never its old hint/evidence.
-            try:
-                original_args = json.loads(call.get("arguments") or "{}")
-            except (ValueError, TypeError):
-                original_args = {}
-            group = original_args.get("group") if isinstance(original_args, dict) else None
-            self.log("new_subject_guard", requested_tool=name)
-            call = {**call, "name": "new_observation", "arguments": json.dumps({"group": group} if group in GROUPS else {})}
-            name = "new_observation"
-        elif selector is not None:
-            self.log("task_status_query", source="route_guard", requested_tool=name, selector=selector)
-            call = {**call, "name": "get_task_status", "arguments": json.dumps(selector)}
-            name = "get_task_status"
-        elif explicit_retake(str(self.turn_question)):
-            # Direct photo/retake requests execute camera control even if the
-            # model selected a read or speech tool. They keep this subject.
-            call = {**call, "name": "look"}
-            name = "look"
-        elif name == "look":
-            obs = self.observations.get(self.focus)
-            if obs and obs.analysis_status == "ready" and obs.image_revision > 0:
-                # A finished photo remains the current subject, including while
-                # its automatic answer or linked expert task waits for speech.
-                self.log("photo_reuse_guard", requested_tool=name, observation_id=obs.id)
-                call = {**call, "name": "get_observation", "arguments": "{}"}
-                name = "get_observation"
         try:
             args = json.loads(call.get("arguments") or "{}")
             if not isinstance(args, dict):
@@ -1942,6 +1942,10 @@ class Session:
                 raise ValueError("Unknown routed tool")
             if "group" in args and args["group"] not in GROUPS:
                 raise ValueError("invalid iconic group")
+            if name == "look" and args.get("target") not in ("current", "new"):
+                raise ValueError("look requires target=current or target=new")
+            if name == "look" and "hint" in args and not isinstance(args["hint"], str):
+                raise ValueError("look hint must be text")
             if name == "describe" and not isinstance(args.get("text"), str):
                 raise ValueError("describe requires text")
             if name == "recent_sounds" and not np.isfinite(float(args.get("seconds", 15))):
@@ -1951,6 +1955,8 @@ class Session:
             if ((name in WRITE_TOOLS or name == "discard_observation") and self.turn_context is not None
                     and self.turn_context != self.input_context()):
                 decision, reason = "clarify", "stale_write_context"
+            if name in ("look", "new_observation") and not self.camera_route_current(name, args):
+                decision, reason = "ignore", "stale_camera_context"
             if decision != "allow":
                 self.log("route_guard", requested_tool=name, decision=decision, reason=reason)
                 result = {"ok": False, "suppress_answer": True, "guard": reason}
@@ -1961,6 +1967,14 @@ class Session:
                     "output": json.dumps(result)}})
                 return
             await self.acknowledge_tool(name)
+            # Local feedback yields to microphone/UI events. Recheck ownership
+            # before a delayed route can replace a newer camera request.
+            if name in ("look", "new_observation") and not self.camera_route_current(name, args):
+                await self.rt_send({"type": "conversation.item.create", "item": {
+                    "type": "function_call_output", "call_id": call["call_id"],
+                    "output": json.dumps({"ok": False, "suppress_answer": True, "guard": "stale_camera_context"})}})
+                self.log("route_guard", requested_tool=name, decision="ignore", reason="stale_camera_context")
+                return
             self.tools_executed = True
             result = {"ok": True} if name == "ignore" else (
                 {"ready_to_answer": True, "reason": args.get("reason")} if name == "speak"
@@ -1993,6 +2007,9 @@ class Session:
             "output": json.dumps(result, ensure_ascii=False)}})
         self.log("tool", name=name, arguments=self.audit_args(call.get("arguments")), ok=result.get("ok", True))
         if result.get("suppress_answer"):
+            return
+        if name in ("look", "new_observation") and not result.get("ok"):
+            self.queue_feedback("clarify")
             return
         if name == "get_task_status" and not result.get("ok"):
             self.queue_feedback("clarify")
@@ -2339,25 +2356,17 @@ class Session:
         if name in ("get_investigations", "manage_investigation"):
             return await self.investigation_tool(name, args)
         if name == "look":
-            if new_subject_request(str(self.turn_question)):
-                return await self.tool("new_observation", {k: v for k, v in args.items() if k == "group"})
-            if (self.camera_request and self.camera_request["phase"] in ("capturing", "classifying")
-                    and not explicit_retake(str(self.turn_question))):
-                return {"ok": True, "analysis_pending": True,
-                        "analysis_status": self.observations[self.focus].analysis_status}
-            obs = self.observations.get(self.focus)
-            if obs and obs.analysis_status == "ready" and obs.image_revision > 0 and not explicit_retake(str(self.turn_question)):
-                return await self.task_status({"scope": "camera"})
+            target = args.get("target", "current")
+            if target not in ("current", "new"):
+                raise ValueError("invalid camera target")
+            if target == "new":
+                group = args.get("group", "Aves")
+                if group not in GROUPS:
+                    raise ValueError("invalid iconic group")
+                await self.new_focus(group)
+                return await self.request_look(args.get("hint", ""))
             return await self.request_look(args.get("hint", ""), args.get("group"))
         if name == "new_observation":
-            obs = self.observations.get(self.focus)
-            if (obs and obs.analysis_request_id
-                    and obs.analysis_status in ("ready", "awaiting_confirmation", "capturing", "analyzing")
-                    and not (explicit_retake(str(self.turn_question)) or new_subject_request(str(self.turn_question)))):
-                # Unclear target changes need clarification, not an answer
-                # using the old animal's evidence or a fictional camera state.
-                self.queue_feedback("clarify")
-                return {"ok": False, "suppress_answer": True, "requires_clarification": True}
             group = args.get("group", "Aves")
             if group not in GROUPS:
                 raise ValueError("invalid iconic group")
@@ -2615,7 +2624,7 @@ class Session:
                 self.sound_windows.append((stamp, detection))
                 await self.expire_focus()
                 obs = self.observations.get(self.focus)
-                if obs and obs.status == "open" and abs(stamp - obs.touched) <= 10:
+                if obs and obs.group == "Aves" and obs.status == "open" and abs(stamp - obs.touched) <= 10:
                     obs.detections.append(detection)
                     await self.refusion(obs, touch=False)
             await self.flush_pending()
@@ -2721,9 +2730,12 @@ class Session:
             if client is None or client is not self.mic:
                 raise ValueError("Only the current microphone controls its camera")
             if ty == "camera_ready":
+                if not event.get("request_id"):
+                    self.input_revision += 1  # A manually opened/changed preview.
                 await self.camera_ready(event)
             elif self.camera_request and (event.get("request_id") == self.camera_request["id"]
                     or (event.get("open_id") and event["open_id"] == self.camera_request.get("open_id"))):
+                self.input_revision += 1
                 await self.cancel_camera_request()
             return
         if ty in ("hello", "location"):

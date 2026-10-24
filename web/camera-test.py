@@ -64,11 +64,14 @@ def serve(port):
                 await self.worker_release.wait()
                 return {"status": "completed", "output": [{"type": "function_call",
                     "name": "ignore", "call_id": "fixture-resumed", "arguments": "{}"}]}
-            if phase == "route" and self.turn_question in ("What is that?", "Look again.",
-                    "I found another animal. Could you help me check it out?"):
+            if phase == "route" and self.turn_question in ("What is that?", "Look again."):
                 return {"status": "completed", "output": [{"type": "function_call",
                     "name": "look", "call_id": "fixture-look-" + uuid.uuid4().hex,
-                    "arguments": "{}"}]}
+                    "arguments": '{"target":"current"}'}]}
+            if phase == "route" and self.turn_question == "I found another animal. Could you help me check it out?":
+                return {"status": "completed", "output": [{"type": "function_call",
+                    "name": "look", "call_id": "fixture-new-target-" + uuid.uuid4().hex,
+                    "arguments": '{"target":"new"}'}]}
             if phase == "route" and self.turn_question == "I saw another animal.":
                 return {"status": "completed", "output": [{"type": "function_call",
                     "name": "new_observation", "call_id": "fixture-new-subject-" + uuid.uuid4().hex,
@@ -77,10 +80,17 @@ def serve(port):
                 await self.phone_json({"type": "fixture_polite_photo_routed"})
                 return {"status": "completed", "output": [{"type": "function_call",
                     "name": "look", "call_id": "fixture-photo-" + uuid.uuid4().hex,
-                    "arguments": "{}"}]}
+                    "arguments": '{"target":"current"}'}]}
+            if phase == "route" and self.turn_question == "Start.":
+                return {"status": "completed", "output": [{"type": "function_call",
+                    "name": "ignore", "call_id": "fixture-idle-start", "arguments": "{}"}]}
             if phase == "route" and self.turn_question == "What do you think?":
                 return {"status": "completed", "output": [{"type": "function_call",
                     "name": "get_observation", "call_id": "fixture-progress", "arguments": "{}"}]}
+            if phase == "route" and self.turn_question == "Check out the identification process.":
+                await self.phone_json({"type": "fixture_status_routed"})
+                return {"status": "completed", "output": [{"type": "function_call",
+                    "name": "get_task_status", "call_id": "fixture-status", "arguments": '{"scope":"camera"}'}]}
             if phase == "route" and self.turn_question == "Second.":
                 return {"status": "completed", "output": [{"type": "function_call",
                     "name": "confirm_observation", "call_id": "fixture-ambiguous", "arguments": '{"count":1}'}]}
@@ -333,6 +343,7 @@ async def test(port, cdp):
         status_encodes = await js("window.__encodes.length")
         await voice_input("fixture:status")
         await until("window.__messages.slice(" + str(status_marker) + ").some(e=>e.text===\"The photo has been received; the image model is identifying the subject.\")")
+        assert await js("window.__messages.slice(" + str(status_marker) + ").some(e=>e.type==='fixture_status_routed')")
         assert await js("window.__uploads.length") == status_uploads
         assert await js("window.__encodes.length") == status_encodes
         assert not await js("window.__messages.slice(" + str(status_marker) + ").some(e=>e.type==='camera_prepare' || e.type==='capture' || e.text==='Camera ready. Say start to take a photo.')")
@@ -352,6 +363,7 @@ async def test(port, cdp):
         ready_messages = await js("window.__messages.slice(" + str(ready_marker) + ")")
         status_done = next(i for i, e in enumerate(ready_messages)
                            if e.get("text") == "Photo identification is complete; the result is ready.")
+        assert any(e.get("type") == "fixture_status_routed" for e in ready_messages)
         auto_answer = next(i for i, e in enumerate(ready_messages) if e.get("type") == "fixture_visual_answer")
         assert status_done < auto_answer
         assert not any(e.get("type") in ("camera_prepare", "capture")
@@ -541,8 +553,8 @@ async def test(port, cdp):
         await until("document.querySelectorAll('.investigation').length === 0 && !document.getElementById('display-status').textContent.includes('R3')")
         results["resetClearsInvestigations"] = True
         # Reproduce the logged new-animal request against a finished Bald Eagle
-        # photo. The model deliberately chooses look; the server must create a
-        # fresh subject and keep the usual ready -> Start camera handshake.
+        # photo. The mocked semantic router chooses look(target=new); the server
+        # must create a fresh subject and retain the ready -> Start handshake.
         new_subject_session = "new-subject-" + uuid.uuid4().hex[:8]
         await call("Emulation.setDeviceMetricsOverride", width=390, height=844, deviceScaleFactor=1, mobile=True)
         await call("Page.navigate", url=origin + "/?session=" + new_subject_session)

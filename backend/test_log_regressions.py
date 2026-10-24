@@ -154,13 +154,19 @@ class LoggedFailureTests(unittest.IsolatedAsyncioTestCase):
         await self.c.request_look()
         request = self.c.camera_request
         request["phase"] = "classifying"
-        self.c.observations[self.c.focus].analysis_status = "analyzing"
-        await self.route("What is this?", "look")
+        obs = self.c.observations[self.c.focus]
+        obs.analysis_status, obs.analysis_stage = "analyzing", "recognizing"
+        self.c.speak_expert = AsyncMock(return_value={"status": "completed"})
+        self.c.generate = AsyncMock()
+        await self.route("How is identification going?", "get_task_status", {"scope": "camera"})
         self.assertIs(self.c.camera_request, request)
         self.assertEqual(request["phase"], "classifying")
-        self.assertTrue(any(p[0] == "feedback" for p in self.c.pending))
-        await self.route("Look again, take another photo.", "look")
+        self.c.speak_expert.assert_awaited_once()
+        self.c.generate.assert_not_awaited()
+        self.assertEqual(len([e for e in self.phone.events if e["type"] == "camera_prepare"]), 1)
+        await self.route("Look again, take another photo.", "look", {"target": "current"})
         self.assertIsNot(self.c.camera_request, request)
+        self.assertEqual(self.c.focus, obs.id)
 
     async def test_ready_query_prevents_duplicate_automatic_readout(self):
         obs = await self.focus()

@@ -847,11 +847,11 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         await second
 
     async def test_focus_capture_expiry_and_confirmed_retention(self):
-        await self.route("look", {"hint": "bill"})
+        await self.route("look", {"target": "current", "hint": "bill"})
         obs = self.c.observations[self.c.focus]
         self.assertTrue(any(e["type"] == "camera_prepare" and e["obs"] == obs.id and e["hint"] == "bill" for e in self.phone.events))
         self.assertFalse(any(e["type"] == "capture" for e in self.phone.events))
-        await self.route("look")
+        await self.route("look", {"target": "current"})
         self.assertEqual(self.c.focus, obs.id)
         obs.touched -= 121
         await self.c.expire_focus()

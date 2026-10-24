@@ -37,7 +37,7 @@ class FeedbackTests(unittest.IsolatedAsyncioTestCase):
             return {"ok": True, "waiting_for_frames": True}
         self.c.tool = tool
         response = {"status": "completed", "output": [{"type": "function_call", "name": "look",
-                    "call_id": "look-1", "arguments": "{}"}]}
+                    "call_id": "look-1", "arguments": '{"target":"current"}'}]}
         work = asyncio.create_task(self.c.finish_route(response))
         try:
             await asyncio.wait_for(started.wait(), 1)
@@ -163,7 +163,7 @@ class FeedbackTests(unittest.IsolatedAsyncioTestCase):
                 "transcript": text, "item_id": text})
             self.phone.send_bytes.assert_not_awaited()
             self.c.pending.clear()
-            await self.route(text, name)
+            await self.route(text, name, '{"target":"current"}' if name == "look" else "{}")
         self.phone.send_bytes.assert_not_awaited()
         self.c.tool.assert_not_awaited()
         self.c.generate.assert_not_awaited()
@@ -188,7 +188,7 @@ class FeedbackTests(unittest.IsolatedAsyncioTestCase):
         self.c.tool = AsyncMock()
         self.c.generate = AsyncMock()
         for name, args in (("look", "null"), ("look", "[]"), ("look", "broken-json"),
-                           ("look", '{"group":"invalid"}'), ("describe", "{}"),
+                           ("look", '{"target":"current","group":"invalid"}'), ("describe", "{}"),
                            ("recent_sounds", '{"seconds":"garbage"}'),
                            ("recent_sounds", '{"seconds":null}'),
                            ("recent_sounds", '{"seconds":NaN}'),
@@ -197,7 +197,7 @@ class FeedbackTests(unittest.IsolatedAsyncioTestCase):
                            ("speak", '{"reason":"unintelligible filler; ignore per routing rules"}')):
             await self.route("Second.", name, args)
         for status in ("cancelled", "failed", "deferred"):
-            await self.route("What is that?", "look", status=status)
+            await self.route("What is that?", "look", '{"target":"current"}', status=status)
         self.phone.send_bytes.assert_not_awaited()
         self.c.tool.assert_not_awaited()
 
@@ -206,7 +206,7 @@ class FeedbackTests(unittest.IsolatedAsyncioTestCase):
         self.c.generate = AsyncMock()
         self.c.turn_revision = self.c.input_revision
         self.c.input_revision += 1  # Another transcript arrived during routing.
-        await self.route("What is that?", "look")
+        await self.route("What is that?", "look", '{"target":"current"}')
         self.phone.send_bytes.assert_not_awaited()
         self.c.turn_revision = self.c.input_revision
         self.c.turn_stopped_at = s.time.monotonic() - 13
