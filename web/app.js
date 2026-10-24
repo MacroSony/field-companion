@@ -16,6 +16,14 @@
     earphones = localStorage.getItem('field-earphones') === 'true';
     firstAudioTip = localStorage.getItem('field-earphone-tip') !== 'seen';
   } catch (_) { /* Storage may be unavailable; speaker is the safe default. */ }
+  let selectedMic = {deviceId: '', label: 'Default'};
+  try {
+    const saved = JSON.parse(localStorage.getItem('field-microphone'));
+    if (typeof saved?.deviceId === 'string' && typeof saved?.label === 'string') selectedMic = saved;
+  } catch (_) { /* Storage is optional. */ }
+  let micSwitching = false, micRevision = 0, deviceRevision = 0;
+  let silentAudio, silentURL, toastTimer;
+  const headsetActions = ['play', 'pause', 'nexttrack', 'previoustrack'];
   let playbackReported = false;
   let socket, reconnectTimer, context, stream, capture, micSource, wakeLock;
   let nextPlaybackTime = 0, lastMeterAt = 0, resampler = null;
@@ -44,6 +52,7 @@
     if ($('earphone-tip')) $('earphone-tip').hidden = !firstAudioTip;
     $('tap').disabled = $('send').disabled = !state.connected;
     $('mic').disabled = !stream || !state.running;
+    if ($('mic-device')) $('mic-device').disabled = !capture || micSwitching || state.starting;
     $('mic').setAttribute('aria-pressed', String(state.paused));
     $('mic').setAttribute('aria-label', state.paused ? 'Resume microphone' : 'Pause microphone');
     $('mic-label').textContent = state.paused ? 'Resume' : 'Pause';
@@ -63,6 +72,147 @@
     connection.lastElementChild.textContent = state.connected ? 'Connected' : state.running ? 'Connecting' : 'Offline';
     if ($('display-status')) $('display-status').textContent = `${state.connected ? '● Live' : '○ Connecting'} · ${playing ? 'Assistant speaking' : 'Session ' + session}`;
     document.querySelectorAll('.counter button, .delete-button').forEach(button => { button.disabled = !state.connected; });
+  }
+
+  function saveMic(deviceId, label) {
+    selectedMic = {deviceId, label: label || (deviceId ? 'Microphone' : 'Default')};
+    try { localStorage.setItem('field-microphone', JSON.stringify(selectedMic)); } catch (_) {}
+  }
+  function captureSettings() {
+    const line = $('capture-settings');
+    if (!line) return;
+    const track = stream?.getAudioTracks()[0];
+    const rate = context?.sampleRate ?? 'unavailable';
+    if (!track) { line.textContent = `Capture: ${micSwitching ? 'switching…' : 'off'} · AudioContext: ${rate} Hz`; return; }
+    const settings = track.getSettings();
+    const value = key => settings[key] === undefined ? 'not reported' : String(settings[key]);
+    line.textContent = `${track.label || 'Microphone'} · sampleRate: ${value('sampleRate')} Hz · channelCount: ${value('channelCount')} · echoCancellation: ${value('echoCancellation')} · noiseSuppression: ${value('noiseSuppression')} · autoGainControl: ${value('autoGainControl')} · deviceId: ${value('deviceId')} · AudioContext: ${rate} Hz`;
+  }
+  async function requestMic(deviceId) {
+    const audio = {echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1, sampleRate: 48000};
+    try {
+      return {input: await navigator.mediaDevices.getUserMedia({audio: {...audio, ...(deviceId ? {deviceId: {exact: deviceId}} : {})}}), deviceId};
+    } catch (error) {
+      if (!deviceId || !['NotFoundError', 'OverconstrainedError'].includes(error.name)) throw error;
+      notice('Selected microphone unavailable; using the default.');
+      return {input: await navigator.mediaDevices.getUserMedia({audio}), deviceId: ''};
+    }
+  }
+  async function refreshDevices() {
+    if (displayMode || !navigator.mediaDevices?.enumerateDevices) return;
+    const revision = ++deviceRevision;
+    try {
+      const devices = (await navigator.mediaDevices.enumerateDevices()).filter(device => device.kind === 'audioinput');
+      if (revision !== deviceRevision) return;
+      const missing = selectedMic.deviceId && !devices.some(device => device.deviceId === selectedMic.deviceId);
+      if (missing) saveMic('', 'Default');
+      const select = $('mic-device');
+      if (select) {
+        select.replaceChildren(new Option('System default', ''));
+        devices.filter(device => device.deviceId).forEach((device, index) => {
+          select.add(new Option(device.label || `Microphone ${index + 1}`, device.deviceId));
+        });
+        select.value = selectedMic.deviceId;
+      }
+      const selected = devices.find(device => device.deviceId === selectedMic.deviceId);
+      if (selected?.label) saveMic(selected.deviceId, selected.label);
+      const actualId = stream?.getAudioTracks()[0]?.getSettings().deviceId;
+      if (state.running && capture && !micSwitching && (missing || (actualId && !devices.some(device => device.deviceId === actualId)))) {
+        notice('Microphone disconnected; switching to the default.');
+        await switchMic('');
+      }
+      captureSettings(); updateControls();
+    } catch (error) { console.warn('Microphone list:', error); }
+  }
+  async function switchMic(deviceId) {
+    if (!state.running || !capture || micSwitching) return;
+    const revision = ++micRevision, activeContext = context, activeCapture = capture;
+    micSwitching = true;
+    micSource?.disconnect(); micSource = null;
+    stream?.getTracks().forEach(track => track.stop()); stream = null;
+    if (state.connected) send({type: 'mic', on: false});
+    captureSettings(); updateControls();
+    try {
+      const result = await requestMic(deviceId);
+      if (revision !== micRevision || !state.running || context !== activeContext) {
+        result.input.getTracks().forEach(track => track.stop()); return;
+      }
+      stream = result.input;
+      stream.getAudioTracks().forEach(track => { track.enabled = !state.paused; });
+      micSource = activeContext.createMediaStreamSource(stream);
+      micSource.connect(activeCapture);
+      resampler = activeContext.sampleRate === 48000 ? null : new LinearResampler(activeContext.sampleRate);
+      saveMic(result.deviceId, result.deviceId ? stream.getAudioTracks()[0].label : 'Default');
+      if (state.connected) send({type: 'mic', on: !state.paused});
+      notice(result.deviceId !== deviceId ? 'Selected microphone unavailable; using the default.' : 'Microphone changed.');
+    } catch (error) {
+      if (revision === micRevision) {
+        stream?.getTracks().forEach(track => track.stop()); stream = null;
+        notice(`Microphone: ${error.message}. Choose another input or use text.`);
+      }
+    } finally {
+      if (revision === micRevision) {
+        micSwitching = false;
+        captureSettings(); updateControls();
+        if ($('mic-device')) $('mic-device').value = selectedMic.deviceId;
+      }
+    }
+  }
+  function headsetToast(message) {
+    const toast = $('headset-toast');
+    if (!toast) return;
+    clearTimeout(toastTimer); toast.textContent = message; toast.hidden = false;
+    toastTimer = setTimeout(() => { toast.hidden = true; }, 3500);
+  }
+  function talk() {
+    if (context && context.state !== 'running') context.resume().catch(() => {});
+    flush(); send({type: 'tap'});
+  }
+  function startHeadsetSession() {
+    if (displayMode || !navigator.mediaSession) return;
+    try {
+      // Real zero-valued PCM, not muted media: no WebAudio connections or mic processing.
+      // Exceed Chromium's short-media threshold so Android can expose media controls.
+      const rate = 48000, samples = rate * 6, wav = new ArrayBuffer(44 + samples * 2), view = new DataView(wav);
+      const text = (at, value) => [...value].forEach((char, i) => view.setUint8(at + i, char.charCodeAt(0)));
+      text(0, 'RIFF'); view.setUint32(4, 36 + samples * 2, true); text(8, 'WAVE');
+      text(12, 'fmt '); view.setUint32(16, 16, true); view.setUint16(20, 1, true);
+      view.setUint16(22, 1, true); view.setUint32(24, rate, true); view.setUint32(28, rate * 2, true);
+      view.setUint16(32, 2, true); view.setUint16(34, 16, true); text(36, 'data'); view.setUint32(40, samples * 2, true);
+      silentURL = URL.createObjectURL(new Blob([wav], {type: 'audio/wav'}));
+      silentAudio = $('headset-audio') || document.createElement('audio');
+      silentAudio.loop = true; silentAudio.src = silentURL;
+      if (window.MediaMetadata) navigator.mediaSession.metadata = new MediaMetadata({title: 'Field Companion — listening'});
+      for (const action of headsetActions) {
+        try {
+          navigator.mediaSession.setActionHandler(action, () => {
+            if (!state.running) return;
+            talk(); headsetToast('Headset button → talk');
+            // Pause is a talk gesture here, not a command to pause the silent session.
+            navigator.mediaSession.playbackState = 'playing';
+            silentAudio?.play().catch(() => {});
+          });
+        } catch (_) { /* Individual actions are not supported by every browser. */ }
+      }
+      navigator.mediaSession.playbackState = 'playing';
+      silentAudio.play().catch(error => {
+        console.warn('Headset media session:', error);
+        if (state.running || state.starting) headsetToast('Headset playback blocked; use Tap to talk.');
+      });
+    } catch (error) { console.warn('Headset media session:', error); }
+  }
+  function stopHeadsetSession() {
+    silentAudio?.pause(); silentAudio?.removeAttribute('src'); silentAudio?.load(); silentAudio = null;
+    if (silentURL) URL.revokeObjectURL(silentURL);
+    silentURL = null;
+    if (navigator.mediaSession) {
+      for (const action of headsetActions) {
+        try { navigator.mediaSession.setActionHandler(action, null); } catch (_) {}
+      }
+      navigator.mediaSession.playbackState = 'none'; navigator.mediaSession.metadata = null;
+    }
+    clearTimeout(toastTimer);
+    if ($('headset-toast')) $('headset-toast').hidden = true;
   }
 
   // Stateful linear interpolation: preserve phase and the last sample across chunks.
@@ -416,6 +566,7 @@
     if (state.running || state.starting) return;
     state.starting = true; $('start').disabled = true;
     notice('Opening microphone…');
+    startHeadsetSession();
     if (navigator.geolocation) navigator.geolocation.getCurrentPosition(position => {
       state.coords = {lat: position.coords.latitude, lng: position.coords.longitude};
       updateMap();
@@ -432,7 +583,10 @@
       unlock.connect(context.destination); unlock.start();
       await unlocked;
       if (!navigator.mediaDevices?.getUserMedia) throw new Error('Microphone needs HTTPS or localhost');
-      stream = await navigator.mediaDevices.getUserMedia({audio: {echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1, sampleRate: 48000}});
+      const result = await requestMic(selectedMic.deviceId);
+      stream = result.input;
+      saveMic(result.deviceId, result.deviceId ? stream.getAudioTracks()[0].label : 'Default');
+      await refreshDevices();
       await context.audioWorklet.addModule('audio-worklet.js');
       micSource = context.createMediaStreamSource(stream);
       capture = new AudioWorkletNode(context, 'field-capture', {numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1]});
@@ -448,10 +602,12 @@
     }
     state.running = true; state.starting = false; state.paused = false;
     state.startedAt = new Date(); state.endedAt = null;
-    requestWakeLock(); updateControls(); connect();
+    captureSettings(); requestWakeLock(); updateControls(); connect();
   }
   async function stop() {
     state.running = false; state.connected = false; state.listening = false;
+    ++micRevision; ++deviceRevision; micSwitching = false;
+    stopHeadsetSession();
     state.endedAt = new Date();
     clearTimeout(reconnectTimer);
     socket?.close(1000, 'Session ended'); socket = null;
@@ -461,6 +617,7 @@
     const oldWakeLock = wakeLock, oldContext = context;
     wakeLock = null; context = null; nextPlaybackTime = 0;
     $('level-fill').style.width = '0%'; $('mic-meter').setAttribute('aria-valuenow', '0');
+    captureSettings();
     notice('Session ended. Your checklist is ready to export.'); updateControls();
     if (oldWakeLock) { try { await oldWakeLock.release(); } catch (_) {} }
     if (oldContext) { try { await oldContext.close(); } catch (_) {} }
@@ -519,9 +676,10 @@
     if (!state.paused && context?.state === 'suspended') context.resume().catch(() => {});
     $('level-fill').style.width = '0%'; updateControls();
   });
-  $('tap').addEventListener('click', () => {
-    if (context && context.state !== 'running') context.resume().catch(() => {});
-    flush(); send({type: 'tap'});
+  $('tap').addEventListener('click', talk);
+  $('mic-device')?.addEventListener('change', event => switchMic(event.target.value));
+  navigator.mediaDevices?.addEventListener('devicechange', () => {
+    if (state.running && capture) refreshDevices();
   });
   $('text-form').addEventListener('submit', event => {
     event.preventDefault(); const text = $('text-input').value.trim();
