@@ -1,6 +1,37 @@
 # Known issues from live testing (Oct 23, 21:30–23:15)
 
-Status: **recorded, not fixed**. Code under test = branch `feat/batched-suggestions` (PR #2), served live on :8780. Condensed event log of the last session: `/data/build/tmp/review/live-test-2258-2315.log` (not in repo). Setup: Android Chrome + laptop playing `/testaudio/` clips; speaker mode 22:58–23:08, earphones mode 23:09–23:15.
+Status: **round 1 backend fixes applied on fix/round1; remaining issues below are still open**. Code under test = branch `feat/batched-suggestions` (PR #2), served live on :8780. Condensed event log of the last session: `/data/build/tmp/review/live-test-2258-2315.log` (not in repo). Setup: Android Chrome + laptop playing `/testaudio/` clips; speaker mode 22:58–23:08, earphones mode 23:09–23:15.
+
+## Round 1 backend resolution (2026-10-23)
+
+- **A1–A6 fixed:** reviewed router wording now distinguishes mic checks, sound
+  questions, logged counts, explicit sightings/approval and filler. All ten
+  requested real-Higgs text cases passed on port 8796 (quiet mode, seeded pending
+  suggestions); acoustic STT reliability remains unverified.
+- **A7 fixed:** one remove tool accepts explicit `all=true`; live clear-all
+  emptied the checklist.
+- **B1, B2, E4 fixed:** non-bird/binomial filtering and one geo @0.001 + all-time
+  verifiable iNat Aves allowlist; Ontario place 6883 / elsewhere 100 km, paginated.
+  Last-good regional lists persist; missing lists suppress detections. Live list
+  had 517 species, retained Red-necked Grebe and excluded all five reviewed
+  out-of-range species plus Human non-vocal.
+- **B3 fixed (display gating):** heard events/suggestions require two >=0.5 windows
+  within 10 s or one >=0.7; >=0.25 history retained. Acoustic false positives can
+  still occur within the allowed species; **B4 remains by design**.
+- **E1 fixed:** Higgs deletion probe acknowledged `conversation.item.deleted`;
+  retain last eight created/added items after each turn and inject fresh compact
+  state each route. Pruning includes function outputs and notifications.
+- **E3 fixed for response.done correlation and reconnect flags:** stale response
+  IDs cannot complete a different awaited response; reconnect clears speaking /
+  transcript flags. No exhaustive delayed-event network fault test was run.
+- **E7 backend portion fixed:** mic `location` updates late GPS. Frontend/device
+  behavior is tracked separately; no claim here about the parallel web changes.
+- Added mic/display reset, verified over a real display WebSocket plus fresh
+  Higgs reconnect. **E2, E5, E6 and other unlisted items remain open.**
+
+Evidence: `/data/build/tmp/round1-{unit,live,delete-probe,allowlist-live}.log`
+and `/data/build/tmp/round1-live-results.json`. Offline suite: 39 tests. Original
+observations below are retained as the before-fix record, not current status.
 
 ## A. Router / intent
 | # | Observed (time) | Evidence | Likely cause |

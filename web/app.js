@@ -1,5 +1,6 @@
 'use strict';
 (() => {
+  const CLIENT_BUILD = '2026-10-23-round1';
   const $ = id => document.getElementById(id);
   const params = new URLSearchParams(location.search);
   const displayMode = params.get('display') === '1';
@@ -11,10 +12,9 @@
     listening: false, speaking: false, items: [], heard: [], coords: null,
     startedAt: null, endedAt: null, model: '', retry: 0
   };
-  let earphones = false, firstAudioTip = true;
+  let earphones = false;
   try {
     earphones = localStorage.getItem('field-earphones') === 'true';
-    firstAudioTip = localStorage.getItem('field-earphone-tip') !== 'seen';
   } catch (_) { /* Storage may be unavailable; speaker is the safe default. */ }
   let selectedMic = {deviceId: '', label: 'Default'};
   try {
@@ -24,7 +24,8 @@
   let micSwitching = false, micRevision = 0, deviceRevision = 0;
   let silentAudio, silentURL, toastTimer;
   const headsetActions = ['play', 'pause', 'nexttrack', 'previoustrack'];
-  let playbackReported = false;
+  let playbackReported = false, headsetEnabled = false, replaced = false;
+  let locationWatch = null, lastSentCoords = null;
   let socket, reconnectTimer, context, stream, capture, micSource, wakeLock;
   let nextPlaybackTime = 0, lastMeterAt = 0, resampler = null;
   const playback = new Set(), tones = new Set();
@@ -45,19 +46,20 @@
   }
   function updateControls() {
     if ($('audio-mode')) {
-      $('audio-mode').textContent = earphones ? '🎧 Earphones' : '🔊 Speaker';
+      $('audio-mode').textContent = earphones ? 'Earphones · voice interruption on' : 'Speaker · tap to interrupt';
       $('audio-mode').setAttribute('aria-pressed', String(earphones));
     }
-    if ($('interrupt-hint')) $('interrupt-hint').textContent = earphones ? 'Say something to interrupt' : 'Tap to interrupt';
-    if ($('earphone-tip')) $('earphone-tip').hidden = !firstAudioTip;
+    if ($('earphone-tip')) $('earphone-tip').hidden = false;
     $('tap').disabled = $('send').disabled = !state.connected;
+    $('reconnect').hidden = !replaced;
+    $('reset').disabled = $('reset-display').disabled = !state.connected;
     $('mic').disabled = !stream || !state.running;
     if ($('mic-device')) $('mic-device').disabled = !capture || micSwitching || state.starting;
     $('mic').setAttribute('aria-pressed', String(state.paused));
-    $('mic').setAttribute('aria-label', state.paused ? 'Resume microphone' : 'Pause microphone');
-    $('mic-label').textContent = state.paused ? 'Resume' : 'Pause';
+    $('mic').setAttribute('aria-label', state.paused ? 'Resume mic' : 'Pause mic');
+    $('mic-label').textContent = state.paused ? 'Resume mic' : 'Pause mic';
     $('mic-icon').textContent = state.paused ? '▷' : 'Ⅱ';
-    $('start').hidden = state.running;
+    $('start').hidden = state.running || replaced;
     $('start-note').hidden = state.running;
     $('stop').hidden = !state.running;
     $('start').disabled = state.starting;
@@ -66,7 +68,7 @@
     document.body.classList.toggle('running', state.running && !!stream && !state.paused);
     document.body.classList.toggle('speaking', playing);
     $('activity').textContent = !state.running ? 'Ready when you are' : playing ? 'Speaking' : !stream ? (displayMode ? 'Live session display' : 'Text only') : state.paused ? 'Mic paused' : state.connected && state.listening ? 'Listening' : state.connected ? 'Mic on' : 'Reconnecting';
-    $('model').textContent = state.model || 'Open mic · hands free';
+    $('model').textContent = state.model || 'Not connected';
     const connection = $('connection');
     connection.className = `connection ${state.connected ? 'online' : state.running ? 'connecting' : ''}`;
     connection.lastElementChild.textContent = state.connected ? 'Connected' : state.running ? 'Connecting' : 'Offline';
@@ -128,27 +130,28 @@
     if (!state.running || !capture || micSwitching) return;
     const revision = ++micRevision, activeContext = context, activeCapture = capture;
     micSwitching = true;
-    micSource?.disconnect(); micSource = null;
-    stream?.getTracks().forEach(track => track.stop()); stream = null;
-    if (state.connected) send({type: 'mic', on: false});
+    let replacementStream, replacementSource;
     captureSettings(); updateControls();
     try {
       const result = await requestMic(deviceId);
       if (revision !== micRevision || !state.running || context !== activeContext) {
         result.input.getTracks().forEach(track => track.stop()); return;
       }
-      stream = result.input;
-      stream.getAudioTracks().forEach(track => { track.enabled = !state.paused; });
-      micSource = activeContext.createMediaStreamSource(stream);
-      micSource.connect(activeCapture);
+      replacementStream = result.input;
+      replacementStream.getAudioTracks().forEach(track => { track.enabled = !state.paused; });
+      replacementSource = activeContext.createMediaStreamSource(replacementStream);
+      replacementSource.connect(activeCapture);
+      const oldStream = stream, oldSource = micSource;
+      stream = replacementStream; micSource = replacementSource;
+      oldSource?.disconnect(); oldStream?.getTracks().forEach(track => track.stop());
       resampler = activeContext.sampleRate === 48000 ? null : new LinearResampler(activeContext.sampleRate);
       saveMic(result.deviceId, result.deviceId ? stream.getAudioTracks()[0].label : 'Default');
       if (state.connected) send({type: 'mic', on: !state.paused});
       notice(result.deviceId !== deviceId ? 'Selected microphone unavailable; using the default.' : 'Microphone changed.');
     } catch (error) {
       if (revision === micRevision) {
-        stream?.getTracks().forEach(track => track.stop()); stream = null;
-        notice(`Microphone: ${error.message}. Choose another input or use text.`);
+        replacementSource?.disconnect(); replacementStream?.getTracks().forEach(track => track.stop());
+        notice(`Microphone unchanged: ${error.message}.`);
       }
     } finally {
       if (revision === micRevision) {
@@ -169,7 +172,7 @@
     flush(); send({type: 'tap'});
   }
   function startHeadsetSession() {
-    if (displayMode || !navigator.mediaSession) return;
+    if (displayMode || !headsetEnabled || silentAudio || !navigator.mediaSession) return;
     try {
       // Real zero-valued PCM, not muted media: no WebAudio connections or mic processing.
       // Exceed Chromium's short-media threshold so Android can expose media controls.
@@ -287,7 +290,7 @@
     source.connect(context.destination);
     // nextPlaybackTime is in the clock of the current AudioContext; a value from an old
     // (closed) context would schedule speech minutes into the future -> silence.
-    if (nextPlaybackTime > context.currentTime + 30) nextPlaybackTime = 0;
+    if (nextPlaybackTime > context.currentTime + 30) flush();
     const at = Math.max(context.currentTime + 0.025, nextPlaybackTime);
     nextPlaybackTime = at + buffer.duration;
     source.playAt = at;
@@ -336,7 +339,7 @@
     return url.href;
   }
   function connect() {
-    if (!state.running) return;
+    if (!state.running || replaced) return;
     clearTimeout(reconnectTimer);
     updateControls();
     let ws;
@@ -346,8 +349,9 @@
     ws.onopen = () => {
       if (socket !== ws || !state.running) { ws.close(); return; }
       // hello MUST be the first frame; geolocation is optional and never blocks it.
-      ws.send(JSON.stringify({type: 'hello', lang: 'en', ...(!displayMode ? {earphones} : {}), ...(state.coords || {})}));
+      ws.send(JSON.stringify({type: 'hello', client_build: CLIENT_BUILD, lang: 'en', ...(!displayMode ? {earphones} : {}), ...(state.coords || {})}));
       state.connected = true; state.retry = 0;
+      lastSentCoords = state.coords ? {...state.coords} : null;
       if (!displayMode) {
         send({type: 'audio_mode', earphones});
         send({type: 'mic', on: !!stream && !state.paused});
@@ -362,22 +366,50 @@
       try { handleMessage(JSON.parse(event.data)); } catch (error) { console.warn('Ignored malformed server message', error); }
     };
     ws.onerror = () => { if (socket === ws) notice('Connection unavailable. Retrying automatically.'); };
-    ws.onclose = () => {
+    ws.onclose = event => {
       if (socket !== ws) return;
+      if (isReplacement(event.reason)) { phoneReplaced(); return; }
       state.connected = false; state.listening = false; flush(); updateControls();
       if (state.running) scheduleReconnect();
     };
   }
   function scheduleReconnect() {
-    if (!state.running) return;
+    if (!state.running || replaced) return;
     const delay = Math.min(15000, 800 * 2 ** Math.min(state.retry++, 5)) + Math.random() * 350;
     notice(`Reconnecting in ${Math.ceil(delay / 1000)} seconds. Checklist edits wait for connection.`);
     clearTimeout(reconnectTimer);
     reconnectTimer = setTimeout(connect, delay);
     updateControls();
   }
+  function isReplacement(value) {
+    return /replac|new mic joined|another (?:phone|mic)|newer microphone|taken over|took over/i.test(String(value || ''));
+  }
+  function phoneReplaced() {
+    replaced = true; clearTimeout(reconnectTimer);
+    stop();
+    notice('');
+    updateControls();
+  }
+  function clearSessionUI() {
+    flush(); state.items = []; state.heard = [];
+    renderChecklist(); renderSuggestions([]); renderCandidates([]); updateMap();
+    $('heard').replaceChildren(element('p', 'empty-inline', 'Listening for the next discovery.'));
+    $('user-caption').textContent = 'Say what you see, or ask about a bird song.';
+    $('assistant-caption').textContent = 'Ready for your next discovery.';
+    $('user-caption').classList.remove('partial'); $('assistant-caption').classList.remove('partial');
+    $('text-input').value = '';
+    state.startedAt = state.running ? new Date() : null; state.endedAt = null;
+    $('session-time').textContent = '00:00';
+  }
+  function resetSession() {
+    if (!state.connected || !confirm('Clear checklist, suggestions, heard history and conversation?')) return;
+    send({type: 'reset'}); clearSessionUI();
+  }
   function handleMessage(message) {
+    if (['state', 'error'].includes(message.type) && (message.replaced === true ||
+        [message.message, message.reason, message.status, message.code].some(isReplacement))) { phoneReplaced(); return; }
     switch (message.type) {
+      case 'reset': clearSessionUI(); break;
       case 'flush': flush(); break;
       case 'earcon': earcon(message.kind); break;
       case 'checklist':
@@ -398,6 +430,7 @@
       }
       case 'candidates': if (Array.isArray(message.items)) renderCandidates(message.items); break;
       case 'state':
+        if (typeof message.server_build === 'string') $('version-banner').hidden = message.server_build === CLIENT_BUILD;
         state.listening = !!message.listening; state.speaking = !!message.speaking;
         if (typeof message.model === 'string') state.model = message.model;
         // Socket transport status remains independent of backend/model connectivity.
@@ -497,7 +530,7 @@
     if (!row) {
       row = element('div', 'suggestion-row'); row.id = 'suggestions';
       row.setAttribute('aria-label', 'BirdNET suggestions — add or dismiss');
-      $('heard').before(row);
+      document.querySelector('.checklist-section').before(row);
     }
     row.replaceChildren(); row.hidden = !items.length;
     for (const item of items) {
@@ -562,15 +595,23 @@
     requestAnimationFrame(() => map.invalidateSize());
   }
 
+  function distanceMeters(a, b) {
+    const rad = Math.PI / 180, dLat = (b.lat - a.lat) * rad, dLng = (b.lng - a.lng) * rad;
+    const h = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat * rad) * Math.cos(b.lat * rad) * Math.sin(dLng / 2) ** 2;
+    return 6371000 * 2 * Math.asin(Math.sqrt(Math.min(1, h)));
+  }
   async function start() {
     if (state.running || state.starting) return;
     state.starting = true; $('start').disabled = true;
     notice('Opening microphone…');
     startHeadsetSession();
-    if (navigator.geolocation) navigator.geolocation.getCurrentPosition(position => {
+    if (navigator.geolocation && locationWatch === null) locationWatch = navigator.geolocation.watchPosition(position => {
       state.coords = {lat: position.coords.latitude, lng: position.coords.longitude};
+      if (state.connected && (!lastSentCoords || distanceMeters(lastSentCoords, state.coords) > 200)) {
+        if (send({type: 'location', ...state.coords})) lastSentCoords = {...state.coords};
+      }
       updateMap();
-    }, () => {}, {enableHighAccuracy: false, timeout: 6000, maximumAge: 60000});
+    }, () => {}, {enableHighAccuracy: false, timeout: 10000, maximumAge: 60000});
     try {
       const AudioContextClass = window.AudioContext || window.webkitAudioContext;
       if (!AudioContextClass) throw new Error('WebAudio unavailable');
@@ -606,6 +647,8 @@
   }
   async function stop() {
     state.running = false; state.connected = false; state.listening = false;
+    if (locationWatch !== null) navigator.geolocation?.clearWatch(locationWatch);
+    locationWatch = null;
     ++micRevision; ++deviceRevision; micSwitching = false;
     stopHeadsetSession();
     state.endedAt = new Date();
@@ -653,15 +696,23 @@
     state.items.forEach(item => rows.push([item.en, item.sci, item.group, item.count, item.notes, item.first_seen, item.source, $('location-name').value, item.lat ?? state.coords?.lat, item.lng ?? state.coords?.lng]));
     downloadCSV(rows, 'all-taxa');
   }
+  $('client-build').textContent = CLIENT_BUILD;
+  $('settings-open').addEventListener('click', () => $('settings-dialog').showModal());
+  $('reset').addEventListener('click', resetSession);
+  $('reset-display').addEventListener('click', resetSession);
+  $('reload').addEventListener('click', () => location.reload());
+  $('reconnect').addEventListener('click', () => { replaced = false; start(); });
+  $('headset-enabled').addEventListener('change', event => {
+    headsetEnabled = event.target.checked;
+    if (headsetEnabled && (state.running || state.starting)) startHeadsetSession();
+    else stopHeadsetSession();
+  });
   $('audio-mode')?.addEventListener('click', () => {
     earphones = !earphones;
     try { localStorage.setItem('field-earphones', String(earphones)); } catch (_) {}
     if (state.connected && !displayMode) send({type: 'audio_mode', earphones});
     updateControls();
   });
-  if (firstAudioTip && !displayMode) {
-    try { localStorage.setItem('field-earphone-tip', 'seen'); } catch (_) {}
-  }
   $('start').addEventListener('click', start);
   $('stop').addEventListener('click', stop);
   $('quiet').addEventListener('click', () => {
@@ -689,6 +740,7 @@
     const birds = state.items.filter(item => item.group === 'Aves').length;
     $('export-summary').textContent = `${state.items.length} entries · ${birds} bird entries for eBird · ${state.items.length - birds} other taxa`;
     $('export-ebird').disabled = !birds; $('export-all').disabled = !state.items.length;
+    $('settings-dialog').close();
     $('export-dialog').showModal();
   });
   $('export-ebird').addEventListener('click', exportEBird);
@@ -707,6 +759,7 @@
   $('map-card')?.addEventListener('toggle', updateMap);
   if (displayMode) {
     if ($('map-card')) $('map-card').open = true;
+    $('heard-card').open = true;
     if ($('phone-hint')) {
       const phoneURL = new URL('/', location.href);
       phoneURL.searchParams.set('session', session);
