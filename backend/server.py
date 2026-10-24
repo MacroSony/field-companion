@@ -196,7 +196,8 @@ TOOLS = [
     tool_schema("new_observation", "Look at a different organism: start a new focus and request camera frames.", {"group": {"type": "string", "enum": GROUPS}}),
     tool_schema("describe", "Attach a user description to the focus; resolve only explicit species names.", {"text": NAME, "name": NAME}, ("text",)),
     tool_schema("ask_expert", "Start a background investigation about the current focus: comparisons, conflicting evidence, diet, habitat or behaviour. Returns immediately; never log.", {"question": NAME}, ("question",)),
-    tool_schema("get_investigations", "Check investigation progress or read a completed result, without starting a new investigation. Use id (R1 etc.) or first/latest/all.", TASK_SELECTOR),
+    tool_schema("get_investigations", "Check progress. Set explain=true ONLY when the user asks to hear/explain a result or accepts the latest explanation offer. Status checks never read results. Use id (R1 etc.) or first/latest/all.",
+                {**TASK_SELECTOR, "explain": {"type": "boolean"}}),
     tool_schema("manage_investigation", "Cancel or retry an investigation. Retry uses its ORIGINAL question and evidence, even after changing focus. Use id or first/latest/all; default latest active for cancel.",
                 {**TASK_SELECTOR, "action": {"type": "string", "enum": ["cancel", "retry"]}}, ("action",)),
     tool_schema("accept_suggestions", "Confirm pending BirdNET suggestions. Yes/both/all = all pending; just X = subset. Silent.",
@@ -224,7 +225,7 @@ Classify ONLY the latest user turn. Ordinary off-topic remarks/questions to a co
 self-talk, phone calls, noise and pet-dog chatter are NOT addressed to you: call ignore.
 Nature sighting reports are addressed even without a wake word: call add_observation.
 Multiple species in one report: call add_observations with all items in ONE call.
-When pending BirdNET suggestions exist: yes / yes both / add them all -> accept_suggestions
+When the latest assistant question asks to log BirdNET suggestions: yes / yes both / add them all -> accept_suggestions
 with omitted species (all pending); just the cardinal -> accept_suggestions with that species.
 No / don't add them -> dismiss_suggestions. These actions are silent, not speak.
 Only accept explicit user confirmation, never a BirdNET notification itself.
@@ -246,6 +247,14 @@ ask_expert schedules work; its immediate answer is an acknowledgement, not resea
 While investigations run, keep handling new questions and sightings normally.
 "How is the first investigation going?", "Any results?", "刚才查得怎么样？"
 use get_investigations, NOT ask_expert. Select the requested R-number or first/latest/all.
+Progress/status questions use explain=false; never read a finished result automatically.
+"Explain R1", "Tell me the result", "讲一下第一个结果" use get_investigations(explain=true).
+After an investigation-ready offer, "yes", "go ahead", "好的，讲一下" accept that
+explanation with get_investigations(explain=true), NOT ask_expert or accept_suggestions.
+"Not now" / "先不讲" after that offer uses ignore, NOT dismiss_suggestions.
+If several results were offered and no one is selected, ask which result to explain.
+Completed investigations are only offered at a conversational pause; never read
+their findings without the user's request or acceptance.
 "Cancel the first investigation" / "取消第一个调查" uses manage_investigation(action=cancel).
 "Try R1 again" / "继续查第一个" uses manage_investigation(action=retry).
 An explicit request to start another investigation uses ask_expert, not a status read.
@@ -307,7 +316,9 @@ class Session:
         self.turn_stopped_at = None
         self.turn_question = ""
         self.expert_readout = None
+        self.investigation_offer_ids = []
         self.first_audio = False
+        self.audio_playback_id = None
         self.rt_lock = asyncio.Lock()
         self.rt = None
         self.connected = False
@@ -419,56 +430,115 @@ class Session:
             await self.flush_pending()
         self.log("investigation_done", id=job.id, status=job.status)
 
+    def investigation_offer(self, jobs, *, chinese):
+        ready = [j.id for j in jobs if j.status == "completed"]
+        failed = [j.id for j in jobs if j.status != "completed"]
+        parts = []
+        if ready:
+            ids = ("、" if chinese else ", ").join(ready)
+            parts.append((f"另外，调查 {ids} 已完成。" if chinese else
+                          f"Also, investigation{'s' if len(ready) > 1 else ''} {ids} "
+                          + ("are ready. " if len(ready) > 1 else "is ready. "))
+                         + (("你想先听哪一项？" if len(ready) > 1 else "要我讲一下结果吗？") if chinese else
+                            ("Which would you like me to explain?" if len(ready) > 1 else
+                             "Would you like me to explain?")))
+        if failed:
+            ids = ("、" if chinese else ", ").join(failed)
+            parts.append(f"调查 {ids} 暂未完成，详情已保存在卡片里。" if chinese else
+                         f"Investigation {ids} could not finish; details are on the task cards.")
+        return " ".join(parts)
+
     async def investigation_notice(self, job):
         if job.announced or job.status not in ("completed", "failed", "timed_out"):
             return
+        # Combine completions already waiting at this conversational boundary.
+        batch = [job]
+        for pending in list(self.pending):
+            if pending[0] != "investigation" or (pending[2] is not None and pending[2] > time.monotonic()):
+                continue
+            other = self.investigations.jobs.get(pending[1])
+            if other and not other.announced and other not in batch and other.status in ("completed", "failed", "timed_out"):
+                batch.append(other)
+                self.pending.remove(pending)
         revision = self.input_revision
-        job.announced = True  # A barge-in ends the notice; the result stays readable.
-        await self.investigations.emit()
-        async def defer_if_interrupted():
-            if (self.closed or self.quiet or self.user_speaking or self.awaiting_transcript
-                    or self.input_revision != revision):
-                job.announced = False
-                if not self.closed:
-                    self.pending.append(("investigation", job.id, None))
-                return True
-            return False
-        if await defer_if_interrupted():
+        def uninterrupted():
+            return (not self.closed and not self.quiet and not self.user_speaking
+                    and not self.awaiting_transcript and self.input_revision == revision
+                    and not self.playback_pending() and time.monotonic() >= self.play_until)
+        async def defer():
+            for item in batch:
+                item.announced = False
+                if not self.closed and not any(p[:2] == ("investigation", item.id) for p in self.pending):
+                    self.pending.append(("investigation", item.id, None))
+            await self.investigations.emit()
+        if not uninterrupted():
+            await defer()
             return
+        for item in batch:
+            item.announced = True  # The short offer is separate from reading the result.
+        await self.investigations.emit()
+        if not uninterrupted():
+            await defer()
+            return
+        answer = self.investigation_offer(batch, chinese=self.lang.startswith("zh") or self.chinese(batch[0].question))
+        previous_offer = self.investigation_offer_ids
+        self.investigation_offer_ids = [j.id for j in batch if j.status == "completed"]
         try:
-            job.notice_attempts += 1
-            await self.inject("[INVESTIGATION_RESULT] " + json.dumps({
-                "id": job.id, "question": job.question,
-                "observation_id": job.observation["id"],
-                "answer": self.investigation_answer(job)}, ensure_ascii=False))
-            if await defer_if_interrupted():
+            for item in batch:
+                item.notice_attempts += 1
+            # Do not put findings in this voice turn. The user must request them.
+            await self.inject("[INVESTIGATION_READY] " + json.dumps({
+                "ids": [j.id for j in batch], "answer": answer,
+                "instruction": "Offer to explain; do not read any investigation findings."}, ensure_ascii=False))
+            if not uninterrupted():
+                self.investigation_offer_ids = previous_offer
+                await defer()
                 return
-            await self.speak_expert(self.investigation_answer(job))
+            response = await self.speak_expert(answer, guard=uninterrupted)
+            if response and response.get("status") == "deferred":
+                self.investigation_offer_ids = previous_offer
+                await defer()
         except Exception:
-            job.announced = False
-            if job.notice_attempts < 2:
-                self.pending.append(("investigation", job.id, time.monotonic() + 5))
+            self.investigation_offer_ids = previous_offer
+            for item in batch:
+                item.announced = False
+                if item.notice_attempts < 2:
+                    self.pending.append(("investigation", item.id, time.monotonic() + 5))
             await self.investigations.emit()
             raise
 
     async def investigation_tool(self, name, args):
         zh = self.chinese(self.turn_question) if self.turn_question else self.lang.startswith("zh")
         if name == "get_investigations":
+            explain = args.get("explain", False)
+            if not isinstance(explain, bool):
+                raise ValueError("explain must be boolean")
             jobs = self.investigations.select(args.get("id"), args.get("selection"))
             if not args.get("id") and not args.get("selection"):
-                jobs = [j for j in jobs if j.status in ACTIVE] or jobs[-1:]
+                if explain:
+                    offered = [j for j in jobs if j.id in self.investigation_offer_ids and j.status == "completed"]
+                    jobs = offered or [j for j in jobs if j.status == "completed"][-1:] or jobs[-1:]
+                    if len(jobs) > 1:
+                        return {"ok": True, "answer": self.investigation_offer(jobs, chinese=zh), "requires_selection": True}
+                else:
+                    jobs = [j for j in jobs if j.status in ACTIVE] or jobs[-1:]
             if not jobs:
                 answer = "目前没有调查任务。" if zh else "There are no investigations yet."
             else:
-                answer = " ".join(self.investigation_answer(j, chinese=zh) for j in jobs[:3])
+                answer = " ".join(self.investigation_answer(j, chinese=zh, include_result=explain) for j in jobs[:3])
+                ready = [j for j in jobs[:3] if j.status == "completed"]
+                if ready and not explain:
+                    answer += " 要我讲一下结果吗？" if zh else " Would you like me to explain?"
                 if len(jobs) > 3:
                     answer += f" 另有 {len(jobs) - 3} 项可在屏幕查看。" if zh else f" There are {len(jobs) - 3} more on screen."
                 if self.may_speak():
+                    self.investigation_offer_ids = [] if explain else [j.id for j in ready]
                     for job in jobs[:3]:
                         if job.status not in ACTIVE:
                             job.announced = True
                     await self.investigations.emit()
-            return {"ok": True, "answer": answer, "investigations": [j.payload() for j in jobs]}
+            return {"ok": True, "answer": answer, "investigations": [
+                {**j.payload(), **({} if explain else {"result": None})} for j in jobs]}
         action = args.get("action")
         if action not in ("cancel", "retry"):
             raise ValueError("Investigation action must be cancel or retry")
@@ -495,12 +565,12 @@ class Session:
                 "answer": f"已用原问题和原观察证据重新安排调查 {job.id}。" if zh else
                           f"Investigation {job.id} is scheduled using the original question and evidence."}
 
-    async def speak_expert(self, answer):
+    async def speak_expert(self, answer, *, guard=None):
         # Keep metadata/hints out of the speech task; a general answer prompt
         # otherwise encourages Higgs to elaborate or translate the decision.
         self.expert_readout = answer
         try:
-            return await self.generate("answer")
+            return await self.generate("answer", guard=guard) if guard else await self.generate("answer")
         finally:
             self.expert_readout = None
 
@@ -647,10 +717,32 @@ class Session:
     def playback_clients(self):
         return [c for c in self.clients if c.role == "mic" or c.audio]
 
+    def playback_pending(self):
+        return any(c.playback_active or c.playback_pending for c in self.playback_clients())
+
+    async def begin_audio(self, response_id):
+        self.audio_playback_id = response_id or "audio-" + uuid.uuid4().hex
+        for client in self.playback_clients():
+            if client.playback_protocol == 1:
+                client.playback_id = self.audio_playback_id
+                client.playback_pending = True
+        await self.phone_json({"type": "audio_start", "id": self.audio_playback_id})
+
+    async def end_audio(self):
+        if self.audio_playback_id:
+            await self.phone_json({"type": "audio_end", "id": self.audio_playback_id})
+
+    async def flush_audio(self):
+        self.audio_playback_id = None
+        for client in self.playback_clients():
+            client.playback_id = None
+            client.playback_pending = client.playback_active = False
+        await self.phone_json({"type": "flush"})
+
     def echo_deadline(self):
         clients = self.playback_clients()
         # A start without an end keeps the gate closed, including suspended WebAudio.
-        if any(c.playback_active for c in clients):
+        if any(c.playback_active or c.playback_pending for c in clients):
             return float("inf")
         estimate = max(self.echo_estimate, self.play_until)
         return max((max(estimate, c.playback_end) + (.5 if c.playback_end else .8)
@@ -730,6 +822,8 @@ class Session:
                                  + json.dumps([r["en"] for r in self.suggestions.values()])
                                  + "\nCurrent focus snapshot (context only, not a new sighting): "
                                  + json.dumps(focus_context)
+                                 + "\nLatest investigation explanation offer (accept only if it is the latest assistant question): "
+                                 + json.dumps(self.investigation_offer_ids)
                                  + "\nInvestigations (context only; never invent progress): "
                                  + json.dumps([{**{k: row[k] for k in ("id", "species", "status", "stage")},
                                                 "question": row["question"][:200]}
@@ -761,9 +855,12 @@ class Session:
             finally:
                 self.update_waiter = None
 
-    async def generate(self, phase):
+    async def generate(self, phase, *, guard=None):
         self.phase = phase
         await self.update_session(self.config(phase))
+        if guard is not None and not guard():
+            return {"status": "deferred"}
+        self.response_id = None
         self.response_waiter = asyncio.get_running_loop().create_future()
         self.audio_allowed = phase == "answer" and self.may_speak()
         self.first_audio = False
@@ -774,7 +871,11 @@ class Session:
             except asyncio.TimeoutError:
                 # Seen live 10/23: a route response.create got no response at all (no error, no done).
                 self.log("response_timeout", phase=phase)
+                if self.response_id:
+                    self.cancelled_ids.append(self.response_id)
+                self.audio_allowed = False
                 await self.rt_send({"type": "response.cancel"})
+                await self.end_audio()
                 if phase != "route" or getattr(self, "_retrying", False):
                     raise
                 self._retrying = True
@@ -859,13 +960,14 @@ class Session:
                     self.pending[0] = (kind, value, stopped)
                     self.log("turns_merged", n=len(parts))
             self.turn_stale = stopped is not None and time.monotonic() - stopped > 12
+            if kind in ("notify", "investigation") and self.playback_pending():
+                continue
             if kind == "notify" and (self.awaiting_transcript or self.quiet
                                      or time.monotonic() < self.play_until
                                      or time.monotonic() - self.last_proactive < SUGGEST_INTERVAL):
                 continue
             if kind == "investigation" and (self.awaiting_transcript or self.quiet
                     or time.monotonic() < self.play_until
-                    or any(c.playback_active for c in self.playback_clients())
                     or self.echo_blocked() or (stopped is not None and time.monotonic() < stopped)):
                 continue
             self.pending.popleft()
@@ -1011,7 +1113,7 @@ class Session:
                 self.active = False
                 if not self.closed:
                     self.play_until = 0
-                    await self.phone_json({"type": "flush"})
+                    await self.flush_audio()
                     await self.state()
             await asyncio.sleep(delay)
             delay = min(15, delay * 2)
@@ -1035,6 +1137,8 @@ class Session:
             return
         if ty in output_types and (self.phase != "answer" or not self.audio_allowed):
             return
+        if ty in output_types and event.get("response_id") is not None and rid != self.response_id:
+            return  # A late chunk from another response must never join this voice turn.
         if ty == "error":
             code = (event.get("error") or {}).get("code", "unknown")
             message = str((event.get("error") or {}).get("message", ""))[:500]
@@ -1059,7 +1163,7 @@ class Session:
                 if self.response_id:
                     self.cancelled_ids.append(self.response_id)
                 self.play_until = 0
-                await self.phone_json({"type": "flush"})
+                await self.flush_audio()
                 await self.rt_send({"type": "response.cancel"})
                 self.log("barge_in")
             await self.state()
@@ -1099,6 +1203,7 @@ class Session:
             self.play_until = max(time.monotonic(), self.play_until) + len(pcm) / 48000
             self.echo_estimate = self.play_until
             if not self.first_audio:
+                await self.begin_audio(rid)
                 for client in self.playback_clients():
                     client.playback_end = 0.0
             await self.phone_audio(pcm)
@@ -1128,7 +1233,11 @@ class Session:
                                        "text": event.get("transcript", event.get("text", "")), "final": True})
         elif ty == "response.done":
             response = event["response"]
+            if response.get("id") is not None and response["id"] != self.response_id:
+                return
             self.log("response_done", status=response.get("status"), phase=self.phase)
+            if self.phase == "answer" and self.first_audio:
+                await self.end_audio()
             if self.response_waiter is not None and not self.response_waiter.done():
                 self.response_waiter.set_result(response)
 
@@ -1471,13 +1580,24 @@ class Session:
                 raise ValueError("playback.active must be boolean")
             if client is None or (client.role == "display" and not client.audio):
                 raise ValueError("Client has no audio output")
+            if client.playback_protocol == 1:
+                if not isinstance(event.get("drained"), bool):
+                    raise ValueError("playback.drained must be boolean")
+                if event.get("response_id") != client.playback_id:
+                    return  # An old playback completion cannot release a newer reply.
+                if event["drained"] and event["active"]:
+                    raise ValueError("Active playback cannot be drained")
+                client.playback_pending = not event["drained"]
             client.playback_active = event["active"]
-            if not client.playback_active:
+            if not client.playback_active and not client.playback_pending:
                 client.playback_end = time.monotonic()
             self.log("playback", active=client.playback_active, role=client.role)
             await self.state()
+            await self.flush_pending()
             return
         if ty == "hello":
+            if client is not None:
+                client.playback_protocol = 1 if event.get("playback_protocol") == 1 else 0
             if event.get("lat") is not None and event.get("lng") is not None:
                 lat, lng = float(event["lat"]), float(event["lng"])
                 if not (-90 <= lat <= 90 and -180 <= lng <= 180):
@@ -1514,7 +1634,7 @@ class Session:
             if self.quiet:
                 self.play_until = 0
                 self.audio_allowed = False
-                await self.phone_json({"type": "flush"})
+                await self.flush_audio()
             await self.state()
             await self.flush_pending()
         elif ty == "tap":
@@ -1576,7 +1696,7 @@ class Session:
         self.play_until = 0
         if self.connected and (self.active or self.response_id):
             await self.rt_send({"type": "response.cancel"})
-        await self.phone_json({"type": "flush"})
+        await self.flush_audio()
         await self.state()
 
     def start(self):
@@ -1607,6 +1727,9 @@ class Client:
         self.lock = asyncio.Lock()
         self.earphones = False
         self.playback_active = False
+        self.playback_protocol = 0
+        self.playback_pending = False
+        self.playback_id = None
         self.playback_end = 0.0
 
     async def send_json(self, event):

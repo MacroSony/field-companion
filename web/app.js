@@ -25,6 +25,7 @@
   let silentAudio, silentURL, toastTimer;
   const headsetActions = ['play', 'pause', 'nexttrack', 'previoustrack'];
   let playbackReported = false;
+  let playbackReport = '', playbackId = null, playbackComplete = true, playbackContext = null;
   let socket, reconnectTimer, context, stream, capture, micSource, wakeLock;
   let nextPlaybackTime = 0, lastMeterAt = 0, resampler = null;
   const playback = new Set(), tones = new Set();
@@ -270,21 +271,27 @@
     if (outgoing.length) socket.send(pcmLittleEndian(outgoing));
   }
   function reportPlayback(active, force = false) {
-    if (!force && playbackReported === active) return;
+    const report = {type: 'playback', active, response_id: playbackId, drained: playbackComplete && !playback.size};
+    const encoded = JSON.stringify(report);
+    if (!force && playbackReport === encoded) return;
     playbackReported = active;
-    if (state.connected && socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({type: 'playback', active}));
+    playbackReport = encoded;
+    if (state.connected && socket?.readyState === WebSocket.OPEN) socket.send(encoded);
   }
   // WebAudio's clock, not receipt of a network chunk, determines actual start.
   setInterval(() => {
-    if (context?.state === 'running' && [...playback].some(source => source.playAt <= context.currentTime)) reportPlayback(true);
+    if (state.connected) reportPlayback(context?.state === 'running' && [...playback].some(source => source.playAt <= context.currentTime));
   }, 20);
   function flush() {
-    const hadPlayback = playback.size > 0 || playbackReported;
+    const hadPlayback = playback.size > 0 || playbackReported || !playbackComplete;
     for (const source of playback) { try { source.stop(); } catch (_) {} }
     for (const tone of tones) { try { tone.stop(); } catch (_) {} }
     playback.clear(); tones.clear();
+    playbackComplete = true;
     if (hadPlayback) reportPlayback(false, true);
+    playbackId = null; playbackReport = '';
     nextPlaybackTime = context?.currentTime || 0;
+    playbackContext = context;
     state.speaking = false;
     updateControls();
   }
@@ -297,13 +304,17 @@
     const source = context.createBufferSource();
     source.buffer = buffer; // WebAudio resamples 24 kHz to the shared context rate.
     source.connect(context.destination);
-    // nextPlaybackTime is in the clock of the current AudioContext; a value from an old
-    // (closed) context would schedule speech minutes into the future -> silence.
-    if (nextPlaybackTime > context.currentTime + 30) nextPlaybackTime = 0;
+    // Reset only when the AudioContext changes. A long queue in the same clock
+    // is valid; resetting it would overlap the next chunk with earlier speech.
+    if (playbackContext !== context) {
+      playbackContext = context;
+      nextPlaybackTime = context.currentTime;
+    }
     const at = Math.max(context.currentTime + 0.025, nextPlaybackTime);
     nextPlaybackTime = at + buffer.duration;
     source.playAt = at;
     playback.add(source);
+    reportPlayback(playbackReported);
     source.onended = () => {
       const removed = playback.delete(source);
       source.disconnect();
@@ -348,7 +359,7 @@
     return url.href;
   }
   function helloMessage() {
-    return {type: 'hello', lang: 'en', ...(!displayMode ? {earphones} : {}), ...(state.coords || {})};
+    return {type: 'hello', lang: 'en', playback_protocol: 1, ...(!displayMode ? {earphones} : {}), ...(state.coords || {})};
   }
   function connect() {
     if (!state.running) return;
@@ -398,6 +409,12 @@
   }
   function handleMessage(message) {
     switch (message.type) {
+      case 'audio_start':
+        if (audioEnabled) { playbackId = message.id; playbackComplete = false; reportPlayback(playbackReported); }
+        break;
+      case 'audio_end':
+        if (audioEnabled && message.id === playbackId) { playbackComplete = true; reportPlayback(playbackReported); }
+        break;
       case 'capture': camera.requestCapture(message); break;
       case 'observation': camera.observe(message); break;
       case 'flush': flush(); break;

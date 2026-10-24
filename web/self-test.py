@@ -61,7 +61,7 @@ async def main():
               createBufferSource() {
                 const s = super.createBufferSource(), stop = s.stop.bind(s), start = s.start.bind(s);
                 s.stop = (...args) => { window.__stops++; return stop(...args); };
-                s.start = (...args) => { if (Number.isFinite(args[0])) window.__starts.push({scheduled: args[0], now: this.currentTime}); return start(...args); };
+                s.start = (...args) => { if (Number.isFinite(args[0])) window.__starts.push({scheduled: args[0], now: this.currentTime, duration: s.buffer?.duration || 0}); return start(...args); };
                 return s;
               }
             };
@@ -114,10 +114,32 @@ async def main():
         assert {'type': 'audio_mode', 'earphones': False} in messages
         assert {'type': 'suggestion_action', 'sci': 'Cardinalis cardinalis', 'action': 'accept'} in messages
         assert {'type': 'suggestion_action', 'sci': 'Turdus migratorius', 'action': 'dismiss'} in messages
-        assert {'type': 'playback', 'active': True} in messages
-        assert {'type': 'playback', 'active': False} in messages
+        assert any(m.get('type') == 'playback' and m.get('active') is True for m in messages)
+        assert any(m.get('type') == 'playback' and m.get('active') is False for m in messages)
         results['audioModesAndPlaybackReports'] = True
         results['suggestionChipActions'] = True
+        # Queue 40 seconds immediately in a suspended real AudioContext. Stream
+        # synthesis can run much faster than playback; no waiting for 40 seconds.
+        burst = await evaluate("""(async () => {
+          const ws = window.__sockets[0], ac = window.__contexts[0];
+          const json = message => ws.dispatchEvent(new MessageEvent('message', {data:JSON.stringify(message)}));
+          json({type:'flush'}); await ac.suspend();
+          const before = window.__starts.length;
+          json({type:'audio_start',id:'long-reply'});
+          for (let i=0;i<40;i++) ws.dispatchEvent(new MessageEvent('message',{data:new ArrayBuffer(48000)}));
+          json({type:'audio_end',id:'long-reply'});
+          const starts=window.__starts.slice(before);
+          return {count:starts.length, nonoverlap:starts.every((s,i)=>!i || s.scheduled+1e-6>=starts[i-1].scheduled+starts[i-1].duration),
+            lead:starts.at(-1).scheduled-ac.currentTime};
+        })()""")
+        assert burst['count'] == 40 and burst['nonoverlap'] and burst['lead'] > 38, burst
+        await asyncio.sleep(.1)
+        messages = [json.loads(e['params']['response']['payloadData']) for e in events
+                    if e.get('method') == 'Network.webSocketFrameSent' and e['params']['response']['opcode'] == 1]
+        assert any(m.get('response_id') == 'long-reply' and m.get('drained') is False for m in messages), messages[-5:]
+        assert not any(m.get('response_id') == 'long-reply' and m.get('drained') is True for m in messages)
+        await evaluate("window.__sockets[0].dispatchEvent(new MessageEvent('message',{data:JSON.stringify({type:'flush'})})); window.__contexts[0].resume()")
+        results['longSpeechQueueNoOverlap'] = burst
         await evaluate("window.__sockets[0].dispatchEvent(new MessageEvent('message', {data:JSON.stringify({type:'suggestions',items:[]})}))")
         shot = await call('Page.captureScreenshot', format='png', captureBeyondViewport=False)
         (ROOT / 'screenshot.png').write_bytes(base64.b64decode(shot['data']))

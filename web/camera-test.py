@@ -48,7 +48,9 @@ def serve(port):
         async def rt_send(self, event):
             pass  # Model transport is a fixture too, including result injection.
 
-        async def generate(self, phase):
+        async def generate(self, phase, *, guard=None):
+            if guard is not None and not guard():
+                return {"status": "deferred"}
             if phase == "answer" and self.expert_readout:
                 await self.phone_json({"type": "transcript", "role": "assistant",
                                        "text": self.expert_readout, "final": True})
@@ -68,6 +70,9 @@ def serve(port):
                 elif text == "fixture:checklist":
                     await self.phone_json({"type": "transcript", "role": "assistant",
                                            "text": "Fixture checklist is still responsive.", "final": True})
+                elif text == "fixture:explain-r1":
+                    result = await self.tool("get_investigations", {"id": "R1", "explain": True})
+                    await self.speak_expert(result["answer"])
                 else:
                     self.expert = SimpleNamespace(available=True, answer=self.fixture_expert)
                     await self.tool("ask_expert", {"question": text})
@@ -294,10 +299,14 @@ async def test(port, cdp):
         await js("document.getElementById('quiet').click()")
         await typed("fixture:finish")
         await until("document.querySelector('[data-id=R1] .investigation-status')?.textContent === 'Ready'")
-        assert not await js("document.getElementById('assistant-caption').textContent.includes('Investigation R1')")
+        assert not await js("document.getElementById('assistant-caption').textContent.toLowerCase().includes('investigation r1')")
         assert await js("document.querySelector('[data-id=R1] .investigation-answer').textContent.includes('original bird')")
         await js("document.getElementById('quiet').click()")
-        await until("document.getElementById('assistant-caption').textContent.includes('Investigation R1')")
+        await until("document.getElementById('assistant-caption').textContent.includes('Would you like me to explain?')")
+        assert not await js("document.getElementById('assistant-caption').textContent.includes('Fixture result')")
+        await typed("fixture:explain-r1")
+        await until("document.getElementById('assistant-caption').textContent.includes('Fixture result')")
+        results["investigationResultsRequireConsent"] = True
         await js("document.querySelector('[data-id=R2]').open=true; document.querySelector('[data-id=R2] button[data-action=retry]').click()")
         await until("document.querySelector('[data-id=R3] .investigation-status')?.textContent === 'Ready'")
         assert await js("document.querySelector('[data-id=R3] .investigation-question').textContent === 'fixture:research-two'")

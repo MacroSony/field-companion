@@ -310,3 +310,114 @@ class InvestigationSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.c.pending), 1)
         self.assertEqual(job.status, "completed")
         self.assertTrue(job.result["ok"])
+
+    async def test_completed_jobs_offer_once_together_without_reading_findings(self):
+        for question in ("First?", "Second?"):
+            await self.c.tool("ask_expert", {"question": question})
+        self.release.set()
+        await until(lambda: all(j.status == "completed" for j in self.c.investigations.jobs.values()))
+        self.c.connected = True
+        spoken = []
+        async def generate(phase, **kwargs):
+            spoken.append(self.c.expert_readout)
+            return {"status": "completed"}
+        self.c.generate = generate
+        self.c.tasks.append(asyncio.create_task(self.c.turn_worker()))
+        self.c.work_ready.set()
+        await until(lambda: len(spoken) == 1 and not self.c.active)
+        await asyncio.sleep(.02)
+        self.assertEqual(len(spoken), 1)
+        self.assertIn("R1", spoken[0])
+        self.assertIn("R2", spoken[0])
+        self.assertIn("Which would you like me to explain?", spoken[0])
+        self.assertNotIn("bird's bill", spoken[0])
+        self.assertNotIn("bird's bill", str(self.c.rt_send.call_args_list))
+        self.assertEqual(self.c.investigation_offer_ids, ["R1", "R2"])
+        ambiguous = await self.c.tool("get_investigations", {"explain": True})
+        self.assertTrue(ambiguous["requires_selection"])
+        self.assertNotIn("bird's bill", ambiguous["answer"])
+        explicit = await self.c.tool("get_investigations", {"id": "R1", "explain": True})
+        self.assertIn("bird's bill", explicit["answer"])
+
+    async def test_status_only_offers_explanation_and_yes_reads_the_offered_job(self):
+        await self.c.tool("ask_expert", {"question": "First?"})
+        self.release.set()
+        await until(lambda: self.c.investigations.jobs["R1"].status == "completed")
+        status = await self.c.tool("get_investigations", {"id": "R1"})
+        self.assertNotIn("bird's bill", status["answer"])
+        self.assertIsNone(status["investigations"][0]["result"])
+        self.assertIn("Would you like me to explain?", status["answer"])
+        # A newer background job must not change what accepting the offer means.
+        self.release.clear()
+        await self.c.tool("ask_expert", {"question": "Second?"})
+        result = await self.c.tool("get_investigations", {"explain": True})
+        self.assertIn("Investigation R1", result["answer"])
+        self.assertIn("bird's bill", result["answer"])
+        self.assertEqual(self.c.investigation_offer_ids, [])
+
+    async def test_next_notice_waits_for_phone_to_drain_previous_short_offer(self):
+        phone = SimpleNamespace(send_json=AsyncMock(), send_bytes=AsyncMock())
+        client = s.Client(phone, self.c)
+        client.earphones, client.playback_protocol = True, 1
+        self.c.clients.add(client)
+        self.c.mic = client
+        self.c.connected = True
+        spoken = []
+        async def generate(phase, **kwargs):
+            spoken.append(self.c.expert_readout)
+            rid = "offer-" + str(len(spoken))
+            self.c.phase, self.c.audio_allowed = "answer", True
+            self.c.response_id, self.c.first_audio = rid, False
+            await self.c.handle_rt({"type": "response.audio.delta", "response_id": rid, "delta": "AAA="})
+            await self.c.handle_rt({"type": "response.done", "response": {"id": rid, "status": "completed"}})
+            return {"status": "completed"}
+        self.c.generate = generate
+        self.c.tasks.append(asyncio.create_task(self.c.turn_worker()))
+        await self.c.tool("ask_expert", {"question": "First?"})
+        self.release.set()
+        await until(lambda: len(spoken) == 1 and not self.c.active)
+        await self.c.tool("ask_expert", {"question": "Second?"})
+        await until(lambda: self.c.investigations.jobs["R2"].status == "completed")
+        self.c.play_until = self.c.echo_estimate = 0
+        self.c.work_ready.set()
+        await asyncio.sleep(.02)
+        self.assertEqual(len(spoken), 1)
+        self.assertFalse(self.c.investigations.jobs["R2"].announced)
+        await self.c.handle_phone({"type": "playback", "active": False, "drained": True, "response_id": "offer-1"}, client)
+        await until(lambda: len(spoken) == 2)
+        self.assertNotIn("bird's bill", " ".join(spoken))
+
+    async def test_user_speech_gets_its_next_reply_before_ready_offer(self):
+        client = s.Client(SimpleNamespace(send_json=AsyncMock(), send_bytes=AsyncMock()), self.c)
+        client.earphones, client.playback_protocol = True, 1
+        self.c.clients.add(client)
+        self.c.mic = client
+        self.c.connected = True
+        self.c.user_speaking = self.c.awaiting_transcript = True
+        spoken = []
+        async def generate(phase, **kwargs):
+            if phase == "route":
+                return {"status": "completed", "output": [{"type": "function_call",
+                    "name": "get_checklist", "call_id": "count", "arguments": "{}"}]}
+            spoken.append(self.c.expert_readout or "Normal reply to the user")
+            rid = "speech-" + str(len(spoken))
+            self.c.phase, self.c.audio_allowed, self.c.first_audio = "answer", True, False
+            self.c.response_id = rid
+            await self.c.handle_rt({"type": "response.audio.delta", "response_id": rid, "delta": "AAA="})
+            await self.c.handle_rt({"type": "response.done", "response": {"id": rid, "status": "completed"}})
+            return {"status": "completed"}
+        self.c.generate = generate
+        self.c.tasks.append(asyncio.create_task(self.c.turn_worker()))
+        await self.c.tool("ask_expert", {"question": "First?"})
+        self.release.set()
+        await until(lambda: self.c.investigations.jobs["R1"].status == "completed")
+        await asyncio.sleep(.02)
+        self.assertEqual(spoken, [])
+        await self.c.handle_rt({"type": "conversation.item.input_audio_transcription.completed",
+                               "transcript": "How many species today?"})
+        await until(lambda: len(spoken) == 1 and not self.c.active)
+        self.assertEqual(spoken, ["Normal reply to the user"])
+        await self.c.handle_phone({"type": "playback", "active": False, "drained": True, "response_id": "speech-1"}, client)
+        await until(lambda: len(spoken) == 2)
+        self.assertIn("Would you like me to explain?", spoken[1])
+        self.assertNotIn("bird's bill", spoken[1])

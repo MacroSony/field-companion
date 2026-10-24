@@ -132,6 +132,44 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         await self.c.handle_rt({"type": "response.output_audio.delta", "delta": "AAA="})
         self.assertEqual(self.phone.audio, [b"\0\0"])
 
+    async def test_playback_waits_for_matching_drained_ack_even_before_play_starts(self):
+        await self.c.handle_phone({"type": "hello", "playback_protocol": 1})
+        self.c.phase, self.c.audio_allowed, self.c.response_id = "answer", True, "voice-1"
+        await self.c.handle_rt({"type": "response.audio.delta", "response_id": "voice-1", "delta": "AAA="})
+        self.assertTrue(self.client.playback_pending)
+        self.assertIn({"type": "audio_start", "id": "voice-1"}, self.phone.events)
+        # Network buffering or a suspended AudioContext can outlast the estimate.
+        self.c.play_until = self.c.echo_estimate = 0
+        await self.c.handle_phone({"type": "playback", "response_id": "voice-1", "active": False, "drained": False})
+        self.assertTrue(self.c.playback_pending())
+        self.assertTrue(self.c.echo_blocked())
+        await self.c.handle_rt({"type": "response.done", "response": {"id": "voice-1", "status": "completed"}})
+        self.assertIn({"type": "audio_end", "id": "voice-1"}, self.phone.events)
+        await self.c.handle_phone({"type": "playback", "response_id": "older-voice", "active": False, "drained": True})
+        self.assertTrue(self.c.playback_pending())
+        await self.c.handle_phone({"type": "playback", "response_id": "voice-1", "active": False, "drained": True})
+        self.assertFalse(self.c.playback_pending())
+
+    async def test_stale_response_audio_and_done_cannot_join_or_finish_new_reply(self):
+        self.c.phase, self.c.audio_allowed, self.c.response_id = "answer", True, "new-voice"
+        self.c.response_waiter = asyncio.get_running_loop().create_future()
+        await self.c.handle_rt({"type": "response.audio.delta", "response_id": "old-voice", "delta": "AAA="})
+        await self.c.handle_rt({"type": "response.done", "response": {"id": "old-voice", "status": "completed"}})
+        self.assertEqual(self.phone.audio, [])
+        self.assertFalse(self.c.response_waiter.done())
+        await self.c.handle_rt({"type": "response.done", "response": {"id": "new-voice", "status": "completed"}})
+        self.assertTrue(self.c.response_waiter.done())
+
+    async def test_notice_guard_is_rechecked_after_session_update(self):
+        ready = True
+        async def user_arrives(config):
+            nonlocal ready
+            ready = False
+        self.c.update_session = AsyncMock(side_effect=user_arrives)
+        response = await self.c.generate("answer", guard=lambda: ready)
+        self.assertEqual(response["status"], "deferred")
+        self.c.rt_send.assert_not_awaited()
+
     async def test_tap_cancels_and_drops_late_audio(self):
         self.c.phase = "answer"
         self.c.connected = self.c.active = True
@@ -236,6 +274,7 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_echo_filter_drops_fragment_and_passes_genuine_question(self):
         self.c.phase = "answer"
+        await self.c.handle_rt({"type": "response.created", "response": {"id": "r1"}})
         await self.c.handle_rt({"type": "response.output_audio_transcript.delta", "response_id": "r1",
                                "delta": "I appreciate the quiet woods. What would you like to ask?"})
         self.assertTrue(self.c.transcript_is_echo("I appreciate the."))

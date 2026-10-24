@@ -81,6 +81,11 @@ async def main(delay, report_path):
         assert c.chinese(live.result["answer"])
         assert live.result["source_ids"], live.result
         await until(lambda: live.announced and not c.active)
+        ready = [e["text"] for e in events if e.get("type") == "transcript"
+                 and e.get("role") == "assistant" and e.get("final")][-1]
+        assert "讲" in ready or "explain" in ready.lower(), ready
+        await turn("好的，讲一下第一个调查的结果。", "get_investigations")
+        assert len(c.investigations.jobs) == 1, "Accepting an explanation started another investigation"
         print(json.dumps({"real_gpt_result": live.payload()}, ensure_ascii=False), flush=True)
 
         async def fixture(question, snapshot, *, on_progress, **kwargs):

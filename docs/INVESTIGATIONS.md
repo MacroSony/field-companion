@@ -20,8 +20,11 @@ species data sources.
   fresh task using the saved original question and evidence. It is a new attempt,
   not resumption of an unfinished model's hidden reasoning.
 - Completed answers and source links remain on the Investigations cards. A voice
-  result includes its task ID and original subject so it is not mistaken for the
-  currently photographed organism.
+  notice only says that a task is ready and asks whether to explain it; findings
+  are never read automatically. Say “Yes, explain it”, “Explain R1” or “讲一下
+  第一个结果” to hear the saved answer. If several tasks are ready, select one.
+  A requested result includes its task ID and original subject so it is not
+  mistaken for the currently photographed organism.
   The read-only display shows a compact task state in its header, keeping the
   live captions visible; full task cards and controls are on the phone.
 
@@ -42,9 +45,13 @@ and model-call boundaries. “Analyzing” does not expose the model's internal
 progress. API/network failures and exhausted budgets terminate the task without
 holding the voice worker. The next queued task can then start.
 
-Completion immediately updates the screen. Spoken completion notices use the
-existing serialized voice worker, yielding to queued user input, ongoing user
-speech, pending transcription, assistant playback and its echo tail. They remain
+Completion immediately updates the screen. Multiple ready tasks are combined
+into one short offer, such as “Also, investigations R1, R2 are ready. Which would
+you like me to explain?” The existing serialized voice worker yields to queued
+user input, ongoing user speech, pending transcription, assistant playback and
+its echo tail. If a user is speaking, their next reply is answered and played
+before the offer. An in-flight session update rechecks this guard before starting
+the notice. Offers remain
 deferred in Quiet mode, including after Tap; a user-requested status/result read
 uses the normal Tap/Quiet rules. A voice interruption ends a notice without
 deleting the saved answer. Notification generation has at most one automatic
@@ -53,12 +60,25 @@ retry; the completed answer remains readable if voice delivery fails.
 The voice model receives a fresh compact task summary for routing. Tools:
 
 - `ask_expert(question)`: create a task and return its acknowledgement/ID.
-- `get_investigations(id?, selection?)`: read progress or completed answers.
+- `get_investigations(id?, selection?, explain=false)`: read progress and offer
+  an explanation; only `explain=true` reads completed answers. Accepting a single
+  offer targets the offered job even if newer tasks exist. Accepting a multiple
+  offer without selecting a task asks which result to explain.
 - `manage_investigation(action, id?, selection?)`: cancel or retry.
 
 `selection` is `first`, `latest` or `all`. Explicit “first” refers to `R1`, not the
 next running task. Cancelling an already completed task cannot cancel a different
 active task. Without a selector, cancel targets the latest active investigation.
+
+The phone advertises `playback_protocol: 1` in `hello`. The backend marks each
+audio reply pending **before** sending its `audio_start` marker and PCM, then
+sends `audio_end` after synthesis. The client acknowledges `response_id` and
+`drained` only once all chunks are received and its WebAudio queue is empty.
+Queued/suspended playback therefore blocks notices, and stale acknowledgements
+cannot release a newer reply. Legacy clients keep the duration/playback fallback.
+Audio chunks remain sequential even when more than 30 seconds are queued; the
+playback clock resets only for a new AudioContext or an explicit flush. Late
+chunks and completion events from a different response are ignored.
 
 ## Time limits and retention
 
@@ -137,3 +157,21 @@ field-recognition acceptance remain separate.
 After merging the parallel recognition/runtime branch, retain its fresh-state,
 history and reset behavior along with this independent queue. A full session reset
 should close/cancel the previous investigation queue before creating a new one.
+
+## Ready offers and playback regression — 2026-10-24
+
+The follow-up changes automatic result readouts into short, batched explanation
+offers. Offline tests cover no findings in the offer, status-only reads,
+single-offer acceptance, multiple-offer selection, user-speech/next-reply ordering,
+matching playback acknowledgements, stale response events and the session-update
+race. A real Chromium check queues 40 seconds of PCM while WebAudio is suspended
+and verifies every chunk starts after the preceding chunk ends, without waiting
+40 seconds in real time. The camera browser suite checks a ready card first,
+then a short offer, and an explanation only after a simulated explicit request.
+
+Real Higgs checks with fixture expert results confirmed that “好的。” routes to
+the offered investigation and “先不讲。” stays silent. A separate live check used
+one real source-backed GPT result, an explicit explanation request, and a
+simulated 45-second investigation while normal questions continued. These checks
+collect PCM without physical playback; the mobile device remains the final
+audible acceptance check. Reports are in ignored `out/investigation-checks/`.
