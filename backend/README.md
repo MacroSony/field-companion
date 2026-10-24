@@ -3,6 +3,79 @@
 The optional [GPT Naturalist expert path](../docs/EXPERT.md) handles complex
 comparisons and species-fact follow-ups without changing the logging fast path.
 
+## Local session diagnostics and opt-in field recording
+
+Every `Session.log()` event is also appended immediately to
+`logs/session-YYYYMMDD.jsonl` under the repository root (local date, all sessions).
+Each line includes a timezone-aware wall-clock `timestamp` and session
+`connection`. Use `--log-dir DIR` to change the directory or `--no-log-file` to
+keep stdout only. Credentials and authorization/header fields are redacted;
+request headers, API keys, image bytes and PCM are not intentionally logged.
+Transcripts, tool arguments, locations and other diagnostic fields **are sensitive**.
+These are diagnostic files, not restoration of the in-memory outing state.
+
+`--record-dir DIR` separately opts in to mono **48 kHz PCM16 WAVs** plus
+`DIR/turns.jsonl`. It is **off by default**, including when event logging is on;
+`--no-log-file` does not disable an explicitly requested recorder. For example:
+
+```bash
+python -B backend/server.py --port 8796 --log-dir logs --record-dir recordings/field-trip
+# No persistent diagnostics or recordings:
+python -B backend/server.py --port 8796 --no-log-file
+```
+
+**Privacy:** the recorder captures everyone near the microphone, including
+bystanders and assistant playback, not just the owner. Obtain appropriate consent.
+Diagnostic files stay local; there is no uploader for them (the normal live
+Higgs audio/STT path is unchanged). `logs/` and `recordings/` are ignored by Git;
+keep custom directories outside version control too. New files are owner-only.
+There is no retention cleanup or disk quota: protect, review and delete these
+files yourself. Disk-write failures warn without stopping the voice session.
+
+### Turn rows and timing limitations
+
+One final row per VAD occurrence contains a unique `turn_id`, provider `item_id`,
+receipt wall time, transcript, WAV filename/duration, outcome/reason, routed tool
+and full redacted arguments, assistant-audio flag and speaker/earphone/echo-guard
+mode at speech start. Outcomes include `guarded_during_playback`, `echo_dropped`,
+`input_ignored`, `stop`, `camera_confirmation`, `routed` and `no_route`. Reused
+provider IDs keep separate occurrence IDs; merged queued utterances share the
+route result but retain separate audio/transcripts. Audio is saved promptly;
+the row waits for the immediate route/answer, or at most 60 seconds after stop
+(60 seconds after start if stop is missing). Disconnect, reset and close flush
+unfinished rows, so no-route turns are retained. A process crash before row
+finalization can leave an orphan WAV. Later-than-timeout routes and subsequent
+photo/investigation announcements do not revise the row. `assistant_audio`
+means backend reply/feedback PCM was produced, not proof of audible phone playback.
+
+Provider `audio_start_ms`/`audio_end_ms` are **not used**: buffer clears,
+reconnects, queued input and speaker-mode withholding make their origin unsafe
+to map directly onto the unbroken mic ring. Instead, monotonic VAD **receipt**
+timestamps anchor the latest absolute mic sample position. WAVs cover that start
+minus 300 ms through that stop plus 300 ms. This is approximate acoustic alignment:
+onset error includes upstream queue/network/VAD delay and up to one mic packet
+(accepted packets are at most one second); stop receipt additionally includes the
+configured **600 ms VAD silence**. Expect hundreds of milliseconds of error even
+without a stall; no measured hardware bound is claimed, and network stalls can
+be worse. The 300 ms pre-padding cannot guarantee the full physical onset under
+high latency. Wall time is receipt time, not calibrated microphone capture time.
+
+The existing float mic ring is 48 kHz, circular, with absolute `position` indices.
+The recorder copies incremental slices before its 30-second rollover, preserving
+long turns until the missing-stop timeout. Post-padding waits for mic samples,
+with a 500 ms wall timeout if capture pauses. Bounds and `clipped` expose missing
+padding/audio (including session startup/reset). `Session.extract_turn_audio()`
+and `session_data.extract_turn_audio()` provide reusable padded ring extraction
+for future gates; they clip unavailable samples, never invent silence.
+`speech_rms_dbfs` and `peak_dbfs` use the unpadded receipt interval;
+`noise_floor_dbfs` is only the RMS of the available padding, not a calibrated noise
+estimator. Silence is floored at -120 dBFS; unavailable features are null. VAD
+hangover, alignment error and playback can contaminate these crude features.
+
+Offline regression tests are in `backend/test_session_data.py`; run them with the
+existing `python -B -m unittest discover -s backend -p 'test_*.py'` suite, not the
+live `selftest.py`.
+
 ## Existing task progress and photo reuse
 
 Photo identification and GPT investigations share the read-only `get_task_status`

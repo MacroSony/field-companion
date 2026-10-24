@@ -30,3 +30,7 @@ out/
 node_modules/
 backend/*.log
 web/testaudio/
+
+# Local field diagnostics (may contain bystander speech/transcripts)
+logs/
+recordings/
