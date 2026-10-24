@@ -1,5 +1,6 @@
 """Offline regressions for camera/research status and unread photo protection."""
 import asyncio
+from copy import deepcopy
 import io
 import json
 import threading
@@ -16,6 +17,8 @@ from test_server import ASGIClient, FakePhone
 
 
 class TaskStatusTests(unittest.IsolatedAsyncioTestCase):
+    NEW_SUBJECT = "I found another animal. Could you help me check it out?"
+
     async def asyncSetUp(self):
         self.c = s.Session("task-status-test")
         self.c.expert = NaturalistExpert(Settings(enabled=False))
@@ -70,6 +73,23 @@ class TaskStatusTests(unittest.IsolatedAsyncioTestCase):
         text = json.dumps(payload, ensure_ascii=False)
         self.assertNotIn("SECRET-RESEARCH-FINDINGS", text)
         self.assertNotIn("the bird eats seeds", text)
+
+    def assert_fresh_subject(self, old):
+        current = self.c.observations[self.c.focus]
+        self.assertNotEqual(current.id, old.id)
+        self.assertEqual(current.fused, [])
+        self.assertEqual(current.detections, [])
+        self.assertNotEqual(current.hint, old.hint)
+        self.assertNotIn(old.hint, current.hint)
+        self.assertEqual(current.image_revision, 0)
+        self.assertIsNone(current.count)
+        self.assertEqual(current.analysis_status, "awaiting_confirmation")
+        self.assertEqual(current.analysis_stage, "camera_opening")
+        self.assertEqual(self.c.camera_request["obs"], current.id)
+        self.assertTrue(any(e.get("type") == "camera_prepare" and e.get("obs") == current.id
+                            for e in self.phone.events))
+        self.assertFalse(any(e.get("type") == "capture" for e in self.phone.events))
+        return current
 
     async def test_invalid_model_status_arguments_clarify_without_starting_work(self):
         for arguments in ('{"scope":"invalid"}', '{invalid-json'):
@@ -342,6 +362,99 @@ class TaskStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("SECRET-RESEARCH-FINDINGS", self.c.speak_expert.await_args.args[0])
         self.assertTrue(job.announced)
         self.assertEqual(self.c.investigation_offer_ids, [])
+
+    async def test_logged_new_subject_overrides_old_photo_routes_without_inheriting_evidence(self):
+        for wrong_tool in ("look", "get_observation", "speak"):
+            with self.subTest(wrong_tool=wrong_tool):
+                old = await self.photo()
+                old.hint = "Old eagle's bill on the original branch"
+                old_vision = ("vision", {"obs": old.id, "image_revision": old.image_revision,
+                                         "request_id": old.analysis_request_id}, None)
+                self.c.pending.append(old_vision)
+                args = {"hint": old.hint} if wrong_tool == "look" else (
+                    {"reason": "Help identify the animal"} if wrong_tool == "speak" else {})
+                await self.route(self.NEW_SUBJECT, wrong_tool, args)
+                fresh = self.assert_fresh_subject(old)
+                self.assertNotIn(old_vision, self.c.pending)
+                self.assertEqual(old.status, "discarded")
+                self.assertEqual(old.fused[0]["sci"], "Haliaeetus leucocephalus")
+                self.assertEqual(len(old.detections), 1)
+                request = self.c.camera_request
+                await self.c.camera_ready({"request_id": request["id"]})
+                self.assertFalse(any(e.get("type") == "capture" for e in self.phone.events))
+                await self.c.camera_confirmation("Start.")
+                self.assertEqual(request["phase"], "capturing")
+                self.assertEqual(len([e for e in self.phone.events if e.get("type") == "capture"]), 1)
+                self.assertEqual(fresh.fused, [])
+
+    async def test_new_subject_preserves_a_previously_confirmed_checklist_observation(self):
+        old = await self.photo()
+        old.hint = "The original eagle's tail"
+        old.status, old.count = "confirmed", 2
+        before = deepcopy(old.payload())
+        await self.route(self.NEW_SUBJECT, "look")
+        self.assert_fresh_subject(old)
+        self.assertEqual(old.payload(), before)
+        self.assertEqual(old.status, "confirmed")
+        self.assertEqual([(r["sci"], r["count"]) for r in self.c.items],
+                         [("Haliaeetus leucocephalus", 2)])
+
+    async def test_new_subject_keeps_running_research_bound_to_its_original_snapshot(self):
+        old = await self.photo()
+        old.hint = "Original animal behind the tree"
+        job = self.research("R1", stage="analyzing")
+        job.observation = deepcopy(old.payload())
+        snapshot = deepcopy(job.observation)
+        await self.route(self.NEW_SUBJECT, "get_observation")
+        self.assert_fresh_subject(old)
+        self.assertIs(self.c.investigations.jobs["R1"], job)
+        self.assertEqual((job.status, job.stage), ("running", "analyzing"))
+        self.assertEqual(job.observation, snapshot)
+        self.assertEqual(job.observation["id"], old.id)
+        self.assertFalse(job.announced)
+
+    async def test_another_named_sighting_logs_without_opening_a_camera(self):
+        await self.photo()
+        taxon = {"sci": "Haliaeetus leucocephalus", "en": "Bald Eagle", "group": "Aves"}
+        with patch.object(s, "resolve", return_value=taxon):
+            await self.route("I saw another bald eagle.", "add_observation", {
+                "name": "Bald Eagle", "group": "Aves", "count": 1, "notes": ""})
+        self.assertIsNone(self.c.camera_request)
+        self.assert_no_camera_commands()
+        self.assertEqual([(r["sci"], r["count"]) for r in self.c.items],
+                         [("Haliaeetus leucocephalus", 1)])
+
+    async def test_new_subject_invalidates_old_inflight_photo_and_preserves_the_new_stage(self):
+        old_obs, old_request, jpeg = await self.prepare_upload()
+        old_obs.hint = "Old subject's wings"
+        started, release = threading.Event(), threading.Event()
+        def classify(*args):
+            started.set()
+            if not release.wait(3):
+                raise RuntimeError("Offline fixture was not released")
+            return {"candidates": [{"sci": "Haliaeetus leucocephalus", "p": .99}]}
+        with patch.object(s, "classify_frame", side_effect=classify) as classifier:
+            work = asyncio.create_task(self.upload(old_request, jpeg))
+            try:
+                self.assertTrue(await asyncio.to_thread(started.wait, 1))
+                await self.route(self.NEW_SUBJECT, "look")
+                fresh = self.assert_fresh_subject(old_obs)
+                newer = self.c.camera_request
+                rejected = await self.upload(old_request, jpeg)
+                self.assertEqual(rejected.status_code, 409)
+                self.assertEqual(classifier.call_count, 1)
+            finally:
+                release.set()
+                result = await asyncio.wait_for(work, 2)
+        self.assertEqual(result.status_code, 409)
+        self.assertIs(self.c.camera_request, newer)
+        self.assertEqual((newer["phase"], fresh.analysis_status, fresh.analysis_stage),
+                         ("opening", "awaiting_confirmation", "camera_opening"))
+        self.assertEqual(fresh.analysis_request_id, newer["id"])
+        self.assertEqual(fresh.fused, [])
+        self.assertEqual(fresh.detections, [])
+        self.assertEqual(old_obs.image_revision, 0)
+        self.assertFalse(any(p[0] == "vision" for p in self.c.pending))
 
     async def test_real_upload_progress_does_not_cancel_classification_or_lose_its_result(self):
         obs, request, jpeg = await self.prepare_upload()

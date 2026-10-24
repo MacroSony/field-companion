@@ -16,6 +16,7 @@ unread result. The backend implements this with canonical task snapshots and
 | “What is the status of all tasks?” | Summarize photo and investigation progress. |
 | “Tell me the result.” / “Explain R1.” / acceptance of an actual explanation offer | Follow the existing result/explanation path, not a progress check. |
 | “Look again.” / “Take another photo.” / “Identify a different animal.” | Keep explicit camera intent; prepare another capture using the normal confirmation rules. |
+| “I found another animal. Could you help me check it out?” | Create a fresh subject, prepare the camera and wait for Start; never answer from the previous animal's evidence. |
 | Manual **Identify this subject** / **Look again** / **New subject** | Keep the button's explicit camera authorization. |
 
 The parser in `backend/task_status.py` is conservative. It recognizes clear
@@ -98,6 +99,14 @@ Status reads preserve queued `vision` work. Only explicit new camera intent,
 manual capture controls, or existing cancellation/focus-reset rules can replace
 it. This distinction also applies after image inference finishes but before
 the result is spoken; `ready` is not permission to discard unread work.
+
+New-subject inspection requests are resolved before old-photo reuse protection.
+The backend corrects a mistaken `look`, evidence-read or speech selection to a
+new observation with empty image evidence, candidates and hints. Existing
+confirmed sightings and investigation snapshots remain intact. A retake stays
+with the same observation; a plain sighting/count report or a species comparison
+does not authorize a camera switch. Both new-subject and retake previews retain
+the separate Start/Identify confirmation.
 
 ## Verification and limits
 

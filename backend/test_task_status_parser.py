@@ -1,10 +1,34 @@
 """Status parsing never creates camera/research work or consumes result consent."""
 import unittest
 
-from task_status import explicit_retake, parse_status_query
+from task_status import explicit_retake, new_subject_request, parse_status_query
 
 
 class TaskStatusParserTests(unittest.TestCase):
+    def test_narrative_new_subject_requires_visual_request(self):
+        for text in (
+                "I found another animal. Could you help me check it out?",
+                "I saw another animal, could you help me checked it out?",
+                "我又发现一个动物，帮我看看是什么",
+                "Look at another bird.", "Identify a different animal.",
+                "New subject.", "Switch to a different subject."):
+            with self.subTest(text=text):
+                self.assertTrue(new_subject_request(text))
+                self.assertTrue(explicit_retake(text))
+                self.assertIsNone(parse_status_query(text))
+        for text in (
+                "I saw another bald eagle.", "What does another animal eat?",
+                "I haven't found another animal. Could you help me check it out?",
+                "Don't check another animal.", "If I find another animal, could you help me check it out?",
+                "Could this be another species?", "Add another bird.",
+                "Could you check the diet of another animal?", "Can you look up another bird's habitat?",
+                "我又发现一个动物，帮我看看它吃什么",
+                "I found another animal, what's R1's progress?",
+                "Look again.", "Take another photo of the same bird.",
+                "我没有发现另一个动物，帮我看看", "如果我又发现一个动物，帮我看看是什么"):
+            with self.subTest(text=text):
+                self.assertFalse(new_subject_request(text))
+
     def test_camera_progress_queries(self):
         for text in ("Check out the identification process.", "How is the identification going?",
                      "How is identification progressing?",

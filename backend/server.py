@@ -32,7 +32,7 @@ from expert import NaturalistExpert, revision as expert_revision
 from investigations import ACTIVE, InvestigationQueue, QueueFull
 from tool_feedback import TOOLS as FEEDBACK_TOOLS, recording as feedback_recording
 from route_safety import route_guard
-from task_status import parse_status_query, explicit_retake
+from task_status import parse_status_query, explicit_retake, new_subject_request
 
 MODEL = "higgs-realtime-1.5-preview"
 SR = 48000
@@ -308,6 +308,9 @@ An explicit request to start another investigation uses ask_expert, not a status
 Never invent progress, percentages, results or completion times.
 For a different organism ("look at a different bird") call new_observation, even if
 an earlier focus exists. "Look again" keeps that focus with look. Discard unwanted IDs with discard_observation.
+"I found another animal. Could you help me check it out?" requests a NEW subject:
+call new_observation, never answer using the previous subject's photo or candidate.
+Prepare the new camera preview and wait for Start/Identify before photographing it.
 Never invent sightings or identify from insufficient evidence; request camera evidence with look.
 Questions about birds heard, sounds, calls, or 'anything else' use recent_sounds(seconds=15). Only explicit questions about logged sightings/counts use get_checklist.
 Greetings, mic checks and general questions addressed to you use speak; sound/checklist questions use their read tools.
@@ -1890,10 +1893,25 @@ class Session:
         call = calls[0]
         name = call["name"]
         selector = self.status_selector(self.turn_question)
-        if selector is not None:
+        if new_subject_request(str(self.turn_question)):
+            # New-target intent must be checked before protecting the previous
+            # photo. Preserve only a valid category, never its old hint/evidence.
+            try:
+                original_args = json.loads(call.get("arguments") or "{}")
+            except (ValueError, TypeError):
+                original_args = {}
+            group = original_args.get("group") if isinstance(original_args, dict) else None
+            self.log("new_subject_guard", requested_tool=name)
+            call = {**call, "name": "new_observation", "arguments": json.dumps({"group": group} if group in GROUPS else {})}
+            name = "new_observation"
+        elif selector is not None:
             self.log("task_status_query", source="route_guard", requested_tool=name, selector=selector)
             call = {**call, "name": "get_task_status", "arguments": json.dumps(selector)}
             name = "get_task_status"
+        elif name == "new_observation" and explicit_retake(str(self.turn_question)):
+            # A retake keeps the current subject's accumulated evidence.
+            call = {**call, "name": "look"}
+            name = "look"
         elif name in ("look", "new_observation") and not explicit_retake(str(self.turn_question)):
             obs = self.observations.get(self.focus)
             if obs and obs.analysis_status == "ready" and obs.image_revision > 0:
@@ -2310,6 +2328,8 @@ class Session:
         if name in ("get_investigations", "manage_investigation"):
             return await self.investigation_tool(name, args)
         if name == "look":
+            if new_subject_request(str(self.turn_question)):
+                return await self.tool("new_observation", {k: v for k, v in args.items() if k == "group"})
             if (self.camera_request and self.camera_request["phase"] in ("capturing", "classifying")
                     and not explicit_retake(str(self.turn_question))):
                 return {"ok": True, "analysis_pending": True,
@@ -2322,7 +2342,7 @@ class Session:
             obs = self.observations.get(self.focus)
             if (obs and obs.analysis_request_id
                     and obs.analysis_status in ("ready", "awaiting_confirmation", "capturing", "analyzing")
-                    and not explicit_retake(str(self.turn_question))):
+                    and not (explicit_retake(str(self.turn_question)) or new_subject_request(str(self.turn_question)))):
                 return await self.task_status({"scope": "camera"})
             group = args.get("group", "Aves")
             if group not in GROUPS:

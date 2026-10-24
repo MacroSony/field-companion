@@ -34,13 +34,15 @@ def serve(port):
         def __init__(self, session_id):
             super().__init__(session_id)
             self.expert = NaturalistExpert(settings=Settings(enabled=False))
-            self.names = {"Turdus migratorius": {"sci": "Turdus migratorius", "en": "American Robin"}}
+            self.names = {"Turdus migratorius": {"sci": "Turdus migratorius", "en": "American Robin"},
+                          "Haliaeetus leucocephalus": {"sci": "Haliaeetus leucocephalus", "en": "Bald Eagle"}}
+            self.fixture_species = "Haliaeetus leucocephalus" if session_id.startswith("new-subject-") else None
             self.research_release = asyncio.Event()
             self.worker_release = asyncio.Event()
             self.worker_release.set()
 
         def allowed_species(self):
-            return set()
+            return {self.fixture_species} if self.fixture_species else set()
 
         def start(self):
             self.connected = True
@@ -62,7 +64,8 @@ def serve(port):
                 await self.worker_release.wait()
                 return {"status": "completed", "output": [{"type": "function_call",
                     "name": "ignore", "call_id": "fixture-resumed", "arguments": "{}"}]}
-            if phase == "route" and self.turn_question in ("What is that?", "Look again."):
+            if phase == "route" and self.turn_question in ("What is that?", "Look again.",
+                    "I found another animal. Could you help me check it out?"):
                 return {"status": "completed", "output": [{"type": "function_call",
                     "name": "look", "call_id": "fixture-look-" + uuid.uuid4().hex,
                     "arguments": "{}"}]}
@@ -95,6 +98,12 @@ def serve(port):
                 elif text == "fixture:voice-start":
                     await self.handle_rt({"type": "conversation.item.input_audio_transcription.completed",
                         "transcript": "Start.", "item_id": "voice-" + uuid.uuid4().hex})
+                elif text == "fixture:new-subject":
+                    await self.handle_rt({"type": "conversation.item.input_audio_transcription.completed",
+                        "transcript": "I found another animal. Could you help me check it out?",
+                        "item_id": "voice-" + uuid.uuid4().hex})
+                elif text == "fixture:classify-robin":
+                    self.fixture_species = "Turdus migratorius"
                 elif text in ("fixture:progress", "fixture:ambiguous", "fixture:status"):
                     await self.handle_rt({"type": "conversation.item.input_audio_transcription.completed",
                         "transcript": {"fixture:progress": "What do you think?",
@@ -130,7 +139,8 @@ def serve(port):
         image = Image.open(io.BytesIO(jpeg))
         if image.format != "JPEG" or max(image.size) > 1920:
             raise ValueError("Invalid camera JPEG")
-        return {"candidates": [{"sci": "Turdus migratorius", "p": .91}], "sharpness": 50}
+        sci = "Haliaeetus leucocephalus" if allowed and "Haliaeetus leucocephalus" in allowed else "Turdus migratorius"
+        return {"candidates": [{"sci": sci, "p": .91}], "sharpness": 50}
 
     backend.Session = FixtureSession
     backend.classify_frame = classify
@@ -191,11 +201,11 @@ async def test(port, cdp):
             state = await js("({text:document.body.innerText.slice(0,1600),requests:window.__requests?.length,uploads:window.__uploads,geometry:window.__geometry})")
             raise AssertionError(f"Timed out: {expression}; state={state}")
 
-        async def voice_input(text):
+        async def voice_input(text, *, earphones=False):
             # Speaker mode deliberately excludes speech during output. Match a
             # real user who waits for all browser audio and the echo tail, rather
             # than injecting final STT while a cached camera cue is playing.
-            await until("document.getElementById('audio-mode').getAttribute('aria-pressed') === 'false' && "
+            await until("document.getElementById('audio-mode').getAttribute('aria-pressed') === '" + str(earphones).lower() + "' && "
                         "window.__lastPlaybackReport?.active === false && window.__lastPlaybackReport?.drained === true && "
                         "performance.now() - window.__lastPlaybackReport.at >= 900 && "
                         "window.__messages.filter(e=>e.type==='state').at(-1)?.speaking === false")
@@ -517,6 +527,50 @@ async def test(port, cdp):
         results["resetClearsObservationEvidence"] = True
         await until("document.querySelectorAll('.investigation').length === 0 && !document.getElementById('display-status').textContent.includes('R3')")
         results["resetClearsInvestigations"] = True
+        # Reproduce the logged new-animal request against a finished Bald Eagle
+        # photo. The model deliberately chooses look; the server must create a
+        # fresh subject and keep the usual ready -> Start camera handshake.
+        new_subject_session = "new-subject-" + uuid.uuid4().hex[:8]
+        await call("Emulation.setDeviceMetricsOverride", width=390, height=844, deviceScaleFactor=1, mobile=True)
+        await call("Page.navigate", url=origin + "/?session=" + new_subject_session)
+        await until("document.readyState === 'complete' && typeof FieldCamera === 'function'")
+        await js("document.getElementById('start').click()")
+        await until("document.getElementById('connection').classList.contains('online')")
+        await js("document.getElementById('audio-mode').click()")
+        await voice_input("fixture:voice-look", earphones=True)
+        await until("window.__messages.some(e=>e.text==='Camera ready. Say start to take a photo.') && !document.getElementById('camera-shutter').disabled")
+        await voice_input("fixture:voice-start", earphones=True)
+        await until("document.querySelectorAll('#observation-evidence img').length === 1 && document.getElementById('observation-candidates').textContent.includes('Bald Eagle') && !document.getElementById('camera-shutter').disabled")
+        old_subject = await js("window.__messages.filter(e=>e.type==='observation' && e.focus).at(-1).id")
+        new_subject_marker = await js("window.__messages.length")
+        uploads_before_new = await js("window.__uploads.length")
+        encodes_before_new = await js("window.__encodes.length")
+        await voice_input("fixture:new-subject", earphones=True)
+        await until("window.__messages.slice(" + str(new_subject_marker) + ").some(e=>e.text==='Camera ready. Say start to take a photo.') && !document.getElementById('camera-shutter').disabled")
+        new_subject = await js("window.__messages.filter(e=>e.type==='observation' && e.focus).at(-1)")
+        assert new_subject["id"] != old_subject
+        assert new_subject["fused"] == [] and new_subject["detections"] == []
+        assert new_subject["image_revision"] == 0
+        assert await js("document.querySelectorAll('#observation-evidence img').length === 0 && document.querySelectorAll('#observation-candidates li').length === 0")
+        assert not await js("document.getElementById('observation-candidates').textContent.includes('Bald Eagle')")
+        assert await js("window.__uploads.length") == uploads_before_new
+        assert await js("window.__encodes.length") == encodes_before_new
+        assert not await js("window.__messages.slice(" + str(new_subject_marker) + ").some(e=>e.type==='capture')")
+        await js("window.__sockets[0].send(JSON.stringify({type:'text',text:'fixture:classify-robin'}))")
+        await voice_input("fixture:voice-start", earphones=True)
+        await until("document.querySelectorAll('#observation-evidence img').length === 1 && document.getElementById('observation-candidates').textContent.includes('American Robin') && !document.getElementById('camera-shutter').disabled")
+        fresh_photo = await js("window.__messages.filter(e=>e.type==='observation' && e.focus).at(-1)")
+        assert fresh_photo["id"] == new_subject["id"] and fresh_photo["image_revision"] == 1
+        assert len(fresh_photo["detections"]) == 1
+        assert await js("window.__uploads.length") == uploads_before_new + 1
+        assert new_subject["id"] in await js("window.__uploads.at(-1).url")
+        await js("document.getElementById('observation-confirm').click()")
+        await until("document.getElementById('observation-status').textContent === 'Added to checklist'")
+        assert await js("document.querySelector('.counter output').value") == "1"
+        assert not await js("document.getElementById('observation-candidates').textContent.includes('Bald Eagle')")
+        results["newSubjectVoiceClearsOldPhotoAndWaitsForStart"] = True
+        await js("document.getElementById('stop').click()")
+        await until("window.__streams.every(s=>s.getTracks().every(t=>t.readyState==='ended'))")
         errors = [e for e in events if e.get("method") == "Runtime.exceptionThrown"]
         assert not errors, errors
         results["runtimeErrors"] = 0

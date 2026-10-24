@@ -31,9 +31,55 @@ def _text(text):
     return re.sub(r"\s+", " ", str(text or "").replace("’", "'").strip()).lower()
 
 
+def new_subject_request(text):
+    """Require both a new organism and a positive visual request.
+
+    A sighting report alone remains a logging input. Retaking the same subject
+    is a separate camera action and must not create a new observation.
+    """
+    value = _text(text)
+    if re.search(r"\b(?:if|when)\s+(?:i|we|you)\b|\b(?:suppose|imagine)\b|"
+                 r"(?:如果|假如|假设|要是|万一).{0,10}(?:发现|看到|找到|遇到|看见)|"
+                 r"\b(?:haven't|have not|didn't|did not|don't|do not|never|no need to)\s+"
+                 r"(?:\w+\s+){0,3}(?:find|found|see|seen|saw|look|check|identify|switch|change)\b|"
+                 r"(?:没有|没|并未|不曾).{0,3}(?:发现|看到|找到|看见)|"
+                 r"(?:不要|不用|别|无需).{0,4}(?:看|识别|辨认|换)", value):
+        return False
+    if re.match(r"^(?:do\s+(?:i|we)\s+(?:need|have)\s+to|should\s+(?:i|we)|"
+                r"(?:can|could|may)\s+i)\b", value):
+        return False
+    if re.search(r"\b(?:eat|eats|diet|habitat|behavior|behaviour|migration|conservation)\b|"
+                 r"吃什么|食性|栖息|行为|迁徙", value):
+        return False
+    if re.fullmatch(r"(?:(?:please|let's)\s+)?(?:new\s+subject|"
+                    r"(?:switch|change|move)\s+(?:(?:to|a|the)\s+)*(?:(?:new|another|different)\s+)?subject|"
+                    r"switch\s+to\s+the\s+other\s+one)[.!?]*", value):
+        return True
+    organism = r"(?:animal|bird|organism|subject|plant|insect|flower|tree|mammal|fish|reptile|spider|mushroom|butterfly)"
+    fresh = bool(re.search(r"\b(?:another|new|different)\s+" + organism + r"\b", value))
+    visual = bool(re.search(
+        r"\b(?:can|could|would|will)\s+you\s+(?:please\s+)?(?:help\s+(?:me|us)\s+)?"
+        r"(?:check(?:ed)?\s+(?:out\b|(?:it|this|that)\s+out\b)|look\s+at\b|"
+        r"identify\b|recognize\b|take\s+a\s+look\b)|"
+        r"(?:^|[.!?,;]\s*|\band\s+)(?:please\s+)?(?:help\s+(?:me|us)\s+)?"
+        r"(?:identify\b|recognize\b|look\s+at\b|check(?:ed)?\s+(?:out\b|(?:it|this|that)\s+out\b))|"
+        r"\bwhat(?:'s|\s+is)\s+(?:this|that|it)[?!.]*$", value))
+    zh_fresh = bool(re.search(r"(?:另(?:一)?(?:个|只|株|棵)?|新的?|不同的|"
+                             r"又(?:发现|看到|找到|遇到|看见)了?一?(?:个|只|株|棵))"
+                             r"(?:动物|鸟|植物|昆虫|花|树|鱼|蜘蛛|蘑菇|蝴蝶|(?:观察)?对象)", value))
+    zh_visual = bool(re.search(r"(?:帮我|请|麻烦你|能不能|能否).{0,4}(?:看看|看一下|识别|辨认)|"
+                              r"^(?:看看|看一下|识别|辨认|换)(?:一)?(?:个|只|株|棵)?(?:另|新|不同)|"
+                              r"(?:这|那|它)是什么[？?。]*$", value))
+    if re.match(r"^换(?:一)?(?:个|只|株|棵)(?:动物|鸟|植物|昆虫|花|树|(?:观察)?对象)[？?。]*$", value):
+        return True
+    return (fresh and visual) or (zh_fresh and zh_visual)
+
+
 def explicit_retake(text):
     """Recognize a new camera action, not an unrelated use of 'new/different'."""
     value = _text(text)
+    if new_subject_request(value):
+        return True
     clauses = [clause.strip() for clause in re.split(r"[;.!?。；！？,，]|\band\b|\bthen\b", value) if clause.strip()]
     if len(clauses) > 1:
         return any(explicit_retake(clause) for clause in clauses)
