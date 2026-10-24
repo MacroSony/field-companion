@@ -48,6 +48,8 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['status'], 'completed')
         self.assertEqual(len(self.contexts), 2)
         self.assertIn(user, self.contexts[-1])
+        self.assertNotIn('out1', self.contexts[-1])
+        self.assertNotIn('out1', self.c.conversation_ids)
 
     async def test_failed_twice_deletes_only_owned_items_preserves_new_audio(self):
         self.statuses = ['failed', 'failed', 'completed']
@@ -70,6 +72,8 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
         await self.wait_idle()
         deleted = {e['item_id'] for e in self.events if e['type'] == 'conversation.item.delete'}
         self.assertTrue({'out1', 'out2'} <= deleted)
+        deletions = [e['item_id'] for e in self.events if e['type'] == 'conversation.item.delete']
+        self.assertEqual(len(deletions), len(set(deletions)))
         self.assertNotIn('newaudio', deleted)
         first_user = self.contexts[0][0]
         self.assertIn(first_user, deleted)

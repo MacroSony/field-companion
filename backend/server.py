@@ -713,7 +713,9 @@ class Session:
                 await self.rt_send({"type": "conversation.item.delete", "item_id": item_id})
                 if item_id in self.conversation_ids:
                     self.conversation_ids.remove(item_id)
-                self.item_owners.pop(item_id, None)
+                owner = self.item_owners.pop(item_id, None)
+                if owner is not None:
+                    owner.discard(item_id)
                 self.deleted_item_ids.append(item_id)
 
     async def generate(self, phase):
@@ -722,6 +724,7 @@ class Session:
         self.audio_allowed = phase == "answer" and self.may_speak()
         self.first_audio = False
         for attempt in range(2):
+            prior_items = set(self.turn_items or ())
             self.response_waiter = asyncio.get_running_loop().create_future()
             self.awaited_response_id = None
             try:
@@ -741,6 +744,8 @@ class Session:
                 if response.get("status") == "failed":
                     if phase == "route" and not attempt and not self.tools_executed:
                         self.log("route_retry", reason="failed")
+                        # A partial failed function call must not poison the retry.
+                        await self.delete_items(set(self.turn_items or ()) - prior_items)
                         await asyncio.sleep(.3)
                         continue
                     raise RuntimeError("Upstream generation failed")
