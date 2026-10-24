@@ -13,3 +13,8 @@
 .display-mode .map-card{position:relative}.display-mode #map{position:absolute;inset:40px 0 24px;height:auto;min-height:0}.display-mode .map-note{position:absolute;left:0;bottom:0;right:0;height:24px}
 
 .unusual-tag { background: #b8860b33; color: #f0c040; border-color: #f0c04066; }
+
+/* Pending BirdNET confirmations, shared by mic and display clients. */
+.suggestion-row{display:flex;gap:8px;overflow:auto;flex-shrink:0;margin-bottom:8px;padding:2px 0}
+.suggestion-chip{display:flex;align-items:center;flex-shrink:0;border:1px solid var(--accent);border-radius:10px;background:#34442a;padding:4px;gap:4px}
+.suggestion-chip .species-photo{width:30px;height:34px}.suggestion-chip button{border:0;background:transparent;color:var(--accent);min-height:40px;font-size:12px}.suggestion-chip .suggestion-dismiss{font-size:22px;min-width:32px}

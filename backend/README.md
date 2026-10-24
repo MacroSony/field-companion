@@ -3,7 +3,7 @@
 ```bash
 source /data/build/birding-demo/.venv/bin/activate
 # BOSON_API_KEY, or the existing ~/.config/boson/api_key; never copy into the repo
-python -B backend/server.py --port 8791
+python -B backend/server.py --port 8793
 ```
 
 The backend serves the existing `web/` at `/` and WebSockets at `/ws`. A phone
@@ -34,7 +34,7 @@ expose it publicly. Server restart loses session state.
 
 ## Route first, answer second
 
-Server VAD explicitly uses `create_response=false`, `interrupt_response=true`.
+Server VAD explicitly uses `create_response=false`, `interrupt_response=false`.
 Each completed transcription queues one routing turn; typed text uses the same
 router. One turn worker serializes session phase changes, tool execution and
 responses, while an independent reader resolves `session.updated` and response
@@ -80,8 +80,8 @@ still goes to BirdNET but is not replayed upstream.
 
 ```bash
 python -B -m unittest discover -s backend -p 'test_*.py' -v
-python -B backend/server.py --host 127.0.0.1 --port 8791
-python -B backend/selftest.py --url ws://127.0.0.1:8791/ws
+python -B backend/server.py --host 127.0.0.1 --port 8793
+python -B backend/selftest.py --url ws://127.0.0.1:8793/ws
 # Stop only the test instance when finished; leave live port 8780 untouched.
 ```
 
@@ -125,3 +125,64 @@ no ten-minute live wait or forced live upstream-disconnect test was run. Browser
 playback duration and network buffering are estimated, and BirdNET intentionally
 continues to hear assistant playback. Previous historical test logs may describe
 older server behavior; the router logs above are the current evidence.
+
+## Batched proactive suggestions (feat/batched-suggestions)
+
+The existing two-window / ten-second / >=0.5 rule now populates an ordered
+session suggestion buffer, retaining best confidence and first/last heard times.
+A 3.5-second debounce produces one batch; prompt starts are at least 25 seconds
+apart (measured again at first output audio). New species accumulate during the
+limit. User turns take priority, and active generation, user speech, pending
+transcription and estimated playback block proactive speech. Quiet mode keeps
+chips only, even after a tap. At most three names are supplied for speech, in
+confidence order, with an “N more on screen” instruction for larger batches.
+Unprompted species stale for >60 seconds are removed; prompted suggestions expire
+120 seconds after dispatch. Suggested/dismissed species stay deduplicated for the
+session. Detection timestamps still update the UI while confirmation is pending.
+
+`accept_suggestions(species?, counts?)` and `dismiss_suggestions(species?)` use
+omitted/empty species for all pending, or select an unambiguous named subset.
+The router gets the current list in each route session's instructions, so yes,
+yes both, just the cardinal and no have explicit context. Accept uses cached
+BirdNET taxon metadata, without another network lookup. `add_observations(items)`
+resolves and validates the entire multi-species report before mutation. These
+write actions return a single earcon and no answer generation. Existing
+`add_observation` is unchanged for single-species callers. The web Heard area
+shows highlighted Add? chips with independent accept/dismiss buttons; displays
+can use them too. See `docs/PROTOCOL.md` for the wire format.
+
+### Current verification (2026-10-23, port 8793 only)
+
+```bash
+/data/build/birding-demo/.venv/bin/python -B -m unittest discover -s backend -p 'test_*.py' -v
+node --check web/app.js
+# With a test server running on 8793:
+/data/build/birding-demo/.venv/bin/python -B backend/selftest.py --url ws://127.0.0.1:8793/ws --chorus
+```
+
+All **26 unit tests passed**; `node --check web/app.js` and `git diff --check`
+also passed. Evidence is reproducible in `backend/test_server.py` and
+`backend/selftest.py`; live output was captured by the execution command, not
+written as extra repo files.
+Chorus session `chorus-afc07fc5` passed real BirdNET + Higgs STT/router on 8793:
+- Mixed testmix cardinal/robin/bluejay recordings in memory (gains .5/1/.05);
+  the five-species fixture did not exist. Two species qualified.
+- Exactly one spoken prompt: “BirdNET just heard a Northern Cardinal and an
+  American Robin. Would you like me to add either or both to your checklist?”
+- Probe `tts("Yes, add them all.")` transcribed “Yes. Add them all.”; one
+  `accept_suggestions` call added both checklist species with exactly one logged
+  earcon and no spoken acknowledgement.
+- Buffer-to-dispatch **3,640 ms**; stream-start-to-first-audio **10,059.6 ms**
+  (includes time needed for two BirdNET windows); speech-stopped-to-earcon
+  **897.5 ms**. One sample, not a latency distribution. Test server was stopped.
+
+Earlier live attempts failed honestly: equal-gain audio qualified only a cardinal;
+then a second mix put cardinal's second hit just beyond the 3-second boundary,
+so only robin was spoken (although accept-all did log both). The final 3.5-second
+debounce includes that boundary and passed. Audio mixing can also create false
+positive detections (one unusual treecreeper hit was seen but never suggested).
+No detection thresholds were relaxed. Spoken max-three/extra wording is model
+instructed and covered at injection level offline, not live with >3 species.
+Natural speech subset/no routing, physical browser playback/chip appearance and
+real-speaker echo behavior remain unverified live; unit tests cover the action
+semantics, guards, rate limit, expiry, deduplication and atomic multi-add.

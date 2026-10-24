@@ -92,7 +92,22 @@ def tool_schema(name, description, properties=None, required=()):
 
 NAME = {"type": "string"}
 COUNT = {"type": "integer", "minimum": 1}
+SUGGEST_DEBOUNCE = 3.5
+SUGGEST_INTERVAL = 25
+SUGGEST_STALE = 60
+SUGGEST_TTL = 120
+SPECIES = {"type": "array", "items": NAME}
+OBSERVATION = {"type": "object", "properties": {
+    "name": NAME, "group": {"type": "string", "enum": GROUPS},
+    "count": COUNT, "notes": NAME}, "required": ["name"]}
+WRITE_TOOLS = ("add_observation", "add_observations", "accept_suggestions",
+               "dismiss_suggestions", "set_count", "remove_observation")
 TOOLS = [
+    tool_schema("accept_suggestions", "Confirm pending BirdNET suggestions. Yes/both/all = all pending; just X = subset. Silent.",
+                {"species": SPECIES, "counts": {"type": "object", "additionalProperties": COUNT}}),
+    tool_schema("dismiss_suggestions", "Decline pending suggestions. No = all; optional subset. Silent.", {"species": SPECIES}),
+    tool_schema("add_observations", "Log multiple user-confirmed species in ONE action, one earcon, no speech.",
+                {"items": {"type": "array", "items": OBSERVATION, "minItems": 1}}, ("items",)),
     tool_schema("add_observation", "Log a user-confirmed sighting; increases existing count. No spoken acknowledgement.",
                 {"name": NAME, "group": {"type": "string", "enum": GROUPS}, "count": COUNT,
                  "notes": {"type": "string"}}, ("name", "group", "count", "notes")),
@@ -112,6 +127,11 @@ Reply in English by default; the user may speak Chinese: answer in the language 
 Classify ONLY the latest user turn. Ordinary off-topic remarks/questions to a companion,
 self-talk, phone calls, noise and pet-dog chatter are NOT addressed to you: call ignore.
 Nature sighting reports are addressed even without a wake word: call add_observation.
+Multiple species in one report: call add_observations with all items in ONE call.
+When pending BirdNET suggestions exist: yes / yes both / add them all -> accept_suggestions
+with omitted species (all pending); just the cardinal -> accept_suggestions with that species.
+No / don't add them -> dismiss_suggestions. These actions are silent, not speak.
+Only accept explicit user confirmation, never a BirdNET notification itself.
 For total count corrections use set_count; for deletion use remove_observation.
 Never claim to have logged anything without a successful tool call. Logging has an earcon,
 not speech. Never give delayed logging acknowledgements, including "I've logged X".
@@ -180,6 +200,9 @@ class Session:
         self.windows = defaultdict(deque)
         self.seen = set()
         self.notified = set()
+        self.suggestions = {}  # insertion ordered; monotonic times stay server-side
+        self.last_proactive = float("-inf")
+        self.proactive_turn = False
         self.names = {}
         self.nearby_cache = {}
         self.ring = np.zeros(30 * SR, dtype=np.float32)
@@ -238,7 +261,9 @@ class Session:
 
     def config(self, phase):
         return {"output_modalities": ["text" if phase == "route" else "audio"],
-                "instructions": ROUTING if phase == "route" else ANSWER,
+                "instructions": (ROUTING + "\nCurrent pending BirdNET suggestions (unconfirmed; latest turn only): "
+                                 + json.dumps([r["en"] for r in self.suggestions.values()])
+                                 if phase == "route" else ANSWER),
                 "tools": TOOLS if phase == "route" else [],
                 "tool_choice": "required" if phase == "route" else "none"}
 
@@ -296,6 +321,42 @@ class Session:
         await self.rt_send({"type": "conversation.item.create", "item": {"type": "message", "role": "user",
                             "content": [{"type": "input_text", "text": text}]}})
 
+    def suggestions_payload(self):
+        return {"type": "suggestions", "items": [
+            {k: r[k] for k in ("sci", "en", "photo", "conf", "t")}
+            for r in sorted(self.suggestions.values(), key=lambda r: -r["conf"])]}
+
+    async def broadcast_suggestions(self):
+        await self.phone_json(self.suggestions_payload())
+
+    async def suggestion_tick(self, now=None):
+        now = time.monotonic() if now is None else now
+        expired = [sci for sci, r in self.suggestions.items()
+                   if (r["prompt_at"] is not None and now - r["prompt_at"] >= SUGGEST_TTL)
+                   or (r["prompt_at"] is None and now - r["last_heard"] > SUGGEST_STALE)
+                   or any(i["sci"] == sci for i in self.items)]
+        for sci in expired:
+            del self.suggestions[sci]
+        if expired:
+            await self.broadcast_suggestions()
+        fresh = [r for r in self.suggestions.values() if r["prompt_at"] is None]
+        if (fresh and now - min(r["buffered_at"] for r in fresh) >= SUGGEST_DEBOUNCE
+                and now - self.last_proactive >= SUGGEST_INTERVAL
+                and not any(p[0] == "notify" for p in self.pending)):
+            self.pending.append(("notify", None, None))
+        if self.pending:
+            self.work_ready.set()
+
+    async def suggestion_loop(self):
+        while not self.closed:
+            await self.suggestion_tick()
+            await asyncio.sleep(.2)
+
+    def suggestion_batch(self):
+        now = time.monotonic()
+        return sorted((r for r in self.suggestions.values() if r["prompt_at"] is None
+                       and now - r["last_heard"] <= SUGGEST_STALE), key=lambda r: -r["conf"])
+
     async def flush_pending(self):
         self.work_ready.set()
 
@@ -322,18 +383,31 @@ class Session:
                     self.pending[0] = (kind, value, stopped)
                     self.log("turns_merged", n=len(parts))
             self.turn_stale = stopped is not None and time.monotonic() - stopped > 12
-            if kind == "notify" and (self.awaiting_transcript or not self.may_speak()
-                                     or time.monotonic() < self.play_until):
+            if kind == "notify" and (self.awaiting_transcript or self.quiet
+                                     or time.monotonic() < self.play_until
+                                     or time.monotonic() - self.last_proactive < SUGGEST_INTERVAL):
                 continue
             self.pending.popleft()
-            if kind == "notify" and any(r["sci"] == value["sci"] for r in self.items):
-                self.work_ready.set()
-                continue
+            if kind == "notify":
+                batch = self.suggestion_batch()
+                if not batch:
+                    self.work_ready.set()
+                    continue
             self.active = True
             self.turn_stopped_at = stopped
             try:
                 if kind == "notify":
-                    await self.inject("[NOTIFY] BirdNET heard " + value["en"])
+                    self.proactive_turn = True
+                    self.last_proactive = time.monotonic()
+                    for r in batch:
+                        r["prompt_at"] = self.last_proactive
+                    spoken = ", ".join(f"{r['en']} ({r['conf']:.2f})" for r in batch[:3])
+                    extra = f" Say 'and {len(batch) - 3} more on screen'." if len(batch) > 3 else ""
+                    await self.inject("[NOTIFY] BirdNET heard: " + spoken
+                                      + ". Ask briefly in one short sentence, first person, e.g. 'I'm hearing a Northern Cardinal and an American Robin, add them?'. Don't mention BirdNET. List at most 3."
+                                      + extra + " Do not speak confidence scores. Do not log anything.")
+                    self.log("suggestion_prompt", species=[r["sci"] for r in batch],
+                             buffered_ms=round((self.last_proactive - min(r["buffered_at"] for r in batch)) * 1000))
                     await self.generate("answer")
                 else:
                     if kind == "text":
@@ -346,6 +420,7 @@ class Session:
                 self.log("turn_failed", error_type=type(exc).__name__)
                 await self.error("Turn failed; please try again.")
             finally:
+                self.proactive_turn = False
                 self.active = False
                 self.transcripts.clear()
                 await self.state()
@@ -372,7 +447,7 @@ class Session:
         except Exception as exc:
             self.log("tool_failed", name=name, error_type=type(exc).__name__)
             result = {"ok": False, "error": "External service unavailable; try again"}
-        if name in ("add_observation", "set_count", "remove_observation"):
+        if name in WRITE_TOOLS:
             await self.broadcast_checklist()
             if result.get("ok"):
                 await self.phone_json({"type": "earcon", "kind": "logged"})
@@ -518,6 +593,8 @@ class Session:
             self.total_audio_out += len(pcm)
             if not self.first_audio:
                 self.first_audio = True
+                if self.proactive_turn:
+                    self.last_proactive = time.monotonic()
                 self.latency("first_audio")
             self.play_until = max(time.monotonic(), self.play_until) + len(pcm) / 48000
             if not was_speaking:
@@ -550,6 +627,20 @@ class Session:
             return next((r["id"] for r in self.items if r["sci"] == taxon["sci"]), None)
         return None
 
+    def log_taxon(self, taxon, count, notes, source="voice"):
+        row = next((r for r in self.items if r["sci"] == taxon["sci"]), None)
+        if row:
+            row["count"] += count
+            if notes:
+                row["notes"] = "; ".join(filter(None, [row["notes"], notes]))
+        else:
+            row = {k: taxon.get(k, "") for k in ("sci", "en", "zh", "photo")}
+            row.update(id="o" + uuid.uuid4().hex[:10], group=taxon.get("group", "Aves"),
+                       count=count, notes=notes, first_seen=now_iso(), source=source,
+                       lat=self.lat, lng=self.lng)
+            self.items.append(row)
+        return dict(row)
+
     async def tool(self, name, args):
         if name == "get_checklist":
             return {"items": [dict(r) for r in self.items], "species_count": len(self.items)}
@@ -570,26 +661,60 @@ class Session:
             if not cached or time.monotonic() - cached[0] > 300:
                 self.nearby_cache[key] = (time.monotonic(), await asyncio.to_thread(nearby, self.lat, self.lng, group))
             return self.nearby_cache[key][1]
-        if name == "add_observation":
-            count = valid_count(args.get("count", 1))
-            group = args.get("group", "Aves")
-            if group not in GROUPS:
-                raise ValueError("invalid iconic group")
-            taxon = await asyncio.to_thread(resolve, str(args["name"]), group)
-            if not taxon:
-                return {"ok": False, "error": "No matching taxon in that iconic group"}
+        if name in ("accept_suggestions", "dismiss_suggestions"):
+            await self.suggestion_tick()
+            species = args.get("species") or []
+            if not isinstance(species, list) or any(not isinstance(n, str) for n in species):
+                raise ValueError("species must be an array of names")
+            selected = list(self.suggestions.values()) if not species else []
+            for n in species:
+                needle = n.strip().casefold()
+                matches = [r for r in self.suggestions.values()
+                           if needle in (r["sci"].casefold(), r["en"].casefold())]
+                if not matches:
+                    # Allow common short forms such as 'cardinal', only if unambiguous.
+                    matches = [r for r in self.suggestions.values() if needle and needle in r["en"].casefold()]
+                if len(matches) != 1:
+                    raise ValueError("Unknown or ambiguous pending suggestion: " + n)
+                if matches[0] not in selected:
+                    selected.append(matches[0])
+            if not selected:
+                return {"ok": False, "error": "No pending suggestions"}
+            counts = args.get("counts") or {}
+            if not isinstance(counts, dict):
+                raise ValueError("counts must be an object")
+            prepared = []
+            for r in selected:
+                count = valid_count(next((v for k, v in counts.items() if k.casefold() in
+                                          (r["sci"].casefold(), r["en"].casefold())), 1))
+                prepared.append((r, count, ""))
             async with self.item_lock:
-                row = next((r for r in self.items if r["sci"] == taxon["sci"]), None)
-                if row:
-                    row["count"] += count
-                    if args.get("notes"):
-                        row["notes"] = "; ".join(filter(None, [row["notes"], str(args["notes"])]))
-                else:
-                    row = {"id": "o" + uuid.uuid4().hex[:10], **taxon, "count": count,
-                           "notes": str(args.get("notes", "")), "first_seen": now_iso(), "source": "voice",
-                           "photo": taxon.get("photo", ""), "lat": self.lat, "lng": self.lng}
-                    self.items.append(row)
-                return {"ok": True, "item": dict(row)}
+                rows = [self.log_taxon(r, count, notes, "birdnet") for r, count, notes in prepared] if name == "accept_suggestions" else []
+                for r in selected:
+                    self.suggestions.pop(r["sci"], None)
+            await self.broadcast_suggestions()
+            return {"ok": True, "items": rows}
+        if name in ("add_observation", "add_observations"):
+            entries = [args] if name == "add_observation" else args.get("items")
+            if not isinstance(entries, list) or not entries or len(entries) > 100:
+                raise ValueError("items must contain 1–100 observations")
+            prepared = []
+            for entry in entries:
+                count = valid_count(entry.get("count", 1))
+                group = entry.get("group", "Aves")
+                if group not in GROUPS:
+                    raise ValueError("invalid iconic group")
+                taxon = await asyncio.to_thread(resolve, str(entry["name"]), group)
+                if not taxon:
+                    return {"ok": False, "error": "No matching taxon in that iconic group"}
+                prepared.append((taxon, count, str(entry.get("notes", ""))))
+            async with self.item_lock:
+                rows = [self.log_taxon(taxon, count, notes) for taxon, count, notes in prepared]
+                for taxon, _, _ in prepared:
+                    self.suggestions.pop(taxon["sci"], None)
+            if any(taxon["sci"] in self.notified for taxon, _, _ in prepared):
+                await self.broadcast_suggestions()
+            return {"ok": True, "items": rows, "item": rows[0]}
         if name in ("remove_observation", "set_count"):
             count = valid_count(args.get("count")) if name == "set_count" else None
             item_id = await self.find_item(args["name"])
@@ -680,10 +805,19 @@ class Session:
                     hits.popleft()
                 if confidence >= 0.5 and (not hits or hits[-1] != end):
                     hits.append(end)
-                if len(hits) >= 2 and sci not in self.notified and not any(r["sci"] == sci for r in self.items):
+                now = time.monotonic()
+                if sci in self.suggestions:
+                    r = self.suggestions[sci]
+                    r.update(conf=max(r["conf"], confidence), last_heard=now, t=heard["t"])
+                    await self.broadcast_suggestions()
+                elif confidence >= .5 and len(hits) >= 2 and sci not in self.notified and not any(r["sci"] == sci for r in self.items):
                     self.notified.add(sci)
-                    self.pending.append(("notify", names, None))
-                    self.log("notify_queued", sci=sci, windows=len(hits))
+                    best = max((h["conf"] for t, h in self.history if t >= now - 10 and h["sci"] == sci), default=confidence)
+                    self.suggestions[sci] = {**names, "conf": best, "t": heard["t"],
+                        "first_heard": now - (end - hits[0]) / SR, "last_heard": now,
+                        "buffered_at": now, "prompt_at": None}
+                    await self.broadcast_suggestions()
+                    self.log("suggestion_buffered", sci=sci, windows=len(hits))
             await self.flush_pending()
         except asyncio.CancelledError:
             raise
@@ -748,6 +882,16 @@ class Session:
             self.lang = str(event.get("lang", "en"))[:32]
             await self.state()
             await self.phone_json({"type": "checklist", "items": [dict(r) for r in self.items]})
+            await self.broadcast_suggestions()
+        elif ty == "suggestion_action":
+            action = event.get("action")
+            if action not in ("accept", "dismiss"):
+                raise ValueError("Invalid suggestion action")
+            result = await self.tool(action + "_suggestions", {"species": [event["sci"]]})
+            if not result.get("ok"):
+                raise ValueError(result["error"])
+            await self.broadcast_checklist()
+            await self.phone_json({"type": "earcon", "kind": "logged"})
         elif ty == "mic":
             if not isinstance(event.get("on"), bool):
                 raise ValueError("mic.on must be boolean")
@@ -805,7 +949,8 @@ class Session:
 
     def start(self):
         self.tasks = [asyncio.create_task(self.realtime_loop()),
-                      asyncio.create_task(self.audio_sender()), asyncio.create_task(self.turn_worker())]
+                      asyncio.create_task(self.audio_sender()), asyncio.create_task(self.turn_worker()),
+                      asyncio.create_task(self.suggestion_loop())]
 
     async def close(self):
         self.closed = True
@@ -855,6 +1000,7 @@ class Client:
         try:
             await s.state()
             await self.send_json({"type": "checklist", "items": [dict(r) for r in s.items]})
+            await self.send_json(s.suggestions_payload())
             while True:
                 packet = await self.phone.receive()
                 if packet["type"] == "websocket.disconnect":
@@ -869,7 +1015,7 @@ class Client:
                         event = json.loads(packet["text"])
                         if not isinstance(event, dict):
                             raise ValueError("JSON message must be an object")
-                        if self.role == "display" and event.get("type") not in ("hello", "text", "edit", "delete", "tap"):
+                        if self.role == "display" and event.get("type") not in ("hello", "text", "edit", "delete", "tap", "suggestion_action"):
                             raise ValueError("Display cannot control microphone or mode")
                         if event.get("type") == "hello" and self.role == "display":
                             await self.send_json(s.state_payload())

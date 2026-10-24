@@ -38,7 +38,7 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_hello_and_vad(self):
         await self.c.handle_phone({"type": "hello", "lang": "zh"})
-        self.assertEqual([e["type"] for e in self.phone.events], ["state", "checklist"])
+        self.assertEqual([e["type"] for e in self.phone.events], ["state", "checklist", "suggestions"])
         vad = self.c.session()["audio"]["input"]["turn_detection"]
         self.assertFalse(vad["create_response"])
         self.assertFalse(vad["interrupt_response"])  # manual barge-in only
@@ -157,10 +157,146 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         await self.c.bird_window(np.zeros(1), 3 * s.SR)
         self.assertFalse(self.c.pending)
         await self.c.bird_window(np.zeros(1), int(4.5 * s.SR))
+        self.assertFalse(self.c.pending)
+        self.assertEqual(len(self.c.suggestions), 1)
+        now = time.monotonic()
+        await self.c.suggestion_tick(now + 2.9)
+        self.assertFalse(self.c.pending)
+        await self.c.suggestion_tick(now + 3.6)
         self.assertEqual(len(self.c.pending), 1)
         self.assertEqual(len(self.c.history), 2)
         heard = next(e for e in self.phone.events if e["type"] == "heard")
         self.assertTrue(all(k in heard for k in ("en", "sci", "photo", "lat", "lng")))
+
+    def seed_suggestions(self, n=2):
+        now = time.monotonic()
+        for i in range(n):
+            sci = f"Bird {i}"
+            self.c.suggestions[sci] = {"sci": sci, "en": f"English Bird {i}", "photo": "",
+                "conf": .7 + i * .05, "t": s.now_iso(), "first_heard": now - 2,
+                "last_heard": now, "buffered_at": now, "prompt_at": None}
+            self.c.notified.add(sci)
+        return now
+
+    async def test_batch_rate_limit_and_stale_expiry(self):
+        now = self.seed_suggestions()
+        self.c.last_proactive = now - 10
+        await self.c.suggestion_tick(now + 3.6)
+        self.assertFalse(self.c.pending)
+        await self.c.suggestion_tick(now + 15)
+        await self.c.suggestion_tick(now + 16)
+        self.assertEqual(len(self.c.pending), 1)
+        self.assertEqual([r["sci"] for r in self.c.suggestion_batch()], ["Bird 1", "Bird 0"])
+        await self.c.suggestion_tick(now + 61)
+        self.assertFalse(self.c.suggestions)
+
+    async def test_prompt_expiry_not_extended_by_hearing(self):
+        now = self.seed_suggestions()
+        for r in self.c.suggestions.values():
+            r.update(prompt_at=now, last_heard=now + 119)
+        await self.c.suggestion_tick(now + 119)
+        self.assertEqual(len(self.c.suggestions), 2)
+        await self.c.suggestion_tick(now + 120)
+        self.assertFalse(self.c.suggestions)
+        self.assertEqual(len(self.c.notified), 2)
+
+    async def test_accept_all_one_earcon_no_speech(self):
+        self.seed_suggestions()
+        self.c.generate = AsyncMock()
+        await self.route("accept_suggestions", {"counts": {"English Bird 0": 2}})
+        self.assertFalse(self.c.suggestions)
+        self.assertEqual([r["count"] for r in self.c.items], [2, 1])
+        self.assertTrue(all(r["source"] == "birdnet" for r in self.c.items))
+        self.assertEqual(sum(e == {"type": "earcon", "kind": "logged"} for e in self.phone.events), 1)
+        self.c.generate.assert_not_awaited()
+
+    async def test_subset_dismiss_and_ui_action(self):
+        self.seed_suggestions(3)
+        await self.route("accept_suggestions", {"species": ["English Bird 1"]})
+        self.assertEqual([r["sci"] for r in self.c.items], ["Bird 1"])
+        await self.c.handle_phone({"type": "suggestion_action", "sci": "Bird 0", "action": "dismiss"})
+        self.assertEqual(list(self.c.suggestions), ["Bird 2"])
+        await self.route("dismiss_suggestions")
+        self.assertFalse(self.c.suggestions)
+        self.assertEqual(len(self.c.items), 1)
+
+    async def test_multi_add_atomic_and_one_earcon(self):
+        taxons = [{"sci": "Anas platyrhynchos", "en": "Mallard"}, {"sci": "Ardea herodias", "en": "Great Blue Heron"}]
+        with patch.object(s, "resolve", side_effect=taxons):
+            await self.route("add_observations", {"items": [{"name": "mallard", "count": 2}, {"name": "heron"}]})
+        self.assertEqual([r["count"] for r in self.c.items], [2, 1])
+        self.assertEqual(sum(e.get("kind") == "logged" for e in self.phone.events), 1)
+        with patch.object(s, "resolve", side_effect=[taxons[0], None]):
+            result = await self.c.tool("add_observations", {"items": [{"name": "mallard"}, {"name": "unknown"}]})
+        self.assertFalse(result["ok"])
+        self.assertEqual(self.c.items[0]["count"], 2)
+
+    async def test_worker_batch_guards_and_max_three(self):
+        now = self.seed_suggestions(5)
+        for r in self.c.suggestions.values():
+            r["buffered_at"] = now - 4
+        self.c.connected = True
+        self.c.generate = AsyncMock(return_value={"status": "completed", "output": []})
+        self.c.quiet = True
+        self.c.tap_at = now  # taps must not enable proactive speech in quiet mode
+        worker = asyncio.create_task(self.c.turn_worker())
+        try:
+            await self.c.suggestion_tick()
+            await asyncio.sleep(.01)
+            self.c.generate.assert_not_awaited()
+            self.c.quiet = False
+            for guard in ("active", "user_speaking", "awaiting_transcript"):
+                setattr(self.c, guard, True)
+                self.c.work_ready.set()
+                await asyncio.sleep(.01)
+                self.c.generate.assert_not_awaited()
+                setattr(self.c, guard, False)
+            self.c.play_until = now + 10
+            self.c.work_ready.set()
+            await asyncio.sleep(.01)
+            self.c.generate.assert_not_awaited()
+            self.c.play_until = 0
+            self.c.work_ready.set()
+            await asyncio.sleep(.01)
+            self.c.generate.assert_awaited_once_with("answer")
+            text = self.c.rt_send.call_args.args[0]["item"]["content"][0]["text"]
+            self.assertIn("English Bird 4", text)
+            self.assertNotIn("English Bird 0", text)
+            self.assertIn("2 more on screen", text)
+            self.assertTrue(all(r["prompt_at"] is not None for r in self.c.suggestions.values()))
+        finally:
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+
+    async def test_best_confidence_distinct_windows_and_dedup(self):
+        names = {"sci": "Cardinalis cardinalis", "en": "Northern Cardinal", "photo": ""}
+        self.c.names[names["sci"]] = names
+        detection = {"scientific_name": names["sci"], "common_name": names["en"], "confidence": .95}
+        self.c.analyze = lambda _: [detection]
+        await self.c.bird_window(np.zeros(1), 3 * s.SR)
+        await self.c.bird_window(np.zeros(1), 3 * s.SR)
+        self.assertFalse(self.c.suggestions)  # duplicate window is not a second hit
+        detection["confidence"] = .55
+        await self.c.bird_window(np.zeros(1), int(4.5 * s.SR))
+        self.assertEqual(self.c.suggestions[names["sci"]]["conf"], .95)
+        self.assertLess(self.c.suggestions[names["sci"]]["first_heard"], self.c.suggestions[names["sci"]]["last_heard"])
+        await self.c.tool("dismiss_suggestions", {})
+        await self.c.bird_window(np.zeros(1), 6 * s.SR)
+        self.assertFalse(self.c.suggestions)
+
+    async def test_invalid_accept_is_atomic_and_pending_context(self):
+        self.seed_suggestions()
+        self.assertIn("English Bird 0", self.c.config("route")["instructions"])
+        with self.assertRaises(ValueError):
+            await self.c.tool("accept_suggestions", {"counts": {"English Bird 1": -1}})
+        self.assertFalse(self.c.items)
+        self.assertEqual(len(self.c.suggestions), 2)
+        with self.assertRaises(ValueError):
+            await self.c.tool("accept_suggestions", {"species": ["unknown"]})
+        self.assertFalse(self.c.items)
+        await self.c.handle_phone({"type": "suggestion_action", "sci": "Bird 0", "action": "accept"})
+        self.assertEqual([r["sci"] for r in self.c.items], ["Bird 0"])
+        self.assertEqual(list(self.c.suggestions), ["Bird 1"])
 
     async def test_update_waits_for_matching_echo(self):
         config = self.c.config("answer")

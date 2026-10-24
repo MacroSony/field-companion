@@ -46,3 +46,17 @@ One WebSocket per phone: `wss://<host>/ws`. The backend also serves the web app 
 - `POST /api/frame?session=<id>&obs=<id>[&x=..&y=..&w=..&h=..]`, body = JPEG (≤ 1920 px long side). Optional crop is normalized 0..1 (from a tap on the bird). One request per frame. Response: `{"detection": {...}}`. The backend then broadcasts the updated `observation`.
 - `{"type":"look"}`: the user opened Look mode / pressed the shutter without speaking. Equivalent to "what's that?" (opens a new focus if none is open).
 - `{"type":"observation_action","id":"ob3","action":"confirm"|"discard"|"focus","count":2?}`: UI buttons.
+
+## Batched BirdNET suggestions
+- `{"type":"suggestions","items":[{"sci":"Cardinalis cardinalis","en":"Northern Cardinal","photo":"https://…","conf":0.87,"t":"<iso>"}]}`:
+  full pending confirmation state, broadcast on change and sent on connection/hello.
+  `conf` is the best confidence; `t` is the last detection time. Empty clears the UI.
+- `{"type":"suggestion_action","sci":"Cardinalis cardinalis","action":"accept"|"dismiss"}`:
+  mic or display may accept/dismiss a chip without model routing. Accept adds one
+  individual with source `birdnet`; either action gives one logged earcon, no speech.
+- Qualifying species accumulate for ~3.5 s. One proactive prompt per 25 s, at most
+  three names (confidence order), with extras on screen. Quiet mode is UI-only
+  even after tap. Unannounced detections older than 60 s are dropped; prompted
+  suggestions expire 120 s after prompt dispatch, without re-suggesting this session.
+  Voice “yes/both/all”, a named subset, and “no” route to silent accept/dismiss;
+  counts and multi-species observation reports are supported in one routed action.

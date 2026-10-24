@@ -207,6 +207,7 @@
         }
         break;
       case 'heard': renderHeard(message); break;
+      case 'suggestions': if (Array.isArray(message.items)) renderSuggestions(message.items); break;
       case 'transcript': {
         const target = message.role === 'user' ? $('user-caption') : message.role === 'assistant' ? $('assistant-caption') : null;
         if (target && typeof message.text === 'string') {
@@ -309,6 +310,26 @@
       if (item.t && !Number.isNaN(Date.parse(item.t))) body.append(element('time', 'heard-time', new Date(item.t).toLocaleTimeString('en', {hour: '2-digit', minute: '2-digit'})));
       card.append(speciesPhoto(item), body);
       $('heard').append(card);
+    }
+  }
+  function renderSuggestions(items) {
+    let row = $('suggestions');
+    if (!row) {
+      row = element('div', 'suggestion-row'); row.id = 'suggestions';
+      row.setAttribute('aria-label', 'BirdNET suggestions — add or dismiss');
+      $('heard').before(row);
+    }
+    row.replaceChildren(); row.hidden = !items.length;
+    for (const item of items) {
+      const chip = element('span', 'suggestion-chip');
+      chip.append(speciesPhoto(item));
+      const add = element('button', '', `Add ${item.en || item.sci}?`);
+      add.title = `BirdNET ${Math.round(item.conf * 100)}% — tap to add`;
+      add.onclick = () => send({type: 'suggestion_action', sci: item.sci, action: 'accept'});
+      const dismiss = element('button', 'suggestion-dismiss', '×');
+      dismiss.setAttribute('aria-label', `Dismiss ${item.en || item.sci}`);
+      dismiss.onclick = () => send({type: 'suggestion_action', sci: item.sci, action: 'dismiss'});
+      chip.append(add, dismiss); row.append(chip);
     }
   }
   function renderCandidates(items) {

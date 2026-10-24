@@ -108,12 +108,99 @@ async def run(url):
             await asyncio.gather(*receivers, return_exceptions=True)
 
 
+async def run_chorus(url):
+    """Real BirdNET + Realtime: chorus -> one batch -> spoken accept-all -> one earcon."""
+    from scipy.io import wavfile
+    from urllib.parse import urlsplit, urlunsplit, urlencode
+    import uuid
+    path = ROOT / "web/testaudio/03_chorus_5species.wav"
+    def load(path):
+        rate, data = wavfile.read(path)
+        if data.ndim > 1:
+            data = data.mean(axis=1)
+        data = data.astype(np.float32)
+        data /= max(1, np.max(np.abs(data)))
+        return resample_poly(data, 48000, rate)
+    if path.exists():
+        wave = load(path)[:18 * 48000]
+        source = str(path)
+    else:
+        # All three real recordings overlap; normalize to prevent clipping.
+        sources = [Path("/data/build/birding-demo/testmix") / f"{n}_best.wav"
+                   for n in ("cardinal", "robin", "bluejay")]
+        if not all(p.exists() for p in sources):
+            sources = [Path(f"/data/build/birding-demo/birds_{n}.wav") for n in ("cardinal", "robin", "bluejay")]
+        tracks = [load(p) for p in sources]
+        wave = sum(gain * np.resize(x, 18 * 48000) for gain, x in zip((.5, 1, .05), tracks))
+        source = " + ".join(str(p) for p in sources)
+    wave = wave / max(1, np.max(np.abs(wave))) * .85
+    pcm = (wave * 32767).astype("<i2").tobytes()
+    raw = await asyncio.to_thread(probe_tts, "Yes, add them all.")
+    speech = resample_poly(np.frombuffer(raw, dtype="<i2").astype(np.float32), 2, 1)
+    speech = np.clip(speech, -32768, 32767).astype("<i2").tobytes() + bytes(192000)
+    sid = "chorus-" + uuid.uuid4().hex[:8]
+    parts = urlsplit(url)
+    endpoint = urlunsplit(parts._replace(query=urlencode({"session": sid, "role": "mic"})))
+    events, audio, checklist = [], [], []
+    async with websockets.connect(endpoint, max_size=None) as mic:
+        async def receive():
+            async for raw in mic:
+                if isinstance(raw, bytes):
+                    audio.append((time.monotonic(), len(raw)))
+                else:
+                    e = json.loads(raw)
+                    events.append((time.monotonic(), e))
+                    if e.get("type") == "checklist":
+                        checklist[:] = e["items"]
+                    if e.get("type") in ("suggestions", "transcript", "error", "earcon") and (e.get("type") != "transcript" or e.get("final")):
+                        print(json.dumps(e), flush=True)
+        async def wait_for(predicate, timeout=60):
+            deadline = time.monotonic() + timeout
+            while not predicate():
+                if time.monotonic() >= deadline:
+                    raise AssertionError("chorus wait timed out")
+                await asyncio.sleep(.05)
+        async def stream(pcm):
+            start = time.monotonic()
+            for offset in range(0, len(pcm), 3840):
+                await asyncio.sleep(max(0, start + offset / 96000 - time.monotonic()))
+                await mic.send(pcm[offset:offset + 3840])
+        receiver = asyncio.create_task(receive())
+        try:
+            await wait_for(lambda: any(e.get("connected") for _, e in events))
+            start = time.monotonic()
+            print(json.dumps({"event": "chorus_source", "source": source, "session": sid}), flush=True)
+            await stream(pcm)
+            prompts = lambda: [(t, e) for t, e in events if e.get("type") == "transcript" and e.get("role") == "assistant" and e.get("final")]
+            await wait_for(lambda: bool(prompts()))
+            pending = next(e["items"] for _, e in reversed(events) if e.get("type") == "suggestions" and e["items"])
+            assert len(pending) >= 2, "BirdNET must suggest multiple species"
+            await asyncio.sleep(4)  # let prompt playback finish before reply
+            before = len(events)
+            await stream(speech)
+            await wait_for(lambda: len(checklist) >= len(pending))
+            await asyncio.sleep(3)
+            assert {i["sci"] for i in pending} <= {i["sci"] for i in checklist}
+            assert len(prompts()) == 1, "expected exactly one spoken proactive prompt"
+            text = prompts()[0][1]["text"].casefold()
+            assert sum(i["en"].casefold() in text for i in pending) >= 2, "prompt did not name multiple species"
+            logged = [e for _, e in events[before:] if e.get("type") == "earcon" and e.get("kind") == "logged"]
+            assert len(logged) == 1, "expected one logging earcon"
+            print(json.dumps({"event": "chorus_selftest_pass", "session": sid,
+                "species": [i["en"] for i in checklist], "prompts": len(prompts()), "logged_earcons": len(logged),
+                "first_audio_from_stream_ms": round((audio[0][0] - start) * 1000, 1)}), flush=True)
+        finally:
+            receiver.cancel()
+            await asyncio.gather(receiver, return_exceptions=True)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="ws://127.0.0.1:8791/ws")
+    parser.add_argument("--chorus", action="store_true")
     args = parser.parse_args()
     try:
-        asyncio.run(run(args.url))
+        asyncio.run(run_chorus(args.url) if args.chorus else run(args.url))
     except Exception as exc:
         print(json.dumps({"event": "selftest_failed", "error_type": type(exc).__name__}), flush=True)
         raise SystemExit(1)
