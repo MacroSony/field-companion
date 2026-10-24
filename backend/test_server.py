@@ -5,6 +5,7 @@ import json
 import time
 import unittest
 from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
 
 import numpy as np
 import server as s
@@ -101,7 +102,7 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         await self.c.handle_rt({"type": "response.output_audio.delta", "response_id": "r1", "delta": "AAA="})
         self.assertFalse(self.phone.audio)
 
-    async def test_echo_guard_blocks_realtime_not_birdnet(self):
+    async def test_echo_guard_blocks_realtime_and_keeps_ring(self):
         display = FakePhone()
         self.c.clients.add(s.Client(display, self.c, "display", True))
         self.c.connected = True
@@ -110,9 +111,112 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.c.state_payload()["echo_guard"])
         self.assertTrue(self.c.audio_queue.empty())
         self.assertEqual(self.c.position, 2400)
-        self.c.play_until = time.monotonic() - .4
+        self.c.play_until = time.monotonic() - .9
         await self.c.ingest_audio(bytes(4800))
         self.assertFalse(self.c.audio_queue.empty())
+
+    async def test_audio_modes_and_display_override(self):
+        self.c.play_until = time.monotonic() + 3
+        self.assertTrue(self.c.echo_guard)  # speaker is the default, no display needed
+        self.assertTrue(self.c.echo_blocked())
+        await self.c.handle_phone({"type": "hello", "earphones": True})
+        self.assertFalse(self.c.echo_guard)
+        self.assertFalse(self.c.echo_blocked())
+        display = s.Client(FakePhone(), self.c, "display", True)
+        self.c.clients.add(display)
+        self.assertTrue(self.c.echo_blocked())
+        self.c.clients.remove(display)
+        await self.c.handle_phone({"type": "audio_mode", "earphones": False})
+        self.assertTrue(self.c.echo_blocked())
+        with self.assertRaises(ValueError):
+            await self.c.handle_phone({"type": "audio_mode", "earphones": "false"})
+
+    async def test_playback_report_end_and_legacy_fallback(self):
+        with patch.object(s, "time", SimpleNamespace(monotonic=lambda: 100)):
+            self.c.echo_estimate = 102
+            self.assertEqual(self.c.echo_deadline(), 102.8)
+            await self.c.handle_phone({"type": "playback", "active": True})
+            self.assertTrue(self.c.echo_blocked())
+            await self.c.handle_phone({"type": "playback", "active": False})
+            self.assertEqual(self.c.echo_deadline(), 102.5)  # early end cannot shorten estimate
+        with patch.object(s, "time", SimpleNamespace(monotonic=lambda: 104)):
+            await self.c.handle_phone({"type": "playback", "active": False})
+            self.assertEqual(self.c.echo_deadline(), 104.5)
+            await self.c.cancel_speech()  # flush retains the acoustic tail
+            self.assertTrue(self.c.echo_blocked())
+        with patch.object(s, "time", SimpleNamespace(monotonic=lambda: 104.51)):
+            self.assertFalse(self.c.echo_blocked())
+
+    async def test_guarded_vad_ignored_but_earphones_barge_in(self):
+        self.c.play_until = time.monotonic() + 2
+        self.c.response_id = "answer"
+        with patch.object(self.c, "log") as log:
+            await self.c.handle_rt({"type": "input_audio_buffer.speech_started"})
+            log.assert_called_with("vad_ignored", reason="assistant_playback")
+        self.assertFalse(self.c.user_speaking)
+        self.assertFalse(self.c.awaiting_transcript)
+        self.assertNotIn({"type": "flush"}, self.phone.events)
+        self.c.rt_send.assert_not_awaited()
+        await self.c.handle_phone({"type": "audio_mode", "earphones": True})
+        await self.c.handle_rt({"type": "input_audio_buffer.speech_started"})
+        self.assertTrue(self.c.user_speaking)
+        self.assertIn({"type": "flush"}, self.phone.events)
+
+    async def test_birdnet_drops_all_overlapping_windows_including_tail(self):
+        self.c.bird_window = AsyncMock()
+        self.c.play_until = time.monotonic() + 2
+        with patch.object(self.c, "log") as log:
+            for _ in range(3):
+                await self.c.ingest_audio(bytes(2 * s.SR))
+            log.assert_called_with("bird_window_skipped", reason="assistant_playback", stream_s=3.0)
+        self.c.play_until = 0
+        # Even after playback, windows containing earlier contaminated samples must drop.
+        for _ in range(2):
+            await self.c.ingest_audio(bytes(2 * s.SR))
+        await asyncio.sleep(0)
+        self.c.bird_window.assert_not_awaited()
+        for _ in range(3):
+            await self.c.ingest_audio(bytes(2 * s.SR))
+        await asyncio.sleep(0)
+        self.c.bird_window.assert_awaited()
+        other = s.Session("earphones")
+        try:
+            client = s.Client(FakePhone(), other)
+            client.earphones = True
+            other.clients.add(client)
+            other.bird_window = AsyncMock()
+            other.play_until = time.monotonic() + 10
+            for _ in range(3):
+                await other.ingest_audio(bytes(2 * s.SR))
+            await asyncio.sleep(0)
+            other.bird_window.assert_awaited_once()
+        finally:
+            await other.close()
+
+    async def test_echo_filter_drops_fragment_and_passes_genuine_question(self):
+        self.c.phase = "answer"
+        await self.c.handle_rt({"type": "response.output_audio_transcript.delta", "response_id": "r1",
+                               "delta": "I appreciate the quiet woods. What would you like to ask?"})
+        self.assertTrue(self.c.transcript_is_echo("I appreciate the."))
+        self.assertTrue(self.c.transcript_is_echo("What would you like to ask?"))
+        # Short replies are never treated as echo (the speaker-mode gate covers those);
+        # answers that reuse the prompt's words must pass.
+        self.assertFalse(self.c.transcript_is_echo("quiet"))
+        self.assertFalse(self.c.transcript_is_echo("Yes, add them."))
+        self.assertFalse(self.c.transcript_is_echo("Just the cardinal."))
+        self.assertFalse(self.c.transcript_is_echo("Which bird has a red head and black wings?"))
+        self.client.earphones = True  # filter is independent of the guard
+        with patch.object(self.c, "log") as log:
+            await self.c.handle_rt({"type": "conversation.item.input_audio_transcription.completed",
+                                    "transcript": "I appreciate the."})
+            log.assert_called_with("echo_dropped", text="I appreciate the.")
+        self.assertFalse(self.c.pending)
+        await self.c.handle_rt({"type": "conversation.item.input_audio_transcription.completed",
+                                "transcript": "Which bird has a red head and black wings?"})
+        self.assertEqual(len(self.c.pending), 1)
+        self.c.spoken.clear()
+        self.c.spoken.append(("old", "I appreciate the.", time.monotonic() - 11))
+        self.assertFalse(self.c.transcript_is_echo("I appreciate the."))
 
     async def test_audio_fanout_and_session_isolation(self):
         silent, loud = FakePhone(), FakePhone()

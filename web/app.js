@@ -11,6 +11,12 @@
     listening: false, speaking: false, items: [], heard: [], coords: null,
     startedAt: null, endedAt: null, model: '', retry: 0
   };
+  let earphones = false, firstAudioTip = true;
+  try {
+    earphones = localStorage.getItem('field-earphones') === 'true';
+    firstAudioTip = localStorage.getItem('field-earphone-tip') !== 'seen';
+  } catch (_) { /* Storage may be unavailable; speaker is the safe default. */ }
+  let playbackReported = false;
   let socket, reconnectTimer, context, stream, capture, micSource, wakeLock;
   let nextPlaybackTime = 0, lastMeterAt = 0, resampler = null;
   const playback = new Set(), tones = new Set();
@@ -30,6 +36,12 @@
     return true;
   }
   function updateControls() {
+    if ($('audio-mode')) {
+      $('audio-mode').textContent = earphones ? '🎧 Earphones' : '🔊 Speaker';
+      $('audio-mode').setAttribute('aria-pressed', String(earphones));
+    }
+    if ($('interrupt-hint')) $('interrupt-hint').textContent = earphones ? 'Say something to interrupt' : 'Tap to interrupt';
+    if ($('earphone-tip')) $('earphone-tip').hidden = !firstAudioTip;
     $('tap').disabled = $('send').disabled = !state.connected;
     $('mic').disabled = !stream || !state.running;
     $('mic').setAttribute('aria-pressed', String(state.paused));
@@ -95,10 +107,21 @@
     const outgoing = resampler ? resampler.process(samples) : samples;
     if (outgoing.length) socket.send(pcmLittleEndian(outgoing));
   }
+  function reportPlayback(active, force = false) {
+    if (!force && playbackReported === active) return;
+    playbackReported = active;
+    if (state.connected && socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({type: 'playback', active}));
+  }
+  // WebAudio's clock, not receipt of a network chunk, determines actual start.
+  setInterval(() => {
+    if (context?.state === 'running' && [...playback].some(source => source.playAt <= context.currentTime)) reportPlayback(true);
+  }, 20);
   function flush() {
+    const hadPlayback = playback.size > 0 || playbackReported;
     for (const source of playback) { try { source.stop(); } catch (_) {} }
     for (const tone of tones) { try { tone.stop(); } catch (_) {} }
     playback.clear(); tones.clear();
+    if (hadPlayback) reportPlayback(false, true);
     nextPlaybackTime = context?.currentTime || 0;
     state.speaking = false;
     updateControls();
@@ -117,8 +140,14 @@
     if (nextPlaybackTime > context.currentTime + 30) nextPlaybackTime = 0;
     const at = Math.max(context.currentTime + 0.025, nextPlaybackTime);
     nextPlaybackTime = at + buffer.duration;
+    source.playAt = at;
     playback.add(source);
-    source.onended = () => { playback.delete(source); source.disconnect(); updateControls(); };
+    source.onended = () => {
+      const removed = playback.delete(source);
+      source.disconnect();
+      if (removed && !playback.size) reportPlayback(false, true);
+      updateControls();
+    };
     source.start(at);
     updateControls();
     if (context.state === 'suspended') notice('Tap to resume audio.');
@@ -167,9 +196,10 @@
     ws.onopen = () => {
       if (socket !== ws || !state.running) { ws.close(); return; }
       // hello MUST be the first frame; geolocation is optional and never blocks it.
-      ws.send(JSON.stringify({type: 'hello', lang: 'en', ...(state.coords || {})}));
+      ws.send(JSON.stringify({type: 'hello', lang: 'en', ...(!displayMode ? {earphones} : {}), ...(state.coords || {})}));
       state.connected = true; state.retry = 0;
       if (!displayMode) {
+        send({type: 'audio_mode', earphones});
         send({type: 'mic', on: !!stream && !state.paused});
         send({type: 'mode', quiet: state.quiet});
       }
@@ -465,6 +495,15 @@
     const rows = [['English Name', 'Scientific Name', 'Taxon Group', 'Count', 'Notes', 'First Seen', 'Source', 'Location Name', 'Latitude', 'Longitude']];
     state.items.forEach(item => rows.push([item.en, item.sci, item.group, item.count, item.notes, item.first_seen, item.source, $('location-name').value, item.lat ?? state.coords?.lat, item.lng ?? state.coords?.lng]));
     downloadCSV(rows, 'all-taxa');
+  }
+  $('audio-mode')?.addEventListener('click', () => {
+    earphones = !earphones;
+    try { localStorage.setItem('field-earphones', String(earphones)); } catch (_) {}
+    if (state.connected && !displayMode) send({type: 'audio_mode', earphones});
+    updateControls();
+  });
+  if (firstAudioTip && !displayMode) {
+    try { localStorage.setItem('field-earphone-tip', 'seen'); } catch (_) {}
   }
   $('start').addEventListener('click', start);
   $('stop').addEventListener('click', stop);

@@ -9,6 +9,7 @@ import base64
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
+from difflib import SequenceMatcher
 import json
 import logging
 from pathlib import Path
@@ -194,6 +195,8 @@ class Session:
         self.cancelled_ids = deque(maxlen=100)
         self.audio_allowed = True
         self.play_until = 0.0
+        self.echo_estimate = 0.0
+        self.spoken = deque(maxlen=3)
         self.playback_task = None
         self.pending = deque()
         self.history = deque(maxlen=3000)
@@ -206,6 +209,7 @@ class Session:
         self.names = {}
         self.nearby_cache = {}
         self.ring = np.zeros(30 * SR, dtype=np.float32)
+        self.echo_ring = np.zeros(len(self.ring), dtype=bool)
         self.position = 0
         self.next_window = 3 * SR
         self.filter_taps = firwin(63, 10800, fs=SR)
@@ -231,8 +235,57 @@ class Session:
                                if c.role == "mic" or c.audio), return_exceptions=True)
 
     @property
+    def speaker_mode(self):
+        mic = self.mic or next((c for c in self.clients if c.role == "mic"), None)
+        return mic is None or not mic.earphones
+
+    @property
     def echo_guard(self):
-        return any(c.role == "display" and c.audio for c in self.clients)
+        return self.speaker_mode or any(c.role == "display" and c.audio for c in self.clients)
+
+    def playback_clients(self):
+        return [c for c in self.clients if c.role == "mic" or c.audio]
+
+    def echo_deadline(self):
+        clients = self.playback_clients()
+        # A start without an end keeps the gate closed, including suspended WebAudio.
+        if any(c.playback_active for c in clients):
+            return float("inf")
+        estimate = max(self.echo_estimate, self.play_until)
+        return max((max(estimate, c.playback_end) + (.5 if c.playback_end else .8)
+                    for c in clients), default=estimate + .8)
+
+    @staticmethod
+    def normalized_words(text):
+        return "".join(c.lower() if c.isalnum() else " " for c in text).split()
+
+    def remember_spoken(self, key, text):
+        if not text.strip():
+            return
+        for row in list(self.spoken):
+            if row[0] == key:
+                self.spoken.remove(row)
+                break
+        self.spoken.append((key, text, time.monotonic()))
+
+    def transcript_is_echo(self, text):
+        words = self.normalized_words(text)
+        if not words:
+            return False
+        now = time.monotonic()
+        recent = [line for _, line, at in self.spoken
+                  if now - max(at, self.play_until, self.echo_estimate,
+                               max((c.playback_end for c in self.clients), default=0)) <= 10]
+        # Echo = a long CONTIGUOUS run of the assistant's own words. Bag-of-words overlap
+        # misfired on answers like "Yes, add them" to "...add them?" or "Cardinal." (10/23).
+        if len(words) < 3:
+            return False
+        for line in recent + ([" ".join(recent)] if len(recent) > 1 else []):
+            other = self.normalized_words(line)
+            m = SequenceMatcher(None, words, other, autojunk=False).find_longest_match(0, len(words), 0, len(other))
+            if m.size >= 3 and m.size >= .7 * len(words):
+                return True
+        return False
 
     def state_payload(self):
         return {"type": "state", "listening": self.mic_on,
@@ -553,6 +606,9 @@ class Session:
                         waiter.set_exception(RuntimeError("Realtime request rejected"))
                 await self.error("Realtime request failed (" + str(code)[:100] + ").")
         elif ty == "input_audio_buffer.speech_started":
+            if self.echo_blocked():
+                self.log("vad_ignored", reason="assistant_playback")
+                return
             self.user_speaking = True
             self.awaiting_transcript = True
             if time.monotonic() < self.play_until:
@@ -572,6 +628,11 @@ class Session:
             # With create_response=false the server never commits the buffer, so STT
             # re-transcribes everything since session start. Clear it per turn (tested 10/23).
             await self.rt_send({"type": "input_audio_buffer.clear"})
+            self.user_speaking = False
+            if self.transcript_is_echo(text):
+                self.log("echo_dropped", text=text)
+                await self.flush_pending()
+                return
             await self.phone_json({"type": "transcript", "role": "user", "text": text, "final": True})
             self.log("user_transcript", text=text)
             if text.strip():
@@ -589,6 +650,12 @@ class Session:
                 return
             pcm = base64.b64decode(event["delta"])
             was_speaking = time.monotonic() < self.play_until
+            # Close the gate BEFORE sending audio: mic ingestion runs concurrently.
+            self.play_until = max(time.monotonic(), self.play_until) + len(pcm) / 48000
+            self.echo_estimate = self.play_until
+            if not self.first_audio:
+                for client in self.playback_clients():
+                    client.playback_end = 0.0
             await self.phone_audio(pcm)
             self.total_audio_out += len(pcm)
             if not self.first_audio:
@@ -596,7 +663,6 @@ class Session:
                 if self.proactive_turn:
                     self.last_proactive = time.monotonic()
                 self.latency("first_audio")
-            self.play_until = max(time.monotonic(), self.play_until) + len(pcm) / 48000
             if not was_speaking:
                 await self.state()
             if self.playback_task is None or self.playback_task.done():
@@ -606,9 +672,13 @@ class Session:
                 return
             key = (rid, event.get("item_id", ""), "text" if "output_text" in ty else "audio")
             self.transcripts[key] = self.transcripts.get(key, "") + event.get("delta", "")
+            if "output_text" not in ty:
+                self.remember_spoken(key, self.transcripts[key])
             await self.phone_json({"type": "transcript", "role": "assistant", "text": self.transcripts[key], "final": False})
         elif ty in ("response.output_audio_transcript.done", "response.audio_transcript.done", "response.output_text.done"):
             if rid not in self.cancelled_ids and self.audio_allowed:
+                if "output_text" not in ty:
+                    self.remember_spoken((rid, event.get("item_id", ""), "audio"), event.get("transcript", ""))
                 await self.phone_json({"type": "transcript", "role": "assistant",
                                        "text": event.get("transcript", event.get("text", "")), "final": True})
         elif ty == "response.done":
@@ -834,9 +904,12 @@ class Session:
         n = len(frame)
         pos = self.position % len(self.ring)
         first = min(n, len(self.ring) - pos)
+        contaminated = self.speaker_mode and self.echo_blocked()
+        self.echo_ring[pos:pos + first] = contaminated
         self.ring[pos:pos + first] = frame[:first]
         if first < n:
             self.ring[:n - first] = frame[first:]
+            self.echo_ring[:n - first] = contaminated
         self.position += n
         self.total_audio_in += len(raw)
         # Stateful 63-tap anti-alias filter, ~0.65 ms delay; phase survives odd-length packets.
@@ -849,7 +922,10 @@ class Session:
                 self.log("audio_queue_drop")
             self.audio_queue.put_nowait(pcm)
         while self.position >= self.next_window:
-            if self.bird_task is None or self.bird_task.done():
+            indices = np.arange(self.next_window - 3 * SR, self.next_window) % len(self.ring)
+            if self.echo_ring[indices].any():
+                self.log("bird_window_skipped", reason="assistant_playback", stream_s=round(self.next_window / SR, 2))
+            elif self.bird_task is None or self.bird_task.done():
                 end = self.next_window
                 samples = self.ring[np.arange(end - 3 * SR, end) % len(self.ring)].copy()
                 self.bird_task = asyncio.create_task(self.bird_window(samples, end))
@@ -858,7 +934,7 @@ class Session:
             self.next_window += int(1.5 * SR)
 
     def echo_blocked(self):
-        return self.echo_guard and time.monotonic() < self.play_until + 0.3
+        return self.echo_guard and time.monotonic() < self.echo_deadline()
 
     async def audio_sender(self):
         while True:
@@ -871,8 +947,30 @@ class Session:
             finally:
                 self.audio_queue.task_done()
 
-    async def handle_phone(self, event):
+    async def handle_phone(self, event, client=None):
+        client = client or self.mic or next((c for c in self.clients if c.role == "mic"), None)
         ty = event.get("type")
+        if ty == "audio_mode" or (ty == "hello" and "earphones" in event):
+            if not isinstance(event.get("earphones"), bool):
+                raise ValueError("earphones must be boolean")
+            if client is None or client.role != "mic":
+                raise ValueError("Only the microphone can set audio_mode")
+            client.earphones = event["earphones"]
+            self.log("audio_mode", earphones=client.earphones)
+            if ty == "audio_mode":
+                await self.state()
+                return
+        if ty == "playback":
+            if not isinstance(event.get("active"), bool):
+                raise ValueError("playback.active must be boolean")
+            if client is None or (client.role == "display" and not client.audio):
+                raise ValueError("Client has no audio output")
+            client.playback_active = event["active"]
+            if not client.playback_active:
+                client.playback_end = time.monotonic()
+            self.log("playback", active=client.playback_active, role=client.role)
+            await self.state()
+            return
         if ty == "hello":
             if event.get("lat") is not None and event.get("lng") is not None:
                 lat, lng = float(event["lat"]), float(event["lng"])
@@ -971,6 +1069,9 @@ class Client:
     def __init__(self, phone, session, role="mic", audio=False):
         self.phone, self.session, self.role, self.audio = phone, session, role, audio
         self.lock = asyncio.Lock()
+        self.earphones = False
+        self.playback_active = False
+        self.playback_end = 0.0
 
     async def send_json(self, event):
         async with self.lock:
@@ -1015,13 +1116,13 @@ class Client:
                         event = json.loads(packet["text"])
                         if not isinstance(event, dict):
                             raise ValueError("JSON message must be an object")
-                        if self.role == "display" and event.get("type") not in ("hello", "text", "edit", "delete", "tap", "suggestion_action"):
+                        if self.role == "display" and event.get("type") not in ("hello", "text", "edit", "delete", "tap", "suggestion_action", "playback"):
                             raise ValueError("Display cannot control microphone or mode")
                         if event.get("type") == "hello" and self.role == "display":
                             await self.send_json(s.state_payload())
                             await self.send_json({"type": "checklist", "items": [dict(r) for r in s.items]})
                         else:
-                            await s.handle_phone(event)
+                            await s.handle_phone(event, self)
                 except (ValueError, KeyError, TypeError) as exc:
                     await s.error(str(exc)[:180])
                 except Exception as exc:

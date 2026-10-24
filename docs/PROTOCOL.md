@@ -6,12 +6,16 @@ One WebSocket per phone: `wss://<host>/ws`. The backend also serves the web app 
 - `wss://<host>/ws?role=mic&session=<id>` (default role `mic`, default session `demo`): the phone. It sends mic audio and commands and receives everything below.
 - `wss://<host>/ws?role=display&session=<id>`: a big-screen view (laptop/projector, URL `/?display=1`). It receives the same JSON messages (checklist, heard, transcripts, candidates, state). It receives assistant audio only with `&audio=1` (so the audience can hear). It sends no mic audio, but may send `text`, `edit`, `delete`.
 - One backend session = one Higgs Realtime session + one BirdNET pipeline + one checklist, shared by all devices in it. Exactly one mic device per session; a newer mic replaces the older one.
-- **Echo guard**: if any display has audio on, the backend runs half-duplex. While the assistant is speaking, plus 300 ms after, mic audio is not forwarded to Realtime (BirdNET still gets it). Barge-in is lost in this mode; the phone tap button still cancels speech.
+- **Echo guard**: the microphone defaults to speaker mode (`earphones=false`), which is safe half-duplex. Guarding is enabled when the mic uses its speaker **or** any display has `audio=1`. It begins before the first outgoing assistant PCM. Mic audio is withheld from Realtime until the later of the backend duration estimate and reported playback end, plus **500 ms**. A reported active playback keeps the gate closed until its end; clients without end reports use the estimate plus **800 ms**. With multiple audio outputs the latest deadline wins. Guarded VAD speech-start events do not cancel playback; **Tap still interrupts**.
+- In speaker mode, three-second BirdNET windows containing any assistant-playback/tail samples are dropped and logged (`bird_window_skipped`, reason `assistant_playback`). Earphone-mode BirdNET is unchanged, including with an audio-enabled display.
+- Independently of output mode, recent assistant speech is compared to incoming STT before routing: up to three spoken transcripts, within ten seconds of assistant speech. Lowercased alphanumeric word overlap >=0.6 or `difflib` ratio >=0.75 drops an echo (`echo_dropped`). Single-word transcripts require an exact word match. Typed text is not filtered. This is a heuristic defense, not acoustic echo cancellation.
 
 ## Phone → backend
 - **Binary frames**: microphone audio, PCM16 little-endian, mono, **48 kHz**, about 20–40 ms per frame. Browser mic processing is off (echoCancellation/noiseSuppression/autoGainControl = false).
 - **JSON text frames**:
-  - `{"type":"hello","lat":43.66,"lng":-79.39,"lang":"zh"}`: sent first. lat/lng are optional.
+  - `{"type":"hello","lat":43.66,"lng":-79.39,"lang":"zh","earphones":false}`: sent first. GPS, language and boolean `earphones` are optional; each new mic defaults to speaker mode.
+  - `{"type":"audio_mode","earphones":true|false}`: mic only; change output mode. `false` = speaker / half-duplex, `true` = earphones / voice interruption (unless an audio-enabled display forces guarding). The UI persists the selection locally and sends it on connect and change.
+  - `{"type":"playback","active":true|false}`: audio-output client reports when scheduled assistant audio actually starts and when its last queued source finishes, including after flush. End times are measured at backend receipt, not supplied by the client. Audio-enabled displays may report too. Reports never shorten the backend estimate.
   - `{"type":"mic","on":true|false}`: mic paused or resumed.
   - `{"type":"mode","quiet":true|false}`: quiet mode. Logging still works, but the assistant only speaks after a tap.
   - `{"type":"tap"}`: push-to-talk / "talk to me now". The next utterance is treated as addressed.
@@ -27,7 +31,7 @@ One WebSocket per phone: `wss://<host>/ws`. The backend also serves the web app 
   - `{"type":"heard","sci":"...","en":"...","zh":"...","conf":0.87,"t":"<iso>","new":true}`: a BirdNET detection. `new` means first time in this session above threshold.
   - `{"type":"transcript","role":"user"|"assistant","text":"...","final":true|false}`: captions.
   - `{"type":"candidates","items":[{"sci":"...","en":"...","zh":"...","photo":"https://...","why":"..."}]}`: identification candidates to show as cards (describe-to-ID / photo ID).
-  - `{"type":"state","listening":true,"speaking":false,"model":"higgs-realtime-1.5-preview","connected":true}`: status for the UI indicator.
+  - `{"type":"state","listening":true,"speaking":false,"model":"higgs-realtime-1.5-preview","connected":true,"echo_guard":true,"session":"demo"}`: status for the UI indicator. `echo_guard` describes the selected policy, not whether input is currently being dropped.
   - `{"type":"error","message":"..."}`
 
 ## Notes
