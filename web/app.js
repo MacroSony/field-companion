@@ -112,6 +112,9 @@
     const source = context.createBufferSource();
     source.buffer = buffer; // WebAudio resamples 24 kHz to the shared context rate.
     source.connect(context.destination);
+    // nextPlaybackTime is in the clock of the current AudioContext; a value from an old
+    // (closed) context would schedule speech minutes into the future -> silence.
+    if (nextPlaybackTime > context.currentTime + 30) nextPlaybackTime = 0;
     const at = Math.max(context.currentTime + 0.025, nextPlaybackTime);
     nextPlaybackTime = at + buffer.duration;
     playback.add(source);
@@ -405,7 +408,7 @@
     stream?.getTracks().forEach(track => track.stop()); stream = null;
     capture?.disconnect(); micSource?.disconnect(); capture = micSource = null;
     const oldWakeLock = wakeLock, oldContext = context;
-    wakeLock = null; context = null;
+    wakeLock = null; context = null; nextPlaybackTime = 0;
     $('level-fill').style.width = '0%'; $('mic-meter').setAttribute('aria-valuenow', '0');
     notice('Session ended. Your checklist is ready to export.'); updateControls();
     if (oldWakeLock) { try { await oldWakeLock.release(); } catch (_) {} }
