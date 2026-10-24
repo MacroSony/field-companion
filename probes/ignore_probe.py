@@ -137,7 +137,7 @@ def write_report(runs, started):
            "Setup caveat: initial setup-only attempts on both text models and preview audio received session.created but no session.updated within 15 seconds, so no turns were submitted in those attempts. "
            "Measured sessions proceed after session.created; its reported settings are retained below. In measured runs it includes the requested tools, matching instructions, model and modalities (and server_vad/STT for audio). "
            "Later retries are separate full-sequence sessions, never spliced into earlier partial results. Server-failed turns in retries are recorded and the same session continues with the next utterance, without reissuing the failed turn.", "",
-           "Reproduce fresh runs: `PYTHONDONTWRITEBYTECODE=1 /data/build/boson-realtime-probe/.venv/bin/python probes/ignore_probe.py`. "
+           "Reproduce fresh runs: `PYTHONDONTWRITEBYTECODE=1 python probes/ignore_probe.py`. "
            "Use `--append --modes preview-text preview-audio` to retain prior evidence and append retries. No commit or push performed.", "",
            "## Exact instructions", "", "```text", INSTRUCTIONS.strip(), "```", ""]
     latest = {}

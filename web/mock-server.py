@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Same-port static + session-aware protocol mock, not a real identifier.
-Run: /data/build/birding-demo/.venv/bin/python web/mock-server.py --port 8767
+Run: python web/mock-server.py --port 8767
 """
 import argparse
 import asyncio

@@ -6,6 +6,7 @@ import argparse
 import ast
 import asyncio
 import json
+import os
 from pathlib import Path
 import time
 import socket
@@ -34,13 +35,15 @@ def probe_tts(text):
 
 
 @contextmanager
-def local_server():
+def local_server(image):
     """Own only port 8792; use real Higgs and mock vision only if /classify is down."""
     import uvicorn
     import server as backend
     from unittest.mock import patch
-    jpeg = Path("/data/build/birding-demo/img/cardinal.jpg").read_bytes()
     try:
+        if image is None:
+            raise ValueError("Chorus test does not need vision")
+        jpeg = image.read_bytes()
         response = requests.post(__import__("os").environ.get("VISION_URL", "http://127.0.0.1:8795") + "/classify", json={
             "jpeg_b64": __import__("base64").b64encode(jpeg).decode(), "crop": None,
             "candidates": ["Cardinalis cardinalis", "Haemorhous mexicanus"], "k": 5}, timeout=30)
@@ -75,7 +78,7 @@ def local_server():
             sock.close()
 
 
-async def run(url):
+async def run(url, image):
     from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
     import uuid
     sid = "selftest-" + uuid.uuid4().hex[:8]
@@ -143,7 +146,7 @@ async def run(url):
                     capture = next(e for e in events["mic"][before_events:] if e.get("type") == "capture")
                     assert capture["n"] == 3
                     http_url = urlunsplit(parts._replace(scheme="http" if parts.scheme == "ws" else "https", path="/api/frame", query=""))
-                    jpeg = Path("/data/build/birding-demo/img/cardinal.jpg").read_bytes()
+                    jpeg = image.read_bytes()
                     response = await asyncio.to_thread(requests.post, http_url,
                         params={"session": sid, "obs": capture["obs"], "capture": capture["request_id"]}, data=jpeg,
                         headers={"Content-Type": "image/jpeg"}, timeout=90)
@@ -184,12 +187,12 @@ async def run(url):
             await asyncio.gather(*receivers, return_exceptions=True)
 
 
-async def run_chorus(url):
+async def run_chorus(url, data_dir, chorus_file):
     """Real BirdNET + Realtime: chorus -> one batch -> spoken accept-all -> one earcon."""
     from scipy.io import wavfile
     from urllib.parse import urlsplit, urlunsplit, urlencode
     import uuid
-    path = ROOT / "web/testaudio/03_chorus_5species.wav"
+    path = chorus_file.expanduser()
     def load(path):
         rate, data = wavfile.read(path)
         if data.ndim > 1:
@@ -202,10 +205,10 @@ async def run_chorus(url):
         source = str(path)
     else:
         # All three real recordings overlap; normalize to prevent clipping.
-        sources = [Path("/data/build/birding-demo/testmix") / f"{n}_best.wav"
+        sources = [(data_dir / "testmix") / f"{n}_best.wav"
                    for n in ("cardinal", "robin", "bluejay")]
         if not all(p.exists() for p in sources):
-            sources = [Path(f"/data/build/birding-demo/birds_{n}.wav") for n in ("cardinal", "robin", "bluejay")]
+            sources = [data_dir / f"birds_{n}.wav" for n in ("cardinal", "robin", "bluejay")]
         tracks = [load(p) for p in sources]
         wave = sum(gain * np.resize(x, 18 * 48000) for gain, x in zip((.5, 1, .05), tracks))
         source = " + ".join(str(p) for p in sources)
@@ -275,15 +278,41 @@ if __name__ == "__main__":
     parser.add_argument("--url", default="ws://127.0.0.1:8792/ws")
     parser.add_argument("--serve", action="store_true", help="Own test server on 8792, mock vision only if /classify unavailable")
     parser.add_argument("--chorus", action="store_true")
+    parser.add_argument("--data-dir", type=Path,
+                        default=Path(os.environ.get("FIELD_COMPANION_TEST_DATA", str(ROOT / "testdata"))).expanduser(),
+                        help="External fixture directory: img/cardinal.jpg, testmix/*_best.wav or birds_*.wav (FIELD_COMPANION_TEST_DATA)")
+    parser.add_argument("--image", type=Path,
+                        default=os.environ.get("FIELD_COMPANION_TEST_IMAGE"),
+                        help="Cardinal JPEG for the photo test (FIELD_COMPANION_TEST_IMAGE)")
+    parser.add_argument("--chorus-file", type=Path,
+                        default=ROOT / "web/testaudio/03_chorus_5species.wav",
+                        help="Optional chorus WAV; otherwise mix recordings from --data-dir")
     args = parser.parse_args()
+    args.data_dir = args.data_dir.expanduser()
+    image = args.image.expanduser() if args.image else args.data_dir / "img/cardinal.jpg"
+    # Preflight before starting a server or making paid TTS/API calls.
+    if args.chorus:
+        names = ("cardinal", "robin", "bluejay")
+        groups = [[args.chorus_file.expanduser()],
+                  [args.data_dir / "testmix" / f"{n}_best.wav" for n in names],
+                  [args.data_dir / f"birds_{n}.wav" for n in names]]
+        available = any(all(p.is_file() for p in group) for group in groups)
+        fixture = "chorus WAV or cardinal/robin/bluejay recordings"
+    else:
+        available = image.is_file()
+        fixture = str(image)
+    if not available:
+        print(json.dumps({"event": "selftest_skipped", "reason": "Missing licensed fixture: " + fixture,
+                          "help": "Supply --data-dir / FIELD_COMPANION_TEST_DATA, --image, or --chorus-file; fixtures are not bundled."}), flush=True)
+        raise SystemExit(0)
     try:
         if args.serve:
             if args.url != "ws://127.0.0.1:8792/ws":
                 raise ValueError("--serve requires the default port-8792 URL")
-            with local_server():
-                asyncio.run(run_chorus(args.url) if args.chorus else run(args.url))
+            with local_server(image if not args.chorus else None):
+                asyncio.run(run_chorus(args.url, args.data_dir, args.chorus_file) if args.chorus else run(args.url, image))
         else:
-            asyncio.run(run_chorus(args.url) if args.chorus else run(args.url))
+            asyncio.run(run_chorus(args.url, args.data_dir, args.chorus_file) if args.chorus else run(args.url, image))
     except Exception as exc:
         print(json.dumps({"event": "selftest_failed", "error_type": type(exc).__name__}), flush=True)
         raise SystemExit(1)

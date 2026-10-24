@@ -328,7 +328,8 @@ ask_expert error without answer, ask the user to look at an organism first.
 SESSIONS = {}
 SESSION_TTL = 600
 FOCUS_TTL = 120
-ALLOWLIST_DIR = Path("/data/build/tmp")
+ALLOWLIST_DIR = Path(os.environ.get("FIELD_COMPANION_CACHE", str(ROOT / "out" / "cache"))).expanduser()
+ALLOWLIST_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def scientific_species(name):

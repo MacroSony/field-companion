@@ -10,6 +10,7 @@ import base64
 from concurrent.futures import ThreadPoolExecutor
 import io
 import json
+import os
 from pathlib import Path
 import socket
 import statistics
@@ -21,7 +22,7 @@ import urllib.error
 import urllib.request
 
 HERE = Path(__file__).resolve().parent
-DATA = Path("/data/build/birding-demo")
+DATA = Path(os.environ.get("FIELD_COMPANION_TEST_DATA", str(HERE.parent / "testdata"))).expanduser()
 
 
 def jpeg_payload(path, candidates=None, crop=None, k=5):
@@ -149,7 +150,7 @@ def integration(args):
     assert len(names) == 60, f"Expected 60 local species, got {len(names)}"
     # Verify in its own process so the model is released before HTTP service starts.
     subprocess.run([sys.executable, "-B", str(Path(__file__).resolve()), "--verify-subset",
-                    "--candidates", str(args.candidates)], check=True)
+                    "--candidates", str(args.candidates), "--data-dir", str(DATA)], check=True)
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", args.port))  # Refuse to reuse/stop someone else's service.
     process = subprocess.Popen([sys.executable, "-B", str(HERE / "vision_service.py"),
@@ -252,8 +253,21 @@ if __name__ == "__main__":
     parser.add_argument("--integration", action="store_true")
     parser.add_argument("--verify-subset", action="store_true")
     parser.add_argument("--port", type=int, default=8795)
-    parser.add_argument("--candidates", type=Path, default=DATA / "vision-imgs/candidates.json")
+    parser.add_argument("--data-dir", type=Path, default=DATA,
+                        help="External image fixture directory (FIELD_COMPANION_TEST_DATA)")
+    parser.add_argument("--candidates", type=Path)
     args = parser.parse_args()
+    DATA = args.data_dir.expanduser()
+    args.candidates = args.candidates or DATA / "vision-imgs/candidates.json"
+    if args.integration or args.verify_subset:
+        required = [args.candidates, DATA / "img/cardinal.jpg"]
+        if args.integration:
+            required.append(DATA / "vision-imgs/00-6.jpg")
+        missing = [str(p) for p in required if not p.is_file()]
+        if missing:
+            print("SKIP vision integration: missing external fixtures: " + ", ".join(missing)
+                  + "; supply --data-dir / FIELD_COMPANION_TEST_DATA and --candidates.")
+            raise SystemExit(0)
     if args.verify_subset:
         verify_subset(args.candidates)
     elif args.integration:

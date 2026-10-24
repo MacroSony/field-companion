@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Real-time synthetic-mic fan-out; writes evidence only to docs/fanout-test.md.
-Run: PYTHONDONTWRITEBYTECODE=1 /data/build/birding-demo/.venv/bin/python -B probes/fanout_probe.py
+Run: FIELD_COMPANION_TEST_DATA=/path/to/fixtures python -B probes/fanout_probe.py
 No audio playback: output audio is counted, not fed back into the microphone.
 """
 import os
@@ -22,6 +22,7 @@ from realtime_probe import connect, tts
 
 ROOT = Path(__file__).resolve().parents[1]
 REPORT = ROOT / "docs/fanout-test.md"
+DATA = Path(os.environ.get("FIELD_COMPANION_TEST_DATA", str(ROOT / "testdata"))).expanduser()
 SR = 48000
 FRAME = 1920
 DURATION = 66
@@ -45,9 +46,15 @@ def evidence(event_name, **fields):
 
 
 def make_stream():
+    missing = [str(DATA / f"birds_{name}.wav") for name in ("cardinal", "robin")
+               if not (DATA / f"birds_{name}.wav").is_file()]
+    if missing:
+        print("SKIP fanout probe: missing external fixtures: " + ", ".join(missing)
+              + "; set FIELD_COMPANION_TEST_DATA.", flush=True)
+        raise SystemExit(0)
     audio = np.zeros(SR * DURATION, dtype=np.float32)
     for name, start, seconds in [("cardinal", 0, 40), ("robin", 40, 20)]:
-        with wave.open(f"/data/build/birding-demo/birds_{name}.wav", "rb") as w:
+        with wave.open(str(DATA / f"birds_{name}.wav"), "rb") as w:
             assert (w.getframerate(), w.getnchannels(), w.getsampwidth()) == (SR, 1, 2)
             x = np.frombuffer(w.readframes(SR * seconds), dtype="<i2").astype(np.float32) / 32768
         audio[start * SR:start * SR + len(x)] = x * 0.25
