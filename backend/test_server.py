@@ -605,6 +605,53 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(new.status, "confirmed")
         self.assertFalse(self.phone.audio)
 
+    async def test_new_target_requests_capture_without_old_evidence_or_hint(self):
+        saved = self.seed(count=2)
+        self.c.focus = saved.id
+        await self.route("new_observation", {"group": "Insecta"})
+        target = self.c.observations[self.c.focus]
+        self.assertNotEqual(target.id, saved.id)
+        self.assertEqual(target.group, "Insecta")
+        self.assertEqual(target.detections, [])
+        self.assertTrue(target.awaiting_answer)
+        self.assertEqual(saved.status, "confirmed")
+        self.assertEqual(self.c.items[0]["count"], 2)
+        self.assertIn({"type": "capture", "obs": target.id, "n": 3, "hint": ""}, self.phone.events)
+
+        target.hint = "Old target's bill"
+        self.phone.events.clear()
+        await self.route("new_observation", {"group": "Plantae"})
+        next_target = self.c.observations[self.c.focus]
+        self.assertEqual(target.status, "discarded")
+        self.assertEqual(next_target.group, "Plantae")
+        self.assertEqual(next_target.hint, "")
+        self.assertTrue(next_target.awaiting_answer)
+        self.assertIn({"type": "capture", "obs": next_target.id, "n": 3, "hint": ""}, self.phone.events)
+        self.assertEqual(len(self.c.items), 1)
+
+        before = list(self.c.observations)
+        with self.assertRaises(ValueError):
+            await self.c.tool("new_observation", {"group": "invalid"})
+        self.assertEqual(list(self.c.observations), before)
+        self.assertEqual(self.c.focus, next_target.id)
+
+    async def test_route_context_tracks_visual_focus_and_drops_discarded_focus(self):
+        obs = await self.c.new_focus()
+        candidate = {"sci": "Cyanocitta cristata", "en": "Blue Jay", "p": .9}
+        obs.fused = [candidate]
+        obs.detections = [s.Detection("photo-evidence", "image", s.now_iso(), [candidate])]
+        context = self.c.config("route")["instructions"].split("\nCurrent focus snapshot (context only, not a new sighting): ")[1]
+        snapshot = json.loads(context)
+        self.assertEqual(snapshot["id"], obs.id)
+        self.assertEqual(snapshot["top3"][0]["sci"], "Cyanocitta cristata")
+        self.assertEqual(snapshot["image_detections"], 1)
+        await self.c.tool("confirm_observation", {"count": 2})
+        context = self.c.config("route")["instructions"].split("\nCurrent focus snapshot (context only, not a new sighting): ")[1]
+        self.assertEqual(json.loads(context)["status"], "confirmed")
+        await self.c.tool("discard_observation", {})
+        context = self.c.config("route")["instructions"].split("\nCurrent focus snapshot (context only, not a new sighting): ")[1]
+        self.assertIsNone(json.loads(context))
+
     async def test_checklist_aggregation_maps_edits_to_observations(self):
         a = self.seed(count=2)
         b = self.seed(count=3)

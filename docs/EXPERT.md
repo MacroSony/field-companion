@@ -8,6 +8,8 @@ jobs. Ordinary sightings, count changes and checklist queries do not call GPT.
 
 - Higgs calls `ask_expert(question)` for candidate comparisons, alternative-ID
   questions and species facts about the focus (diet, habitat, behaviour).
+  The turn worker supplies the original typed/STT question, so a router rewrite
+  cannot silently translate it or add a species hypothesis.
 - An uncertain visual response calls the expert once for the current observation,
   after a short capture-burst delay. A confident visual response uses the existing
   BioCLIP answer. There is no GPT request per uploaded frame.
@@ -46,7 +48,9 @@ IDs, so the observation ID cannot be substituted for a detection ID. Empty
 contexts only allow empty reference arrays. Responses must match the question's
 English/Chinese language; wrong-language responses are rejected.
 Results carry an observation ID, snapshot revision and cited source metadata.
-The Higgs answer prompt asks it to speak the finished answer verbatim.
+Expert speech uses a scoped readout prompt containing only the finished answer;
+the normal answer prompt is restored after generation, including on failure.
+The model is instructed to read verbatim, which remains a live-evaluated behavior.
 
 For more evidence, the backend updates the existing observation's `hint` and
 broadcasts the existing `observation` message. The user's next “look again” reuses
@@ -107,3 +111,5 @@ focus isolation, stale results, hints, quiet mode and the core-path fallback.
 They establish the integration contract, not naturalist accuracy. Live model
 evaluation and an actual phone → camera → BioCLIP → GPT → Higgs field test remain
 separate acceptance checks.
+See [LOOK_EXPERT_TESTING.md](LOOK_EXPERT_TESTING.md) for the latest Look/expert
+validation, reproduced handoff bugs, fixes and remaining combined-field checks.

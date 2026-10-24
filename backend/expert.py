@@ -57,6 +57,13 @@ species knowledge from features actually reported by the user. If the current
 ID is uncertain, phrase facts conditionally ("If it is ..."). If the supplied
 sources do not support the requested fact, abstain or request clarification.
 No facts from memory, fabricated URLs, or invented evidence/source IDs.
+Apply the same source rule to the capture hint: do not describe the appearance,
+diet or behaviour of an alternative absent from the supplied sources. Say that
+the comparison is unsupported and request a neutral head/bill or whole-body view.
+The answer itself must include any essential request for another photo; hint is
+only a short UI reminder and will not be read aloud separately. When abstaining,
+say briefly that the available species information does not cover the question;
+do not ask the field user to supply source excerpts or promise to fetch them.
 For every source_id cited, include a source_quotes entry with a short EXACT
 verbatim excerpt from that source's extract which directly supports the claim.
 Do not use ellipses or paraphrase in quotes. A fact about one candidate never

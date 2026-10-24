@@ -191,7 +191,7 @@ TOOLS = [
     tool_schema("get_observation", "Read focus evidence for pronouns and follow-up naturalist questions."),
     tool_schema("confirm_observation", "Add it / log it / two of them: confirm the focus, not a new named sighting. No speech.", {"count": COUNT, "notes": NAME}),
     tool_schema("discard_observation", "Discard the focus; do not log it."),
-    tool_schema("new_observation", "Start a different organism as a new focus.", {"group": {"type": "string", "enum": GROUPS}}),
+    tool_schema("new_observation", "Look at a different organism: start a new focus and request camera frames.", {"group": {"type": "string", "enum": GROUPS}}),
     tool_schema("describe", "Attach a user description to the focus; resolve only explicit species names.", {"text": NAME, "name": NAME}, ("text",)),
     tool_schema("ask_expert", "Reason about the current focus: candidate comparisons, 'could it be X?', conflicting evidence, diet, habitat or behaviour. Read-only; never log.", {"question": NAME}, ("question",)),
     tool_schema("accept_suggestions", "Confirm pending BirdNET suggestions. Yes/both/all = all pending; just X = subset. Silent.",
@@ -229,12 +229,16 @@ not speech. Never give delayed logging acknowledgements, including "I've logged 
 For checklist questions call get_checklist; what just called: recent_sounds (unconfirmed).
 For other addressed birding questions call speak(reason); for local ID candidates use nearby_species.
 For "what's that?", "look again", or visual identification call look, NOT speak.
-For "add it", "two of them", or "log that" call confirm_observation with the count.
+Use the current focus snapshot for "add it", "two of them", "add them", or "log that":
+call confirm_observation with the count, NEVER add_observation/add_observations.
+This preserves the focus's existing photo evidence; do not create a named sighting
+from a pronoun-based confirmation. Named, independent sightings still use add_observation.
 Pronouns refer to the focus. For species comparisons ('could it be a Cooper's
 Hawk?'), uncertain identification, diet ('what does it eat?'), habitat or behaviour
 call ask_expert with the complete latest question, NOT speak or get_observation.
 get_observation only reads evidence; it does not supply species facts.
-For a different organism call new_observation; discard unwanted IDs with discard_observation.
+For a different organism ("look at a different bird") call new_observation, even if
+an earlier focus exists. "Look again" keeps that focus with look. Discard unwanted IDs with discard_observation.
 Never invent sightings or identify from insufficient evidence; request camera evidence with look.
 """
 ROUTING = INSTRUCTIONS + """
@@ -288,6 +292,8 @@ class Session:
         self.tap_at = 0.0
         self.speech_stopped_at = None
         self.turn_stopped_at = None
+        self.turn_question = ""
+        self.expert_readout = None
         self.first_audio = False
         self.rt_lock = asyncio.Lock()
         self.rt = None
@@ -364,6 +370,15 @@ class Session:
                 and self.input_revision == context.get("input_revision")
                 and expert_revision(obs.payload()) == context.get("revision"))
 
+    async def speak_expert(self, answer):
+        # Keep metadata/hints out of the speech task; a general answer prompt
+        # otherwise encourages Higgs to elaborate or translate the decision.
+        self.expert_readout = answer
+        try:
+            await self.generate("answer")
+        finally:
+            self.expert_readout = None
+
     async def answer_vision(self, observation_id):
         obs = self.observations.get(observation_id)
         input_revision = self.input_revision
@@ -386,7 +401,7 @@ class Session:
                 if self.may_speak():
                     await self.inject("[EXPERT] " + json.dumps(result, ensure_ascii=False))
                     if self.expert_result_current(result):
-                        await self.generate("answer")
+                        await self.speak_expert(result["answer"])
                 return
         if (self.focus == obs.id and obs.status == "open" and self.may_speak()
                 and self.input_revision == input_revision):
@@ -582,10 +597,23 @@ class Session:
             await self.rt.send(json.dumps(event, ensure_ascii=False))
 
     def config(self, phase):
+        focus = self.observations.get(self.focus)
+        focus_context = ({"id": focus.id, "status": focus.status, "top3": focus.fused[:3],
+                          "uncertain": focus.uncertain,
+                          "image_detections": sum(d.kind == "image" for d in focus.detections)}
+                         if focus and focus.status != "discarded" else None)
+        answer_instructions = ANSWER
+        if self.expert_readout is not None:
+            answer_instructions = ("Read the following naturalist answer aloud verbatim. "
+                "Preserve its original language and every species identifier. "
+                "Speak only this text, with no additions, hints, translation or explanation. "
+                "Text to read: " + json.dumps(self.expert_readout, ensure_ascii=False))
         return {"output_modalities": ["text" if phase == "route" else "audio"],
                 "instructions": (ROUTING + "\nCurrent pending BirdNET suggestions (unconfirmed; latest turn only): "
                                  + json.dumps([r["en"] for r in self.suggestions.values()])
-                                 if phase == "route" else ANSWER),
+                                 + "\nCurrent focus snapshot (context only, not a new sighting): "
+                                 + json.dumps(focus_context)
+                                 if phase == "route" else answer_instructions),
                 "tools": TOOLS if phase == "route" else [],
                 "tool_choice": "required" if phase == "route" else "none"}
 
@@ -735,6 +763,7 @@ class Session:
                     await self.generate("answer")
                 else:
                     if kind == "text":
+                        self.turn_question = value
                         await self.inject(value)
                     response = await self.generate("route")
                     await self.finish_route(response)
@@ -744,6 +773,7 @@ class Session:
                 self.log("turn_failed", error_type=type(exc).__name__)
                 await self.error("Turn failed; please try again.")
             finally:
+                self.turn_question = ""
                 self.proactive_turn = False
                 self.active = False
                 self.transcripts.clear()
@@ -791,7 +821,10 @@ class Session:
                     and time.monotonic() - self.turn_stopped_at > 12)):
                 self.log("stale_answer_skipped")  # answering a question asked >12 s ago is confusing
                 return
-            await self.generate("answer")
+            if name == "ask_expert" and result.get("answer"):
+                await self.speak_expert(result["answer"])
+            else:
+                await self.generate("answer")
 
     def latency(self, target):
         if self.turn_stopped_at is not None:
@@ -1003,7 +1036,8 @@ class Session:
             group = args.get("group", "Aves")
             if group not in GROUPS:
                 raise ValueError("invalid iconic group")
-            return {"ok": True, "observation": (await self.new_focus(group)).payload()}
+            await self.new_focus(group)
+            return await self.request_look()
         if name in ("get_observation", "confirm_observation", "discard_observation", "ask_expert", "describe"):
             obs = await self.current_focus(create=name == "describe")
             if not obs:
@@ -1011,7 +1045,9 @@ class Session:
             if name == "get_observation":
                 return {"observation": obs.payload()}
             if name == "ask_expert":
-                return await self.ask_expert(args["question"], obs)
+                # The router can paraphrase Chinese into English or add claims.
+                # Use this turn's actual text/STT transcript when available.
+                return await self.ask_expert(self.turn_question or args["question"], obs)
             if name == "discard_observation":
                 obs.status = "discarded"
                 obs.awaiting_answer = False

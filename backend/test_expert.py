@@ -253,6 +253,39 @@ class ExpertSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.c.focus, "ob1")
         self.assertEqual(self.c.mic.send_json.call_args.args[0]["hint"], "Zoom on the head")
 
+    async def test_worker_preserves_original_question_instead_of_router_translation(self):
+        self.c.connected = True
+        self.c.expert.answer.return_value = {"ok": True, "status": "completed",
+            **decision(answer="请拍近一点。")}
+        self.c.generate.return_value = {"status": "completed", "output": [{
+            "type": "function_call", "name": "ask_expert", "call_id": "translated",
+            "arguments": json.dumps({"question": "What does a Downy Woodpecker eat?"})}]}
+        self.c.pending.append(("text", "它吃什么？", None))
+        worker = asyncio.create_task(self.c.turn_worker())
+        self.c.tasks.append(worker)
+        self.c.work_ready.set()
+        async with asyncio.timeout(2):
+            while self.c.pending or self.c.active or not self.c.expert.answer.await_count:
+                await asyncio.sleep(.01)
+        self.assertEqual(self.c.expert.answer.call_args.args[0], "它吃什么？")
+        self.assertEqual(self.c.turn_question, "")
+        self.assertIsNone(self.c.expert_readout)
+
+    async def test_expert_readout_is_scoped_to_one_answer_even_on_failure(self):
+        normal = self.c.config("answer")
+        readouts = []
+        async def generate(phase):
+            readouts.append(self.c.config(phase))
+            raise ConnectionError("test disconnect")
+        self.c.generate.side_effect = generate
+        with self.assertRaises(ConnectionError):
+            await self.c.speak_expert("如果是 Downy Woodpecker，请拍清楚头部。")
+        self.assertIn("Downy Woodpecker", readouts[0]["instructions"])
+        self.assertIn("请拍清楚头部", readouts[0]["instructions"])
+        self.assertEqual(readouts[0]["tools"], [])
+        self.assertIsNone(self.c.expert_readout)
+        self.assertEqual(self.c.config("answer"), normal)
+
     async def test_focus_changes_evidence_changes_and_new_questions_drop_results(self):
         async def change_focus(*args):
             await self.c.new_focus()
