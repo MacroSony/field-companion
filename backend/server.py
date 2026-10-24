@@ -55,8 +55,14 @@ def inat(path, **params):
 
 
 def taxon_names(t):
-    return {"sci": t["name"], "en": t.get("english_common_name") or t["name"],
-            "zh": t.get("preferred_common_name") or t.get("english_common_name") or t["name"]}
+    en = t.get("english_common_name")
+    if not en:
+        result = inat("taxa/" + str(t["id"]), locale="en").get("results", [])
+        english = result[0] if result else {}
+        en = english.get("english_common_name") or english.get("preferred_common_name") or t["name"]
+    photo = t.get("default_photo") or {}
+    return {"sci": t["name"], "en": en, "zh": t.get("preferred_common_name") or en,
+            "photo": photo.get("square_url") or photo.get("medium_url") or ""}
 
 
 def resolve(name, group=None):
@@ -75,8 +81,7 @@ def nearby(lat, lng, group):
     result = inat("observations/species_counts", lat=lat, lng=lng, radius=15,
                   d1=since, iconic_taxa=group, per_page=60, locale="zh-CN")
     return {"lat": lat, "lng": lng, "radius_km": 15, "since": since,
-            "species": [{**taxon_names(r["taxon"]), "n": r["count"],
-                         "photo": (r["taxon"].get("default_photo") or {}).get("medium_url", "")}
+            "species": [{**taxon_names(r["taxon"]), "n": r["count"]}
                         for r in result.get("results", [])]}
 
 
@@ -99,29 +104,36 @@ TOOLS = [
                 {"seconds": {"type": "number", "minimum": 0, "maximum": 3600}}, ("seconds",)),
     tool_schema("nearby_species", "List recent iNaturalist species near GPS; narrow down description-based IDs before asking for confirmation.",
                 {"group": {"type": "string", "enum": GROUPS}}, ("group",)),
+    tool_schema("speak", "Request a spoken answer; no answer during routing.", {"reason": NAME}, ("reason",)),
     tool_schema("ignore", "Speech not addressed to the assistant (chatter, noise): stay silent; call ONLY this tool."),
 ]
-INSTRUCTIONS = """You are a concise hands-free birding/naturalist companion. Reply in the user's language, at most one short sentence.
-Never claim to have performed any action without its successful tool call. Checklist state is authoritative.
-A sighting report such as '两只北美红雀在灌木丛里' means call add_observation with count=2 and notes about the bushes.
-For count corrections call set_count, NOT add_observation. After add/remove/set_count call, say NOTHING: the phone plays an earcon.
-For unrelated conversation, bird song, noise or chatter call only ignore() and say NOTHING. Never transcribe bird song as human instructions.
-For questions about what just called use recent_sounds; distinguish heard species from confirmed checklist sightings.
-Use get_checklist for checklist questions. For unnamed organisms use nearby_species and ask before adding.
-[NOTIFY] is an automated unconfirmed BirdNET event: briefly ask whether to add the heard species; never auto-add it.
-Quiet mode means continue using logging tools, but do not speak unless the user taps. Never invent detections or claim an ID is certain.
+INSTRUCTIONS = """You are a concise hands-free birding/naturalist companion with an open microphone.
+Reply in English by default; the user may speak Chinese: answer in the language of the question.
+Classify ONLY the latest user turn. Ordinary off-topic remarks/questions to a companion,
+self-talk, phone calls, noise and pet-dog chatter are NOT addressed to you: call ignore.
+Nature sighting reports are addressed even without a wake word: call add_observation.
+For total count corrections use set_count; for deletion use remove_observation.
+Never claim to have logged anything without a successful tool call. Logging has an earcon,
+not speech. Never give delayed logging acknowledgements, including "I've logged X".
+For checklist questions call get_checklist; what just called: recent_sounds (unconfirmed).
+For other addressed birding questions call speak(reason); for local ID candidates use nearby_species.
+Never invent sightings or identify from insufficient evidence; ask for a description instead.
 """
-
-# v0 has one shared, in-memory outing: a reconnecting phone sees the same checklist.
-# No phone/session identifier exists in the v0 wire protocol. Restart resets the outing.
-ITEMS = []
-ITEM_LOCK = asyncio.Lock()
-CONNECTIONS = set()
-
-
-async def broadcast_checklist():
-    payload = {"type": "checklist", "items": [dict(row) for row in ITEMS]}
-    await asyncio.gather(*(c.phone_json(payload) for c in list(CONNECTIONS)), return_exceptions=True)
+ROUTING = INSTRUCTIONS + """
+ROUTING PHASE ONLY: select exactly ONE function call with NO text or audio.
+Chatter -> ignore; sighting -> add_observation; addressed question -> speak or a read tool.
+Earlier tool outputs are already handled. Do not invent sightings from questions.
+[TAP] means the next utterance is addressed to you.
+"""
+ANSWER = INSTRUCTIONS + """
+ANSWER PHASE: answer ONLY the latest addressed question in ONE short sentence. No tools.
+Use supplied tool results and checklist. Never acknowledge any earlier log or chatter;
+no "I've logged X" acknowledgements in answers. Reply in English by default, but in the
+language of the question (including Chinese). [NOTIFY] is an automated, unconfirmed BirdNET
+event: briefly ask whether to add the heard species, in English; NEVER claim it is logged.
+"""
+SESSIONS = {}
+SESSION_TTL = 600
 
 
 def valid_count(value):
@@ -130,22 +142,34 @@ def valid_count(value):
     return value
 
 
-class PhoneConnection:
-    def __init__(self, phone):
-        self.phone = phone
-        self.id = uuid.uuid4().hex[:8]
-        self.phone_lock = asyncio.Lock()
+class Session:
+    def __init__(self, session_id):
+        self.id = session_id
+        self.clients = set()
+        self.mic = None
+        self.items = []
+        self.item_lock = asyncio.Lock()
+        self.expiry_task = None
+        self.update_lock = asyncio.Lock()
+        self.update_waiter = None
+        self.response_waiter = None
+        self.phase = "route"
+        self.work_ready = asyncio.Event()
+        self.tap_at = 0.0
+        self.speech_stopped_at = None
+        self.turn_stopped_at = None
+        self.first_audio = False
         self.rt_lock = asyncio.Lock()
         self.rt = None
         self.connected = False
         self.closed = False
         self.mic_on = True
         self.quiet = False
-        self.tapped = False
-        self.lang = "zh"
+        self.lang = "en"
         self.lat, self.lng = 43.66, -79.39
         self.active = False
         self.user_speaking = False
+        self.awaiting_transcript = False
         self.response_id = None
         self.cancelled_ids = deque(maxlen=100)
         self.audio_allowed = True
@@ -170,7 +194,6 @@ class PhoneConnection:
         self.bird_task = None
         self.tasks = []
         self.transcripts = {}
-        self.output_buffers = defaultdict(list)
         self.total_audio_in = 0
         self.total_audio_out = 0
 
@@ -178,19 +201,30 @@ class PhoneConnection:
         LOG.info("%s", json.dumps({"connection": self.id, "event": event, **fields}, ensure_ascii=False))
 
     async def phone_json(self, event):
-        if not self.closed:
-            async with self.phone_lock:
-                await self.phone.send_json(event)
+        await asyncio.gather(*(c.send_json(event) for c in list(self.clients)), return_exceptions=True)
 
     async def phone_audio(self, pcm):
-        if not self.closed:
-            async with self.phone_lock:
-                await self.phone.send_bytes(pcm)
+        await asyncio.gather(*(c.send_audio(pcm) for c in list(self.clients)
+                               if c.role == "mic" or c.audio), return_exceptions=True)
+
+    @property
+    def echo_guard(self):
+        return any(c.role == "display" and c.audio for c in self.clients)
+
+    def state_payload(self):
+        return {"type": "state", "listening": self.mic_on,
+                "speaking": time.monotonic() < self.play_until,
+                "model": MODEL, "connected": self.connected, "echo_guard": self.echo_guard,
+                "session": self.id}
 
     async def state(self):
-        await self.phone_json({"type": "state", "listening": self.mic_on,
-                               "speaking": time.monotonic() < self.play_until,
-                               "model": MODEL, "connected": self.connected})
+        await self.phone_json(self.state_payload())
+
+    async def broadcast_checklist(self):
+        await self.phone_json({"type": "checklist", "items": [dict(r) for r in self.items]})
+
+    def may_speak(self):
+        return not self.quiet or time.monotonic() - self.tap_at < 10
 
     async def error(self, message):
         await self.phone_json({"type": "error", "message": message})
@@ -202,41 +236,136 @@ class PhoneConnection:
                 raise ConnectionError("Realtime unavailable")
             await self.rt.send(json.dumps(event, ensure_ascii=False))
 
+    def config(self, phase):
+        return {"output_modalities": ["text" if phase == "route" else "audio"],
+                "instructions": ROUTING if phase == "route" else ANSWER,
+                "tools": TOOLS if phase == "route" else [],
+                "tool_choice": "required" if phase == "route" else "none"}
+
     def session(self):
-        return {"model": MODEL, "output_modalities": ["audio"], "instructions": INSTRUCTIONS +
-                f"\nUser locale: {self.lang}. GPS: {self.lat}, {self.lng}. Quiet mode: {self.quiet}. " +
-                ("Speak Mandarin Chinese, including automated notifications, unless the user speaks another language."
-                 if self.lang.startswith("zh") else "Use the user's locale for automated notifications."),
-                "tools": TOOLS, "tool_choice": "auto",
+        return {"model": MODEL, **self.config("route"),
                 "audio": {"input": {"format": {"type": "audio/pcm", "rate": 24000},
                                     "turn_detection": {"type": "server_vad", "threshold": 0.5,
-                                                       "prefix_padding_ms": 300, "silence_duration_ms": 600},
+                                                       "prefix_padding_ms": 300, "silence_duration_ms": 600,
+                                                       "create_response": False, "interrupt_response": True},
                                     "transcription": {"model": "higgs-stt-3.1"}},
                           "output": {"format": {"type": "audio/pcm", "rate": 24000}}}}
+
+    async def update_session(self, config):
+        # Reader resolves the echo future; no waiting inside the reader.
+        async with self.update_lock:
+            self.update_waiter = asyncio.get_running_loop().create_future()
+            try:
+                await self.rt_send({"type": "session.update", "session": config})
+                echo = await asyncio.wait_for(self.update_waiter, 12)
+                for key in ("tool_choice", "output_modalities", "instructions"):
+                    if key in config and echo.get(key) != config[key]:
+                        raise RuntimeError("Session echo mismatch: " + key)
+                self.log("session_updated", phase=self.phase)
+            finally:
+                self.update_waiter = None
+
+    async def generate(self, phase):
+        self.phase = phase
+        await self.update_session(self.config(phase))
+        self.response_waiter = asyncio.get_running_loop().create_future()
+        self.audio_allowed = phase == "answer" and self.may_speak()
+        self.first_audio = False
+        try:
+            await self.rt_send({"type": "response.create"})
+            response = await asyncio.wait_for(self.response_waiter, 45)
+            if response.get("status") == "failed":
+                raise RuntimeError("Upstream generation failed")
+            return response
+        finally:
+            self.response_waiter = None
 
     async def inject(self, text):
         await self.rt_send({"type": "conversation.item.create", "item": {"type": "message", "role": "user",
                             "content": [{"type": "input_text", "text": text}]}})
 
-    async def create_response(self):
-        self.active = True  # reserve before awaiting network I/O
-        await self.rt_send({"type": "response.create"})
-
     async def flush_pending(self):
-        if not self.connected or self.active or self.user_speaking or not self.pending:
+        self.work_ready.set()
+
+    async def turn_worker(self):
+        while not self.closed:
+            await self.work_ready.wait()
+            self.work_ready.clear()
+            if not self.connected or self.active or self.user_speaking or not self.pending:
+                continue
+            user = next((p for p in self.pending if p[0] != "notify"), None)
+            if user is not None:
+                self.pending.remove(user)
+                self.pending.appendleft(user)
+            kind, value, stopped = self.pending[0]
+            if kind == "notify" and (self.awaiting_transcript or not self.may_speak()
+                                     or time.monotonic() < self.play_until):
+                continue
+            self.pending.popleft()
+            if kind == "notify" and any(r["sci"] == value["sci"] for r in self.items):
+                self.work_ready.set()
+                continue
+            self.active = True
+            self.turn_stopped_at = stopped
+            try:
+                if kind == "notify":
+                    await self.inject("[NOTIFY] BirdNET heard " + value["en"])
+                    await self.generate("answer")
+                else:
+                    if kind == "text":
+                        await self.inject(value)
+                    response = await self.generate("route")
+                    await self.finish_route(response)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.log("turn_failed", error_type=type(exc).__name__)
+                await self.error("Turn failed; please try again.")
+            finally:
+                self.active = False
+                self.transcripts.clear()
+                await self.state()
+                if self.pending:
+                    self.work_ready.set()
+
+    async def finish_route(self, response):
+        if response.get("status") != "completed":
             return
-        kind, value = self.pending[0]
-        if kind == "notify" and (self.quiet or time.monotonic() < self.play_until):
+        calls = [i for i in response.get("output", []) if i.get("type") == "function_call"]
+        self.log("route_done", tools=[c["name"] for c in calls])
+        if len(calls) != 1:
+            await self.error("Routing did not select one action; please try again.")
             return
-        self.pending.popleft()
-        if kind == "notify" and any(row["sci"] == value["sci"] for row in ITEMS):
-            await self.flush_pending()
-            return
-        self.active = True
-        text = value if kind == "text" else f"[NOTIFY] BirdNET heard {value['en']} ({value['zh']})"
-        await self.inject(text)
-        await self.rt_send({"type": "response.create"})
-        self.log("injected", kind=kind, text=text)
+        call = calls[0]
+        name = call["name"]
+        try:
+            args = json.loads(call.get("arguments") or "{}")
+            result = {"ok": True} if name == "ignore" else (
+                {"ready_to_answer": True, "reason": args.get("reason")} if name == "speak"
+                else await self.tool(name, args))
+        except (ValueError, TypeError, KeyError) as exc:
+            result = {"ok": False, "error": str(exc)[:180]}
+        except Exception as exc:
+            self.log("tool_failed", name=name, error_type=type(exc).__name__)
+            result = {"ok": False, "error": "External service unavailable; try again"}
+        if name in ("add_observation", "set_count", "remove_observation"):
+            await self.broadcast_checklist()
+            if result.get("ok"):
+                await self.phone_json({"type": "earcon", "kind": "logged"})
+                self.latency("earcon")
+            else:
+                await self.error(result.get("error", "Checklist change failed"))
+        await self.rt_send({"type": "conversation.item.create", "item": {
+            "type": "function_call_output", "call_id": call["call_id"],
+            "output": json.dumps(result, ensure_ascii=False)}})
+        self.log("tool", name=name, ok=result.get("ok", True))
+        if name in ("speak", "get_checklist", "recent_sounds", "nearby_species") and self.may_speak():
+            await self.generate("answer")
+
+    def latency(self, target):
+        if self.turn_stopped_at is not None:
+            self.log("latency", target=target,
+                     speech_stopped_ms=round((time.monotonic() - self.turn_stopped_at) * 1000, 1))
 
     async def realtime_loop(self):
         delay = 1
@@ -250,16 +379,18 @@ class PhoneConnection:
                     self.active = False
                     self.response_id = None
                     self.transcripts.clear()
-                    self.output_buffers.clear()
+                    # Higgs waits for the first update before emitting session.created.
                     await self.rt_send({"type": "session.update", "session": self.session()})
-                    # session.updated is not reliably emitted by Higgs; session.created suffices.
-                    event = json.loads(await asyncio.wait_for(ws.recv(), 20))
-                    if event.get("type") == "error":
-                        raise RuntimeError("Realtime session setup rejected")
+                    while True:
+                        event = json.loads(await asyncio.wait_for(ws.recv(), 20))
+                        if event.get("type") in ("session.created", "session.updated"):
+                            break
+                        if event.get("type") == "error":
+                            raise RuntimeError("Realtime setup rejected")
                     self.connected = True
                     delay = 1
                     self.log("realtime_connected", model=MODEL, acknowledgement=event.get("type"))
-                    summary = "; ".join(f"{r['count']} {r['en']} ({r['zh']})" for r in ITEMS) or "empty"
+                    summary = "; ".join(f"{r['count']} {r['en']} ({r.get('zh', '')})" for r in self.items) or "empty"
                     await self.rt_send({"type": "conversation.item.create", "item": {"type": "message", "role": "user",
                                         "content": [{"type": "input_text", "text": "Current confirmed checklist (context only; do not speak): " + summary[:3000]}]}})
                     await self.state()
@@ -274,6 +405,9 @@ class PhoneConnection:
                 self.log("realtime_disconnected", error_type=type(exc).__name__, retry_s=delay)
                 await self.error("Realtime disconnected; reconnecting.")
             finally:
+                for waiter in (self.update_waiter, self.response_waiter):
+                    if waiter is not None and not waiter.done():
+                        waiter.set_exception(ConnectionError("Realtime disconnected"))
                 self.rt = None
                 self.connected = False
                 self.active = False
@@ -297,10 +431,11 @@ class PhoneConnection:
                         "response.output_audio_transcript.delta", "response.audio_transcript.delta",
                         "response.output_text.delta", "response.output_audio_transcript.done",
                         "response.audio_transcript.done", "response.output_text.done")
-        if ty in output_types and not event.get("_deliver"):
-            # Higgs sometimes emits a spoken preamble BEFORE its tool call. Wait
-            # for response.done to decide whether this is a silent logging turn.
-            self.output_buffers[rid].append(event)
+        if ty == "session.updated":
+            if self.update_waiter is not None and not self.update_waiter.done():
+                self.update_waiter.set_result(event.get("session", {}))
+            return
+        if ty in output_types and (self.phase != "answer" or not self.audio_allowed):
             return
         if ty == "error":
             code = (event.get("error") or {}).get("code", "unknown")
@@ -311,10 +446,13 @@ class PhoneConnection:
                 pass
             self.log("realtime_error", code=code, message=message)
             if code != "response_not_active" and "cancel" not in str(code):
-                self.active = False
+                for waiter in (self.update_waiter, self.response_waiter):
+                    if waiter is not None and not waiter.done():
+                        waiter.set_exception(RuntimeError("Realtime request rejected"))
                 await self.error("Realtime request failed (" + str(code)[:100] + ").")
         elif ty == "input_audio_buffer.speech_started":
             self.user_speaking = True
+            self.awaiting_transcript = True
             if time.monotonic() < self.play_until:
                 if self.response_id:
                     self.cancelled_ids.append(self.response_id)
@@ -325,16 +463,25 @@ class PhoneConnection:
             await self.state()
         elif ty == "input_audio_buffer.speech_stopped":
             self.user_speaking = False
+            self.speech_stopped_at = time.monotonic()
         elif ty == "conversation.item.input_audio_transcription.completed":
+            self.awaiting_transcript = False
             text = event.get("transcript", "")
+            # With create_response=false the server never commits the buffer, so STT
+            # re-transcribes everything since session start. Clear it per turn (tested 10/23).
+            await self.rt_send({"type": "input_audio_buffer.clear"})
             await self.phone_json({"type": "transcript", "role": "user", "text": text, "final": True})
             self.log("user_transcript", text=text)
+            if text.strip():
+                self.pending.append(("text", text, self.speech_stopped_at))  # transcript as text; audio buffer is cleared
+                await self.flush_pending()
         elif ty == "conversation.item.input_audio_transcription.failed":
+            self.awaiting_transcript = False
             await self.error("Input transcription failed.")
+            await self.flush_pending()
         elif ty == "response.created":
             self.active = True
             self.response_id = event["response"]["id"]
-            self.audio_allowed = not self.quiet or self.tapped
         elif ty in ("response.output_audio.delta", "response.audio.delta"):
             if rid in self.cancelled_ids or not self.audio_allowed:
                 return
@@ -342,6 +489,9 @@ class PhoneConnection:
             was_speaking = time.monotonic() < self.play_until
             await self.phone_audio(pcm)
             self.total_audio_out += len(pcm)
+            if not self.first_audio:
+                self.first_audio = True
+                self.latency("first_audio")
             self.play_until = max(time.monotonic(), self.play_until) + len(pcm) / 48000
             if not was_speaking:
                 await self.state()
@@ -359,61 +509,23 @@ class PhoneConnection:
                                        "text": event.get("transcript", event.get("text", "")), "final": True})
         elif ty == "response.done":
             response = event["response"]
-            calls = [item for item in response.get("output", []) if item.get("type") == "function_call"]
-            self.log("response_done", status=response.get("status"), tools=[c["name"] for c in calls])
-            buffered = self.output_buffers.pop(response.get("id", rid), [])
-            if not calls and response.get("status") == "completed":
-                for output in buffered:
-                    await self.handle_rt({**output, "_deliver": True})
-            # Any tool turn's preamble is discarded; read tools get a separate
-            # grounded answer via response.create, mutations get only an earcon.
-            # Keep the response reserved while potentially slow tool work runs.
-            followup = False
-            for call in calls:
-                name = call["name"]
-                if name == "ignore":
-                    self.log("tool", name=name, ok=True)
-                    continue  # deliberately NO function output and NO response.create
-                try:
-                    args = json.loads(call.get("arguments") or "{}")
-                    result = await self.tool(name, args)
-                except (ValueError, TypeError, KeyError) as exc:
-                    result = {"ok": False, "error": str(exc)[:180]}
-                except Exception as exc:
-                    self.log("tool_failed", name=name, error_type=type(exc).__name__)
-                    result = {"ok": False, "error": "External service unavailable; try again"}
-                await self.rt_send({"type": "conversation.item.create", "item": {"type": "function_call_output",
-                                    "call_id": call["call_id"], "output": json.dumps(result, ensure_ascii=False)}})
-                self.log("tool", name=name, ok=result.get("ok", True))
-                if name in ("add_observation", "remove_observation", "set_count"):
-                    await broadcast_checklist()
-                    if result.get("ok"):
-                        await self.phone_json({"type": "earcon", "kind": "logged"})
-                    else:
-                        await self.error(result.get("error", "Checklist change failed"))
-                elif name in ("get_checklist", "recent_sounds", "nearby_species"):
-                    followup = True
-            self.active = False
-            if followup:
-                await self.create_response()
-            else:
-                self.tapped = False
-                await self.flush_pending()
-            await self.state()
+            self.log("response_done", status=response.get("status"), phase=self.phase)
+            if self.response_waiter is not None and not self.response_waiter.done():
+                self.response_waiter.set_result(response)
 
     async def find_item(self, name):
         needle = str(name).strip().casefold()
-        for row in ITEMS:
+        for row in self.items:
             if any(str(row.get(k, "")).casefold() == needle for k in ("id", "sci", "en", "zh")):
                 return row["id"]
         taxon = await asyncio.to_thread(resolve, str(name), None)
         if taxon:
-            return next((r["id"] for r in ITEMS if r["sci"] == taxon["sci"]), None)
+            return next((r["id"] for r in self.items if r["sci"] == taxon["sci"]), None)
         return None
 
     async def tool(self, name, args):
         if name == "get_checklist":
-            return {"items": [dict(r) for r in ITEMS], "species_count": len(ITEMS)}
+            return {"items": [dict(r) for r in self.items], "species_count": len(self.items)}
         if name == "recent_sounds":
             seconds = float(args.get("seconds", 15))
             if not np.isfinite(seconds):
@@ -439,26 +551,27 @@ class PhoneConnection:
             taxon = await asyncio.to_thread(resolve, str(args["name"]), group)
             if not taxon:
                 return {"ok": False, "error": "No matching taxon in that iconic group"}
-            async with ITEM_LOCK:
-                row = next((r for r in ITEMS if r["sci"] == taxon["sci"]), None)
+            async with self.item_lock:
+                row = next((r for r in self.items if r["sci"] == taxon["sci"]), None)
                 if row:
                     row["count"] += count
                     if args.get("notes"):
                         row["notes"] = "; ".join(filter(None, [row["notes"], str(args["notes"])]))
                 else:
                     row = {"id": "o" + uuid.uuid4().hex[:10], **taxon, "count": count,
-                           "notes": str(args.get("notes", "")), "first_seen": now_iso(), "source": "voice"}
-                    ITEMS.append(row)
+                           "notes": str(args.get("notes", "")), "first_seen": now_iso(), "source": "voice",
+                           "photo": taxon.get("photo", ""), "lat": self.lat, "lng": self.lng}
+                    self.items.append(row)
                 return {"ok": True, "item": dict(row)}
         if name in ("remove_observation", "set_count"):
             count = valid_count(args.get("count")) if name == "set_count" else None
             item_id = await self.find_item(args["name"])
-            async with ITEM_LOCK:
-                row = next((r for r in ITEMS if r["id"] == item_id), None)
+            async with self.item_lock:
+                row = next((r for r in self.items if r["id"] == item_id), None)
                 if row is None:
                     return {"ok": False, "error": "Species is not in the checklist"}
                 if name == "remove_observation":
-                    ITEMS.remove(row)
+                    self.items.remove(row)
                 else:
                     row["count"] = count
                 return {"ok": True, "item": dict(row)}
@@ -489,12 +602,13 @@ class PhoneConnection:
                     except Exception:
                         taxon = None
                     self.names[sci] = taxon or {"sci": sci, "en": d["common_name"], "zh": d["common_name"]}
-                names = {k: self.names[sci][k] for k in ("sci", "en", "zh")}
+                names = {k: self.names[sci].get(k, "") for k in ("sci", "en", "zh", "photo")}
                 confidence = round(float(d["confidence"]), 4)
                 first = confidence >= 0.5 and sci not in self.seen
                 if confidence >= 0.5:
                     self.seen.add(sci)
-                heard = {"type": "heard", **names, "conf": confidence, "t": now_iso(), "new": first}
+                heard = {"type": "heard", **names, "conf": confidence, "t": now_iso(), "new": first,
+                         "lat": self.lat, "lng": self.lng}
                 self.history.append((time.monotonic(), {k: v for k, v in heard.items() if k != "type"}))
                 await self.phone_json(heard)
                 self.log("bird_detection", **names, conf=confidence, stream_s=round(end / SR, 2))
@@ -505,9 +619,9 @@ class PhoneConnection:
                     hits.popleft()
                 if confidence >= 0.5 and (not hits or hits[-1] != end):
                     hits.append(end)
-                if len(hits) >= 2 and sci not in self.notified and not any(r["sci"] == sci for r in ITEMS):
+                if len(hits) >= 2 and sci not in self.notified and not any(r["sci"] == sci for r in self.items):
                     self.notified.add(sci)
-                    self.pending.append(("notify", names))
+                    self.pending.append(("notify", names, None))
                     self.log("notify_queued", sci=sci, windows=len(hits))
             await self.flush_pending()
         except asyncio.CancelledError:
@@ -534,7 +648,7 @@ class PhoneConnection:
         filtered, self.filter_state = lfilter(self.filter_taps, [1.0], frame, zi=self.filter_state)
         pcm = (np.clip(filtered[self.decimation_phase::2], -1, 1) * 32767).astype("<i2").tobytes()
         self.decimation_phase = (self.decimation_phase - n) % 2
-        if self.connected:
+        if self.connected and not self.echo_blocked():
             if self.audio_queue.full():
                 self.audio_queue.get_nowait()  # bounded latency rather than stale audio after a network stall
                 self.log("audio_queue_drop")
@@ -548,11 +662,14 @@ class PhoneConnection:
                 self.log("bird_window_skipped", reason="worker busy")
             self.next_window += int(1.5 * SR)
 
+    def echo_blocked(self):
+        return self.echo_guard and time.monotonic() < self.play_until + 0.3
+
     async def audio_sender(self):
         while True:
             pcm = await self.audio_queue.get()
             try:
-                if self.connected:
+                if self.connected and not self.echo_blocked():
                     await self.rt_send({"type": "input_audio_buffer.append", "audio": base64.b64encode(pcm).decode()})
             except Exception as exc:
                 self.log("audio_send_failed", error_type=type(exc).__name__)
@@ -567,9 +684,9 @@ class PhoneConnection:
                 if not (-90 <= lat <= 90 and -180 <= lng <= 180):
                     raise ValueError("Invalid GPS coordinates")
                 self.lat, self.lng = lat, lng
-            self.lang = str(event.get("lang", "zh"))[:32]
+            self.lang = str(event.get("lang", "en"))[:32]
             await self.state()
-            await self.phone_json({"type": "checklist", "items": [dict(r) for r in ITEMS]})
+            await self.phone_json({"type": "checklist", "items": [dict(r) for r in self.items]})
         elif ty == "mic":
             if not isinstance(event.get("on"), bool):
                 raise ValueError("mic.on must be boolean")
@@ -583,87 +700,153 @@ class PhoneConnection:
                 self.play_until = 0
                 self.audio_allowed = False
                 await self.phone_json({"type": "flush"})
-            if self.connected:
-                await self.rt_send({"type": "session.update", "session": {"instructions": self.session()["instructions"]}})
             await self.state()
             await self.flush_pending()
         elif ty == "tap":
-            self.tapped = True
+            self.tap_at = time.monotonic()
+            await self.cancel_speech()
             if self.connected:
-                await self.inject("[TAP] The next user utterance is addressed to you; you may speak in quiet mode.")
+                await self.inject("[TAP] The next user utterance is addressed to you.")
         elif ty == "text":
             text = event.get("text", "")
             if not isinstance(text, str) or not text.strip() or len(text) > 8000:
                 raise ValueError("text must contain 1–8000 characters")
-            self.pending.appendleft(("text", text))
+            self.pending.append(("text", text, None))
             await self.flush_pending()
         elif ty in ("edit", "delete"):
             count = valid_count(event.get("count")) if ty == "edit" else None
-            async with ITEM_LOCK:
-                row = next((r for r in ITEMS if r["id"] == event.get("id")), None)
+            async with self.item_lock:
+                row = next((r for r in self.items if r["id"] == event.get("id")), None)
                 if not row:
                     raise ValueError("Unknown observation id")
                 if ty == "edit":
                     row["count"] = count
                 else:
-                    ITEMS.remove(row)
-            await broadcast_checklist()
+                    self.items.remove(row)
+            await self.broadcast_checklist()
             await self.phone_json({"type": "earcon", "kind": "logged"})
             if self.connected:
-                summary = json.dumps(ITEMS, ensure_ascii=False)
+                summary = json.dumps(self.items, ensure_ascii=False)
                 await self.rt_send({"type": "conversation.item.create", "item": {"type": "message", "role": "user",
                                     "content": [{"type": "input_text", "text": "Manual checklist update (context only): " + summary[:6000]}]}})
         else:
             raise ValueError("Unknown message type")
 
+    async def cancel_speech(self):
+        if self.response_id:
+            self.cancelled_ids.append(self.response_id)
+        self.audio_allowed = False
+        self.play_until = 0
+        if self.connected and (self.active or self.response_id):
+            await self.rt_send({"type": "response.cancel"})
+        await self.phone_json({"type": "flush"})
+        await self.state()
+
+    def start(self):
+        self.tasks = [asyncio.create_task(self.realtime_loop()),
+                      asyncio.create_task(self.audio_sender()), asyncio.create_task(self.turn_worker())]
+
+    async def close(self):
+        self.closed = True
+        tasks = self.tasks + [t for t in (self.bird_task, self.playback_task) if t is not None]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self.executor.shutdown(wait=False, cancel_futures=True)
+
+    async def expire(self):
+        await asyncio.sleep(SESSION_TTL)
+        if not self.clients:
+            SESSIONS.pop(self.id, None)
+            await self.close()
+
+
+class Client:
+    def __init__(self, phone, session, role="mic", audio=False):
+        self.phone, self.session, self.role, self.audio = phone, session, role, audio
+        self.lock = asyncio.Lock()
+
+    async def send_json(self, event):
+        async with self.lock:
+            await self.phone.send_json(event)
+
+    async def send_audio(self, pcm):
+        async with self.lock:
+            await self.phone.send_bytes(pcm)
+
     async def run(self):
-        await self.phone.accept()
-        CONNECTIONS.add(self)
-        self.log("phone_connected")
+        s = self.session
+        if s.expiry_task:
+            s.expiry_task.cancel()
+            s.expiry_task = None
+        # Attach before awaiting old.close: its finally must not start an expiry
+        # timer during the transient microphone replacement.
+        s.clients.add(self)
+        if self.role == "mic":
+            old = s.mic
+            s.mic = self
+            if old is not None:
+                s.clients.discard(old)
+                try:
+                    await old.phone.close(code=1000, reason="Replaced by newer microphone")
+                except (RuntimeError, WebSocketDisconnect):
+                    pass
         try:
-            hello = await asyncio.wait_for(self.phone.receive_json(), 20)
-            if not isinstance(hello, dict) or hello.get("type") != "hello":
-                await self.error("Send hello first")
-                await self.phone.close(code=1008)
-                return
-            await self.handle_phone(hello)
-            self.tasks = [asyncio.create_task(self.realtime_loop()), asyncio.create_task(self.audio_sender())]
+            await s.state()
+            await self.send_json({"type": "checklist", "items": [dict(r) for r in s.items]})
             while True:
                 packet = await self.phone.receive()
                 if packet["type"] == "websocket.disconnect":
                     break
+                if self.role == "mic" and s.mic is not self:
+                    break  # a replaced mic cannot race a final JSON control message
                 try:
                     if packet.get("bytes") is not None:
-                        await self.ingest_audio(packet["bytes"])
+                        if self.role == "mic" and s.mic is self:
+                            await s.ingest_audio(packet["bytes"])
                     elif packet.get("text") is not None:
                         event = json.loads(packet["text"])
                         if not isinstance(event, dict):
                             raise ValueError("JSON message must be an object")
-                        await self.handle_phone(event)
+                        if self.role == "display" and event.get("type") not in ("hello", "text", "edit", "delete", "tap"):
+                            raise ValueError("Display cannot control microphone or mode")
+                        if event.get("type") == "hello" and self.role == "display":
+                            await self.send_json(s.state_payload())
+                            await self.send_json({"type": "checklist", "items": [dict(r) for r in s.items]})
+                        else:
+                            await s.handle_phone(event)
                 except (ValueError, KeyError, TypeError) as exc:
-                    await self.error(str(exc)[:180])
+                    await s.error(str(exc)[:180])
                 except Exception as exc:
-                    self.log("phone_message_failed", error_type=type(exc).__name__)
-                    await self.error("Request could not be completed")
-        except (WebSocketDisconnect, asyncio.TimeoutError):
+                    s.log("client_message_failed", error_type=type(exc).__name__)
+                    await s.error("Request could not be completed")
+        except WebSocketDisconnect:
             pass
         finally:
-            self.closed = True
-            CONNECTIONS.discard(self)
-            tasks = self.tasks + [t for t in (self.bird_task, self.playback_task) if t is not None]
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            self.executor.shutdown(wait=False, cancel_futures=True)
-            self.log("phone_disconnected", input_bytes=self.total_audio_in, output_bytes=self.total_audio_out)
+            s.clients.discard(self)
+            if s.mic is self:
+                s.mic = None
+            await s.state()
+            if not s.clients:
+                s.expiry_task = asyncio.create_task(s.expire())
 
 
-app = FastAPI(title="Field Companion v0")
+app = FastAPI(title="Field Companion v0.1")
 
 
 @app.websocket("/ws")
 async def phone_socket(ws: WebSocket):
-    await PhoneConnection(ws).run()
+    role = ws.query_params.get("role", "mic")
+    session_id = ws.query_params.get("session", "demo")
+    if role not in ("mic", "display") or not session_id or len(session_id) > 128:
+        await ws.close(code=1008)
+        return
+    await ws.accept()
+    session = SESSIONS.get(session_id)
+    if session is None:
+        session = SESSIONS[session_id] = Session(session_id)
+        session.start()
+    await Client(ws, session, role, ws.query_params.get("audio") == "1").run()
 
 
 # Mount after the websocket route so /ws is never shadowed by the static app.
