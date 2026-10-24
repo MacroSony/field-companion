@@ -17,6 +17,13 @@ Plain HTML/CSS/JS, no build step. Serve this directory at `/` with the protocol 
 
 Open the header **Settings** gear for Speaker/Earphones, **Quiet (only speaks when you tap)**, microphone and capture diagnostics, model/build IDs, headset controls, **Type instead**, CSV export, and **Reset session**. Heard nearby and the map start collapsed on phones. The main controls are Start/End, **Tap to talk** (the next thing you say is addressed to the assistant; tap again to stop speech), and **Pause mic** (stops mic capture/transmission).
 
+**Mute assistant** temporarily sets only the shared assistant output gain to zero,
+including current/queued speech and earcons. Captions, microphone transmission and
+playback/drained timing continue, so it can test acoustic feedback without relying
+on phone volume controls. The main screen shows the muted state; reconnect keeps
+it, End/page reload restores audible output, and unmuting never replays old audio.
+`output_mute` reports are diagnostic only and do not change BirdNET or mic policy.
+
 After **Start listening** grants permission, use **Microphone** in Settings to choose the phone, USB-C, or headset input. The device ID and label are saved locally. Switching acquires and connects the new input before stopping the old track, preserving the old input on failure; a missing saved or disconnected input falls back to the system default. The small debug line shows actual track settings and AudioContext rate ("not reported" means the browser omitted a setting). Speaker/Earphones controls conversation behavior, not hardware routing.
 
 **Headset-button push-to-talk is opt-in and defaults off.** Only enabling it during a session (or starting with it checked) plays a looping, zero-valued WAV through a separate audio element to keep Media Session active. Disabling it stops the loop and releases Media Session. Supported play/pause/next/previous headset actions act like **Tap to talk**, cancel speech, and show **Headset button → talk**. End releases this media session. This is tap-to-talk, not hold-to-record; unsupported browsers still have the on-screen button.
@@ -40,7 +47,7 @@ Mock checklist state is shared per session, persists through reconnects, and cle
 ## Implementation notes
 
 - Start unlocks a shared AudioContext and requests 48 kHz mono input with echo cancellation enabled, noise suppression and automatic gain control disabled. An AudioWorklet captures PCM16 in 20 ms chunks. A stateful linear JS resampler handles other negotiated rates; it is not a production band-limited resampler.
-- Hello includes `client_build` (`2026-10-24-tool-feedback`) and `playback_protocol: 1`; an optional differing `server_build` in state shows a reload banner. Absence is supported. Service-worker cache is bumped with this build. Deploy frontend and backend together.
+- Hello includes `client_build` (`2026-10-24-speaker-echo`) and `playback_protocol: 1`; an optional differing `server_build` in state shows a reload banner. Absence is supported. Service-worker cache is bumped with this build. Deploy frontend and backend together.
 - GPS never delays hello. Late fixes and subsequent movement over 200 m send `location`. A replaced mic (backend reason `Replaced by newer microphone`, or a replacement state/error) stops audio/capture and auto-reconnect; the user must tap the takeover notice to reconnect.
 - Reset in Settings and the display header confirms **Clear checklist, suggestions, heard history, investigations and conversation?**, sends `reset`, and immediately clears local outing state, camera evidence, investigation cards and captions. Server reset cancels old investigations and starts a fresh queue/conversation.
 - Incoming 24 kHz PCM is queued sequentially through WebAudio, including queues over 30 seconds. The playback clock resets only when its AudioContext changes or an explicit flush occurs. Matching `audio_start` / `audio_end` and drained acknowledgements keep ready offers behind existing playback. Flush stops speech and earcons. Disconnected edits are disabled; reconnect uses backoff. Stale mic frames are dropped instead of buffered.

@@ -9,12 +9,22 @@ One WebSocket per phone: `wss://<host>/ws`. The backend also serves the web app 
 - **Echo guard**: speaker mode (`earphones=false`) and audio-enabled displays use transcript-confirmed interruption. Microphone audio continues to Realtime during playback. VAD alone is a candidate; a non-echo transcript cancels generation, flushes queued playback and routes the new question. Earphones without an audio-enabled display cancel at VAD start. Spoken “stop” / “等一下” cancels without a spoken acknowledgement, keeps investigations running, and defers automatic notices until the next user turn. Tap cancels immediately. Playback estimates, actual playback reports and their 500 ms tail (800 ms for legacy clients) still protect BirdNET and automatic notifications; they do not close Realtime input.
 - In speaker mode, three-second BirdNET windows containing any assistant-playback/tail samples are dropped and logged (`bird_window_skipped`, reason `assistant_playback`). Earphone-mode BirdNET is unchanged, including with an audio-enabled display.
 - Independently of output mode, recent assistant speech is compared to incoming STT before routing: up to three spoken transcripts, within ten seconds of assistant speech. A contiguous match of at least three normalized English words, or six tokens for Chinese (individual Chinese characters are tokens), covering >=70% of the input drops an echo (`echo_dropped`). Shorter inputs and explicit stop commands pass. Typed text is not filtered. This heuristic supplements browser acoustic echo cancellation.
+- In speaker mode, three observed short/misheard cached-cue echoes additionally
+  match the complete utterance during their matching playback or its two-second
+  tail: `Taking photo`, `Photo ready`, and `I hurt you` (from `I heard you`). This
+  does not lower the general word threshold or filter single-word Start/Stop.
+  Known filler/unprompted Yes/Okay is ignored before cancelling current playback;
+  matching logging/explanation consent and meaningful new questions still pass.
+  Dropped echo/ignored items are removed from retained model history.
 
 ## Phone → backend
 - **Binary frames**: microphone audio, PCM16 little-endian, mono, **48 kHz**, about 20–40 ms per frame. The browser requests echoCancellation=true, noiseSuppression=false and autoGainControl=false. Actual processing depends on browser/device support.
 - **JSON text frames**:
   - `{"type":"hello","lat":43.66,"lng":-79.39,"lang":"zh","earphones":false}`: sent first. GPS, language and boolean `earphones` are optional; each new mic defaults to speaker mode. The mic may repeat hello with its current language/output mode when an initially pending GPS fix arrives; subsequent observations use the updated location.
   - `{"type":"audio_mode","earphones":true|false}`: mic only; change output policy. `false` = speaker / transcript-confirmed interruption; `true` = earphones / voice-onset interruption unless an audio-enabled display requires transcript confirmation. The UI persists the selection locally and sends it on connect and change.
+  - `{"type":"output_mute","muted":true|false}`: informational per-client output
+    state, logged for diagnostics. No input, model or playback policy changes.
+    The client sends it on connect and whenever its temporary mute is toggled.
   - `{"type":"playback","active":true|false}`: audio-output client reports when scheduled assistant audio actually starts and when its last queued source finishes, including after flush. End times are measured at backend receipt, not supplied by the client. Audio-enabled displays may report too. Reports never shorten the backend estimate.
   - `{"type":"mic","on":true|false}`: mic paused or resumed.
   - `{"type":"mode","quiet":true|false}`: quiet mode. Logging still works, but the assistant only speaks after a tap.

@@ -65,11 +65,35 @@ not a claim that every photo starts a GPT investigation. The photo cue waits for
 the previous playback and ongoing conversation and is discarded on cancellation
 or a changed focus. Results wait for the progress audio to drain.
 
-Current build: `2026-10-24-task-receipts`.
+That build: `2026-10-24-task-receipts`.
 All 169 offline tests pass. Regressions replay the unwanted Yes/Okay receipts, preserve investigation consent,
 and check task confirmation ordering, invalid/cancelled/stale routes and camera
 phase feedback. Browser media/classification are fixtures; physical phone playback
 and camera behavior still need user verification.
+
+## Short speaker echoes and mute control (2026-10-24)
+
+Phone logs captured the assistant's cached prompts returning as `Taking photo`,
+`I hurt you` (after `I heard you`) and `Photo ready`. These exact short variants
+are suppressed only against their matching recent cached output in speaker mode,
+during playback or its two-second tail. The general echo threshold is unchanged;
+single-word Start/Stop, valid offer consent and new questions remain supported.
+Unprompted Yes/Okay and filler are rejected before cancelling current playback.
+Dropped echo/ignored inputs are removed from model history. This is a bounded
+lexical safeguard, not a guarantee of acoustic echo cancellation.
+
+Settings now includes temporary **Mute assistant**, independent of system volume.
+The client keeps the same microphone/captions/PCM scheduling and drained reports,
+with the shared assistant PCM/earcon gain at zero. It sends diagnostic-only
+`output_mute` events on connect/toggle; these do not change BirdNET input or gates.
+The main screen displays mute; reconnect retains it and End/reload resets it.
+
+Current build: `2026-10-24-speaker-echo`. Offline tests replay the observed prompt
+echoes, pre-interruption rejection, valid consent/commands and output-state
+diagnostics. Browser tests additionally verify shared zero gain, continued mic
+packets/captions/reports and no replay/flush when muting or unmuting. Real phone
+acoustic behavior still requires a user check.
+Validation: 176 offline tests and both isolated browser suites passed.
 
 ## Camera confirmation (2026-10-24)
 

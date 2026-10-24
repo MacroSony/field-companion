@@ -979,7 +979,7 @@ class Session:
             return
         self.play_until = max(time.monotonic(), self.play_until) + len(pcm) / 48000
         self.echo_estimate = self.play_until
-        self.remember_spoken((playback_id, "feedback"), text)
+        self.remember_spoken((playback_id, "feedback", kind), text)
         if kind != "received":
             self.last_assistant_text = text
         await self.phone_json({"type": "transcript", "role": "assistant", "text": text, "final": True})
@@ -994,6 +994,10 @@ class Session:
                      request_id=self.camera_request["id"] if self.camera_request else None)
         elif self.audio_playback_id == playback_id:
             await self.flush_audio()
+        if not played:
+            for row in list(self.spoken):
+                if row[0] == (playback_id, "feedback", kind):
+                    self.spoken.remove(row)
         if self.playback_task is None or self.playback_task.done():
             self.playback_task = asyncio.create_task(self.playback_finished())
         await self.state()
@@ -1069,6 +1073,24 @@ class Session:
         words = re.sub(r"[^\w\s]", "", str(text).lower()).split()
         return bool(words) and all(w in {"ah", "uh", "um", "oh", "hmm", "mm", "mmhmm", "mhm", "er", "erm"} for w in words)
 
+    def consent_context(self):
+        return {
+            "log_offer": bool(re.search(r"(?:add|log|record|加入|记录).*(?:\?|？)$", self.last_assistant_text, re.I)),
+            "explanation_offer": bool(self.investigation_offer_ids and re.search(
+                r"(?:would you like me to explain|which would you like me to explain|要我讲一下结果吗|你想先听哪一项)",
+                self.last_assistant_text, re.I))}
+
+    def ignored_input_reason(self, text):
+        """Apply known no-intent guards before audio cancellation, not just tools."""
+        if not text.strip() or self.filler_only(text):
+            return "empty_or_filler"
+        context = self.consent_context()
+        name = ("get_investigations" if context["explanation_offer"] else
+                "confirm_observation" if context["log_offer"] else "speak")
+        decision, reason = route_guard(name, {"explain": True}, text,
+            suggestions=bool(self.suggestions), **context)
+        return reason if decision == "ignore" else None
+
     def remember_spoken(self, key, text):
         if not text.strip():
             return
@@ -1086,10 +1108,21 @@ class Session:
             return False
         now = time.monotonic()
         recent = []
+        # Observed clipped/misheard copies of *our cached cues*, not a global
+        # phrase blacklist. Single-word commands and arbitrary user questions
+        # never match. Require speaker mode and matching playback or a 2s tail.
+        cue_echoes = {"camera-taking": ("taking", "photo"),
+                      "photo-ready": ("photo", "ready"),
+                      "received": ("i", "hurt", "you")}
         for key, line, at in self.spoken:
             related = [c for c in self.clients if c.playback_id == key[0]]
             end = max([at] + [c.playback_end for c in related])
-            if any(c.playback_active or c.playback_pending for c in related) or now - end <= 10:
+            playing = any(c.playback_active or c.playback_pending for c in related)
+            kind = key[2] if len(key) > 2 and key[1] == "feedback" else None
+            if (self.echo_guard and (playing or now - end <= 2)
+                    and tuple(words) == cue_echoes.get(kind)):
+                return True
+            if playing or now - end <= 10:
                 recent.append(line)
         # Echo = a long CONTIGUOUS run of the assistant's own words. Bag-of-words overlap
         # misfired on answers like "Yes, add them" to "...add them?" or "Cardinal." (10/23).
@@ -1594,13 +1627,8 @@ class Session:
                 raise ValueError("describe requires text")
             if name == "recent_sounds" and not np.isfinite(float(args.get("seconds", 15))):
                 raise ValueError("seconds must be finite")
-            offer = bool(self.investigation_offer_ids and re.search(
-                r"(?:would you like me to explain|which would you like me to explain|要我讲一下结果吗|你想先听哪一项)",
-                self.last_assistant_text, re.I))
             decision, reason = route_guard(name, args, self.turn_question,
-                suggestions=bool(self.suggestions),
-                log_offer=bool(re.search(r"(?:add|log|record|加入|记录).*(?:\?|？)$", self.last_assistant_text, re.I)),
-                explanation_offer=offer)
+                suggestions=bool(self.suggestions), **self.consent_context())
             if ((name in WRITE_TOOLS or name == "discard_observation") and self.turn_context is not None
                     and self.turn_context != self.input_context()):
                 decision, reason = "clarify", "stale_write_context"
@@ -1825,6 +1853,15 @@ class Session:
             self.user_speaking = False
             if self.transcript_is_echo(text):
                 self.log("echo_dropped", text=text)
+                if event.get("item_id"):
+                    await self.delete_items([event["item_id"]])
+                await self.flush_pending()
+                return
+            ignored = self.ignored_input_reason(text)
+            if ignored:
+                self.log("input_ignored", text=text, reason=ignored)
+                if event.get("item_id"):
+                    await self.delete_items([event["item_id"]])
                 await self.flush_pending()
                 return
             if text.strip() and self.assistant_audio_pending():
@@ -2377,6 +2414,11 @@ class Session:
                 await self.flush_audio()
             await self.state()
             await self.flush_pending()
+        elif ty == "output_mute":
+            if not isinstance(event.get("muted"), bool):
+                raise ValueError("muted must be boolean")
+            # Diagnostic only: do not alter microphone/BirdNET or playback gates.
+            self.log("output_mute", muted=event["muted"], role=client.role if client else None)
         elif ty == "tap":
             self.input_revision += 1
             self.tap_at = time.monotonic()
