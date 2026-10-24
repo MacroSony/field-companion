@@ -110,3 +110,34 @@ class Playback(unittest.IsolatedAsyncioTestCase):
         await session.finish_route(self.route)
         session.generate.assert_not_awaited()
         session.phone_audio.assert_not_awaited()
+
+class Transport(unittest.IsolatedAsyncioTestCase):
+    async def test_even_pcm_framing_and_pool_reuse(self):
+        from template_answers import SpeechStream
+        from unittest.mock import MagicMock
+        stream = SpeechStream()
+        response = MagicMock()
+        response.__enter__.return_value = response
+        try:
+            with patch.object(stream.http, 'post', return_value=response) as post:
+                for _ in range(2):
+                    response.raw.read1.side_effect = [b'a', b'bcd', b'']
+                    chunks = [c async for c in stream.chunks('hello', 'offline-test-key')]
+                    self.assertEqual(b''.join(chunks), b'abcd')
+                    self.assertTrue(all(len(c) % 2 == 0 for c in chunks))
+                self.assertEqual(post.call_count, 2)
+                self.assertEqual(post.call_args.kwargs['timeout'], (3, 3))
+                self.assertTrue(post.call_args.kwargs['json']['stream'])
+        finally:
+            stream.close()
+
+    async def test_http_error_reaches_fallback(self):
+        from template_answers import SpeechStream
+        stream = SpeechStream()
+        try:
+            with patch.object(stream.http, 'post', side_effect=OSError('offline')):
+                with self.assertRaises(OSError):
+                    async for _ in stream.chunks('hello', 'offline-test-key'):
+                        self.fail('HTTP errors must never produce PCM')
+        finally:
+            stream.close()

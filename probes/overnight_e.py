@@ -17,7 +17,7 @@ def serve():
     import logging
     import server as s
     import uvicorn
-    init, log, audio, tool = s.Session.__init__, s.Session.log, s.Session.phone_audio, s.Session.tool
+    init, log, audio, tool, inject = s.Session.__init__, s.Session.log, s.Session.phone_audio, s.Session.tool, s.Session.inject
     def seeded(self, *args):
         init(self, *args)
         for i, (sci, en, count) in enumerate([('Cardinalis cardinalis', 'Northern Cardinal', 7), ('Turdus migratorius', 'American Robin', 8)]):
@@ -37,7 +37,15 @@ def serve():
             for en in ['Northern Cardinal', 'American Robin']:
                 self.history.append((time.monotonic(), {'en': en}))
         return await tool(self, name, args)
+    async def clean_inject(self, text):
+        # Keep the live connection/HTTP pool but remove failed-turn pollution.
+        # This is a controlled empty-context measurement, not production history.
+        for item_id in list(self.conversation_ids):
+            await self.rt_send({'type': 'conversation.item.delete', 'item_id': item_id})
+        self.conversation_ids.clear()
+        await inject(self, text)
     s.Session.__init__, s.Session.log, s.Session.phone_audio, s.Session.tool = seeded, logged, sent, fixture_tool
+    s.Session.inject = clean_inject
     logging.basicConfig(level=logging.INFO, format='%(message)s')
     logging.getLogger('websockets').setLevel(logging.WARNING)
     uvicorn.run(s.app, host='127.0.0.1', port=8797, log_level='warning')
@@ -59,6 +67,7 @@ async def bench():
                         await asyncio.sleep(.1)
                 else:
                     raise RuntimeError('server did not start')
+                await asyncio.sleep(.1)
                 await ws.close()
                 async with websockets.connect('ws://127.0.0.1:8797/ws?session=experiment-e', max_size=None) as ws:
                     while True:
@@ -67,7 +76,7 @@ async def bench():
                             break
                     for rep in range(8):
                         for case, question in [('sounds', 'What did you hear?'), ('checklist', 'How many species do we have?')]:
-                            for attempt in range(3):
+                            for attempt in range(5):
                                 t = time.perf_counter()
                                 await ws.send(json.dumps({'type': 'text', 'text': question}))
                                 first = None

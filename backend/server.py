@@ -986,6 +986,8 @@ class Session:
                     if waiter is not None and not waiter.done():
                         waiter.set_exception(ConnectionError("Realtime disconnected"))
                 self.rt = None
+                if self.tts_active:
+                    self.audio_allowed = False
                 self.connected = False
                 self.user_speaking = self.awaiting_transcript = False
                 self.active = False
