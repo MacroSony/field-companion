@@ -45,7 +45,6 @@ async def main():
         await call('Page.enable')
         await call('Runtime.enable')
         await call('Network.enable')
-        await call('Browser.setDownloadBehavior', behavior='deny')
         await call('Emulation.setDeviceMetricsOverride', width=390, height=844, deviceScaleFactor=1, mobile=True)
         await call('Emulation.setTouchEmulationEnabled', enabled=True)
         await call('Emulation.setGeolocationOverride', latitude=43.66, longitude=-79.39, accuracy=10)
@@ -71,7 +70,20 @@ async def main():
         ''')
         await call('Page.navigate', url='http://localhost:8877/?session=phone-test')
         await asyncio.sleep(1)
-        events.clear()
+        assert await evaluate("""document.readyState === 'complete' ? true : new Promise(resolve => {
+          window.addEventListener('load', () => resolve(true), {once:true});
+          setTimeout(() => resolve(false), 10000);
+        })"""), 'Page did not finish loading'
+        # A cold Chromium worker can start after the audio/UI are ready.
+        worker_ready = await evaluate("""navigator.serviceWorker.controller ? true : new Promise(resolve => {
+          navigator.serviceWorker.addEventListener('controllerchange', () => resolve(true), {once:true});
+          setTimeout(() => resolve(false), 15000);
+        })""")
+        assert worker_ready, await evaluate("""(async () => ({secure:isSecureContext,url:location.href,
+          workers:(await navigator.serviceWorker.getRegistrations()).map(r=>({scope:r.scope,active:r.active?.state,installing:r.installing?.state,waiting:r.waiting?.state})),
+          caches:await caches.keys()}))()""")
+        # Apply download interception after the app shell has initialized.
+        await call('Browser.setDownloadBehavior', behavior='deny')
         await evaluate("document.getElementById('start').click()")
         await asyncio.sleep(3)
         results = await evaluate('''({

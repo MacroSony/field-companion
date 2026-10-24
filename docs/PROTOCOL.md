@@ -13,7 +13,7 @@ One WebSocket per phone: `wss://<host>/ws`. The backend also serves the web app 
 ## Phone → backend
 - **Binary frames**: microphone audio, PCM16 little-endian, mono, **48 kHz**, about 20–40 ms per frame. Browser mic processing is off (echoCancellation/noiseSuppression/autoGainControl = false).
 - **JSON text frames**:
-  - `{"type":"hello","lat":43.66,"lng":-79.39,"lang":"zh","earphones":false}`: sent first. GPS, language and boolean `earphones` are optional; each new mic defaults to speaker mode.
+  - `{"type":"hello","lat":43.66,"lng":-79.39,"lang":"zh","earphones":false}`: sent first. GPS, language and boolean `earphones` are optional; each new mic defaults to speaker mode. The mic may repeat hello with its current language/output mode when an initially pending GPS fix arrives; subsequent observations use the updated location.
   - `{"type":"audio_mode","earphones":true|false}`: mic only; change output mode. `false` = speaker / half-duplex, `true` = earphones / voice interruption (unless an audio-enabled display forces guarding). The UI persists the selection locally and sends it on connect and change.
   - `{"type":"playback","active":true|false}`: audio-output client reports when scheduled assistant audio actually starts and when its last queued source finishes, including after flush. End times are measured at backend receipt, not supplied by the client. Audio-enabled displays may report too. Reports never shorten the backend estimate.
   - `{"type":"mic","on":true|false}`: mic paused or resumed.
@@ -44,12 +44,18 @@ One WebSocket per phone: `wss://<host>/ws`. The backend also serves the web app 
    "detections":[{"id":"d7","kind":"sound"|"image"|"description","t":"<iso>","thumb":"/api/frame/d7.jpg"?,"text":"..."?,"candidates":[{"sci":"..","en":"..","p":0.62}]}],
    "fused":[{"sci":"..","en":"..","photo":"https://..","p":0.71}],"uncertain":true|false,"hint":"Check the bill length"?}`
   Sent on every change. `checklist` messages continue as before; they are derived from confirmed observations.
-- `{"type":"capture","obs":"ob3","n":3,"hint":"Zoom on the head","zoom":2.0?}`: the phone should switch to Look mode (if not already), grab n frames over ~1 s, and POST them.
+- `{"type":"capture","obs":"ob3","n":3,"hint":"Zoom on the head","zoom":2.0?}`: the phone should switch to Look mode (if not already) and grab n frames over ~1 s. The current UI caps n at 3, selects the sharpest within the chosen region and POSTs one JPEG. Zoom is user-controlled digital zoom in this version; the optional server zoom field is not applied.
 
 ### Phone → backend
 - `POST /api/frame?session=<id>&obs=<id>[&x=..&y=..&w=..&h=..]`, body = JPEG (≤ 1920 px long side). Optional crop is normalized 0..1 (from a tap on the bird). One request per frame. Response: `{"detection": {...}}`. The backend then broadcasts the updated `observation`.
 - `{"type":"look"}`: the user opened Look mode / pressed the shutter without speaking. Equivalent to "what's that?" (opens a new focus if none is open).
 - `{"type":"observation_action","id":"ob3","action":"confirm"|"discard"|"focus","count":2?}`: UI buttons.
+
+The phone uploads only on a requested capture. A frame's crop is normalized to the
+uploaded, digitally zoomed JPEG. Closing/backgrounding the camera, ending a session,
+losing the socket or changing/closing the focus cancels outstanding client work.
+After replacement by another mic, the old phone stops rather than auto-reconnecting
+and evicting the replacement. See [CAMERA.md](CAMERA.md) for UI behavior and tests.
 
 ## Batched BirdNET suggestions
 - `{"type":"suggestions","items":[{"sci":"Cardinalis cardinalis","en":"Northern Cardinal","photo":"https://…","conf":0.87,"t":"<iso>"}]}`:

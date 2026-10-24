@@ -1,6 +1,15 @@
 # Known issues from live testing (Oct 23, 21:30–23:15)
 
-Status: **recorded, not fixed**. Code under test = branch `feat/batched-suggestions` (PR #2), served live on :8780. Condensed event log of the last session: `/data/build/tmp/review/live-test-2258-2315.log` (not in repo). Setup: Android Chrome + laptop playing `/testaudio/` clips; speaker mode 22:58–23:08, earphones mode 23:09–23:15.
+Status: **recorded, not fixed unless noted below**. Code under test = branch `feat/batched-suggestions` (PR #2), served live on :8780. Condensed event log of the last session: `/data/build/tmp/review/live-test-2258-2315.log` (not in repo). Setup: Android Chrome + laptop playing `/testaudio/` clips; speaker mode 22:58–23:08, earphones mode 23:09–23:15.
+
+## Follow-up on feat/look-ui
+
+- E7: late initial GPS is sent to the backend; failed microphone changes retain
+  the old input; a replaced phone ends its session instead of reconnecting forever.
+  Covered by the isolated camera browser test; physical device validation remains.
+- E9/E10: this branch builds on feat/expert's merged Observation/suggestion model
+  and implements the existing Look/observation frontend contract. It does not
+  resolve unrelated router/BirdNET eligibility or Realtime lifecycle issues below.
 
 ## A. Router / intent
 | # | Observed (time) | Evidence | Likely cause |

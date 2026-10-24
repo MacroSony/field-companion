@@ -30,6 +30,8 @@
   const playback = new Set(), tones = new Set();
   const bars = document.querySelector('.soundscape');
   const nativeLittleEndian = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
+  const camera = new FieldCamera({displayMode, session, send,
+    connected: () => state.running && state.connected, backendURL: websocketURL});
 
   function notice(message) {
     $('notice').textContent = message;
@@ -44,6 +46,7 @@
     return true;
   }
   function updateControls() {
+    camera.updateConnection();
     if ($('audio-mode')) {
       $('audio-mode').textContent = earphones ? '🎧 Earphones' : '🔊 Speaker';
       $('audio-mode').setAttribute('aria-pressed', String(earphones));
@@ -128,27 +131,30 @@
     if (!state.running || !capture || micSwitching) return;
     const revision = ++micRevision, activeContext = context, activeCapture = capture;
     micSwitching = true;
-    micSource?.disconnect(); micSource = null;
-    stream?.getTracks().forEach(track => track.stop()); stream = null;
-    if (state.connected) send({type: 'mic', on: false});
     captureSettings(); updateControls();
+    let replacement, replacementSource;
     try {
       const result = await requestMic(deviceId);
+      replacement = result.input;
       if (revision !== micRevision || !state.running || context !== activeContext) {
         result.input.getTracks().forEach(track => track.stop()); return;
       }
-      stream = result.input;
+      replacementSource = activeContext.createMediaStreamSource(replacement);
+      replacementSource.connect(activeCapture);
+      micSource?.disconnect();
+      stream?.getTracks().forEach(track => track.stop());
+      stream = replacement; micSource = replacementSource;
+      replacement = replacementSource = null;
       stream.getAudioTracks().forEach(track => { track.enabled = !state.paused; });
-      micSource = activeContext.createMediaStreamSource(stream);
-      micSource.connect(activeCapture);
       resampler = activeContext.sampleRate === 48000 ? null : new LinearResampler(activeContext.sampleRate);
       saveMic(result.deviceId, result.deviceId ? stream.getAudioTracks()[0].label : 'Default');
       if (state.connected) send({type: 'mic', on: !state.paused});
       notice(result.deviceId !== deviceId ? 'Selected microphone unavailable; using the default.' : 'Microphone changed.');
     } catch (error) {
+      replacementSource?.disconnect();
+      replacement?.getTracks().forEach(track => track.stop());
       if (revision === micRevision) {
-        stream?.getTracks().forEach(track => track.stop()); stream = null;
-        notice(`Microphone: ${error.message}. Choose another input or use text.`);
+        notice(`Microphone: ${error.message}. ${stream ? 'Your previous microphone is still active.' : 'Choose another input or use text.'}`);
       }
     } finally {
       if (revision === micRevision) {
@@ -335,6 +341,9 @@
     if (displayMode) url.searchParams.set('audio', audioEnabled ? '1' : '0');
     return url.href;
   }
+  function helloMessage() {
+    return {type: 'hello', lang: 'en', ...(!displayMode ? {earphones} : {}), ...(state.coords || {})};
+  }
   function connect() {
     if (!state.running) return;
     clearTimeout(reconnectTimer);
@@ -346,7 +355,7 @@
     ws.onopen = () => {
       if (socket !== ws || !state.running) { ws.close(); return; }
       // hello MUST be the first frame; geolocation is optional and never blocks it.
-      ws.send(JSON.stringify({type: 'hello', lang: 'en', ...(!displayMode ? {earphones} : {}), ...(state.coords || {})}));
+      ws.send(JSON.stringify(helloMessage()));
       state.connected = true; state.retry = 0;
       if (!displayMode) {
         send({type: 'audio_mode', earphones});
@@ -362,8 +371,13 @@
       try { handleMessage(JSON.parse(event.data)); } catch (error) { console.warn('Ignored malformed server message', error); }
     };
     ws.onerror = () => { if (socket === ws) notice('Connection unavailable. Retrying automatically.'); };
-    ws.onclose = () => {
+    ws.onclose = async event => {
       if (socket !== ws) return;
+      if (['Replaced by newer microphone', 'New mic joined'].includes(event.reason)) {
+        await stop();
+        notice('Another phone joined this session. Start again to take over, or use a different session link.');
+        return;
+      }
       state.connected = false; state.listening = false; flush(); updateControls();
       if (state.running) scheduleReconnect();
     };
@@ -378,6 +392,8 @@
   }
   function handleMessage(message) {
     switch (message.type) {
+      case 'capture': camera.requestCapture(message); break;
+      case 'observation': camera.observe(message); break;
       case 'flush': flush(); break;
       case 'earcon': earcon(message.kind); break;
       case 'checklist':
@@ -569,6 +585,7 @@
     startHeadsetSession();
     if (navigator.geolocation) navigator.geolocation.getCurrentPosition(position => {
       state.coords = {lat: position.coords.latitude, lng: position.coords.longitude};
+      if (state.connected) send(helloMessage());
       updateMap();
     }, () => {}, {enableHighAccuracy: false, timeout: 6000, maximumAge: 60000});
     try {
@@ -605,6 +622,7 @@
     captureSettings(); requestWakeLock(); updateControls(); connect();
   }
   async function stop() {
+    camera.close();
     state.running = false; state.connected = false; state.listening = false;
     ++micRevision; ++deviceRevision; micSwitching = false;
     stopHeadsetSession();

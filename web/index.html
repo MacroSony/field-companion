@@ -14,6 +14,7 @@
   <link rel="stylesheet" href="vendor/leaflet/leaflet.css">
   <link rel="stylesheet" href="style.css">
   <script src="vendor/leaflet/leaflet.js" defer></script>
+  <script src="camera.js" defer></script>
   <script src="app.js" defer></script>
 </head>
 <body>
@@ -31,7 +32,7 @@
           <label for="mic-device">Microphone</label>
           <select id="mic-device" disabled aria-describedby="capture-settings"><option value="">Default · allow microphone to list devices</option></select>
         </div>
-        <p id="capture-settings" class="capture-settings">Capture settings appear after Start.</p>
+        <details class="audio-details"><summary>Audio details</summary><p id="capture-settings" class="capture-settings">Capture settings appear after Start.</p></details>
         <div class="soundscape" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div>
         <div id="mic-meter" class="level-meter" role="meter" aria-label="Microphone level" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="level-fill"></div></div>
         <div class="panel-foot"><span id="model">Open mic · hands free</span><span id="session-time">00:00</span></div>
@@ -43,6 +44,31 @@
       </section>
 
       <div id="notice" class="notice" role="status" hidden></div>
+
+      <section class="look-section" aria-labelledby="look-heading">
+        <div class="section-label"><h2 id="look-heading">Look closer</h2><button id="camera-toggle" class="look-button" type="button" disabled aria-expanded="false" aria-controls="camera-panel">Open camera</button></div>
+        <p class="look-intro">Start listening, then open the camera or ask “What is that?”</p>
+        <div id="camera-panel" class="camera-panel" hidden>
+          <div id="camera-viewport" class="camera-viewport" role="button" tabindex="0" aria-label="Select the subject in the camera preview">
+            <video id="camera-preview" autoplay muted playsinline></video>
+            <div id="camera-crop" class="camera-crop" hidden><span>Selected area</span></div>
+          </div>
+          <p id="camera-status" class="camera-status" role="status">Opening camera…</p>
+          <div class="camera-options"><label for="camera-zoom">Zoom <output id="camera-zoom-value">1×</output></label><input id="camera-zoom" type="range" min="1" max="4" step="0.1" value="1" aria-label="Camera zoom"><button id="camera-clear-crop" class="look-button" type="button" hidden>Full frame</button></div>
+          <div class="camera-options"><label for="camera-group">Looking for</label><select id="camera-group"><option value="Aves">Birds</option><option value="Plantae">Plants</option><option value="Insecta">Insects</option><option value="Mammalia">Mammals</option><option value="Fungi">Fungi</option><option value="Reptilia">Reptiles</option><option value="Amphibia">Amphibians</option><option value="Arachnida">Spiders</option><option value="Mollusca">Molluscs</option><option value="Actinopterygii">Fish</option></select></div>
+          <div class="camera-actions"><button id="camera-shutter" class="start-button" type="button" disabled>Identify this subject</button><button id="camera-new" class="look-button" type="button" disabled>New subject</button></div>
+          <p class="camera-note">Tap the subject to select an area. Photos upload only when you request identification.</p>
+        </div>
+      </section>
+
+      <section id="active-observation" class="active-observation" aria-labelledby="observation-heading" hidden>
+        <div class="section-label"><h2 id="observation-heading">Current observation</h2><span id="observation-status" class="observation-status"></span></div>
+        <p id="observation-hint" class="observation-hint" hidden></p>
+        <ol id="observation-candidates" class="observation-candidates" aria-label="Candidate species"></ol>
+        <p id="observation-empty" class="camera-note">Waiting for an image or description.</p>
+        <div id="observation-evidence" class="observation-evidence" aria-label="Observation evidence"></div>
+        <div class="observation-actions"><label for="observation-count">Count <input id="observation-count" type="number" min="1" step="1" value="1" inputmode="numeric"></label><button id="observation-confirm" class="look-button" type="button" disabled>Add to checklist</button><button id="observation-again" class="look-button" type="button" disabled>Look again</button><button id="observation-discard" class="look-button" type="button" disabled>Discard</button></div>
+      </section>
 
       <section class="heard-section" aria-labelledby="heard-heading">
         <div class="section-label"><h2 id="heard-heading">Heard nearby</h2><span class="live-label"><i></i> LIVE</span></div>

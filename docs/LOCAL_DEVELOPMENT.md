@@ -59,6 +59,20 @@ Open <http://localhost:8791/>. The same process serves static assets and `/ws`.
 Localhost supports microphone access; a phone accessing another computer needs
 HTTPS. The server's session state is in memory.
 
+## Camera development
+
+Open **Look closer** after starting the session. The camera has separate permission
+and leaves microphone input running when it is closed. Real identification also
+requires the BioCLIP service; see [CAMERA.md](CAMERA.md) for setup and limitations.
+
+For credential-free browser integration, start
+`.\.venv\Scripts\python.exe -X utf8 -B web/camera-test.py --serve` (port 8878),
+then an isolated Chromium with the fake-media flags below and CDP port 9224.
+Run `.\.venv\Scripts\python.exe -X utf8 -B web/camera-test.py` to validate the
+real frame/observation routes with a fixture classifier. This does not make
+Higgs, OpenAI, BirdNET or iNaturalist requests. Screenshots/results go to ignored
+`out/camera-checks/`. Start each run with a fresh browser profile.
+
 ## Existing tests
 
 Offline backend regressions do not need API credentials:
@@ -76,7 +90,7 @@ and fake media devices. For example, in a second PowerShell terminal:
 
 ```powershell
 New-Item -ItemType Directory -Force out\local-checks | Out-Null
-$profileDirectory = Join-Path (Get-Location).Path ('out\local-checks\chrome-profile-' + [guid]::NewGuid().ToString('N'))
+$profileDirectory = Join-Path (Get-Location).Path ('out\c-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
 $chromeArguments = @(
     '--headless=new',
     '--use-fake-device-for-media-stream',
@@ -108,6 +122,8 @@ try {
 ```
 
 Start with a fresh mock process and browser profile for each full browser run.
+Keep the profile path short on Windows: nested Service Worker cache files can
+exceed filesystem path limits and prevent the offline shell from installing.
 The unmodified test copy puts its screenshots and JSON results in ignored
 `out/local-checks/`, preserving the committed reference screenshots in `web/`.
 

@@ -58,6 +58,19 @@ Screenshots: `screenshot.png` (phone) and `screenshot-display.png` (1280×720 pr
 
 To rerun: start a **fresh** mock on 8877 and Chrome with `--headless=new --no-sandbox --use-fake-device-for-media-stream --use-fake-ui-for-media-stream --remote-debugging-port=9223`, then run `/data/build/birding-demo/.venv/bin/python web/self-test.py`. The test denies real downloads and examines CSV Blobs directly. Its sessions should be fresh for deterministic initial counts.
 
+## Camera and observation follow-up
+
+The phone now has **Look closer**: separate camera permission, rear-facing preview,
+1–4× digital zoom, tap-to-select crop, three-frame sharpness selection and JPEG
+upload. It renders the current Observation, top-three candidates, recent evidence,
+expert hints, Look again, New subject, confirmation/count and discard. The display
+mirrors the observation without requesting media. See [CAMERA.md](../docs/CAMERA.md)
+for the protocol, real vision-service requirement and isolated browser test.
+
+Late GPS is sent to the backend through a repeated hello. Failed microphone changes
+retain the previous stream, and a replaced phone stops instead of evicting the new
+mic through reconnect. Capture diagnostics are available under **Audio details**.
+
 ## Known gaps
 
-No physical Android/iOS or live-model/backend verification in this pass. Mobile backgrounding, device audio routes, ignored capture constraints, and autoplay after interruptions still need hardware testing; keep the app foregrounded and use wired earphones. GPS does not block hello, and late coordinates are used locally rather than retroactively changing the protocol hello. Map tiles and photos require internet; imagery may fail independently of the session. Captions show the latest utterance for each speaker, not an archived conversation. Long checklists/timelines/captions scroll within display panels. No camera upload, offline checklist persistence, full survey-effort collection, or eBird taxonomy validation.
+Physical Android/iOS camera and the real BioCLIP → GPT → Higgs loop still need hardware testing. Mobile backgrounding, device audio routes, ignored capture constraints, and autoplay after interruptions also need hardware checks; keep the app foregrounded and use wired earphones. Map tiles and photos require internet; imagery may fail independently of the session. Captions show the latest utterance for each speaker, not an archived conversation. Long checklists/timelines/captions scroll within display panels. Offline checklist persistence, full survey-effort collection and eBird taxonomy validation remain open.
