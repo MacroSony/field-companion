@@ -9,7 +9,7 @@ CHECKLIST = []
 _nearby_cache = {}
 
 def inat(path, **p):
-    r = requests.get("https://api.inaturalist.org/v1/" + path, params=p, timeout=20, headers={"User-Agent": "mika-hackathon-probe"})
+    r = requests.get("https://api.inaturalist.org/v1/" + path, params=p, timeout=20, headers={"User-Agent": "field-companion-hackathon-probe"})
     r.raise_for_status(); return r.json()
 
 def nearby_species(group="Aves", limit=60):
