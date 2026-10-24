@@ -95,6 +95,17 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
         for text in ['Okay.', 'yes', 'yeah', 'sure', 'Ah, add it', '']:
             self.assertFalse(self.c.filler_only(text), text)
 
+    async def test_audit_args_compact_bounded_and_redacted(self):
+        self.assertEqual(self.c.audit_args('{"count": 2, "all": true}'), '{"count":2,"all":true}')
+        self.assertEqual(len(self.c.audit_args(json.dumps({'notes': 'x' * 300}))), 200)
+        self.assertNotIn('private', self.c.audit_args('{"api_key":"private","nested":{"token":"private"}}'))
+        self.assertEqual(self.c.audit_args('invalid private'), '[invalid JSON]')
+        with patch.object(self.c, 'log') as log:
+            await self.c.finish_route({'status': 'completed', 'output': [
+                {'type': 'function_call', 'name': 'ignore', 'call_id': 'c', 'arguments': '{"count":2}'}]})
+        self.assertEqual(log.call_args_list[0].kwargs['arguments'], ['{"count":2}'])
+        self.assertEqual(log.call_args_list[-1].kwargs['arguments'], '{"count":2}')
+
     def test_priority_prompt_is_route_only(self):
         self.assertTrue(s.ROUTING.startswith('HIGHEST-PRIORITY ROUTING RULE:'))
         self.assertNotIn('HIGHEST-PRIORITY', s.ANSWER)

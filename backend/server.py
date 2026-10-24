@@ -879,11 +879,28 @@ class Session:
                 if self.pending:
                     self.work_ready.set()
 
+    @staticmethod
+    def audit_args(arguments):
+        def clean(value):
+            if isinstance(value, dict):
+                return {k: ("[redacted]" if re.search(r"key|token|secret|password|authorization", k, re.I)
+                            else clean(v)) for k, v in value.items()}
+            if isinstance(value, list):
+                return [clean(v) for v in value]
+            if isinstance(value, str):
+                return re.sub(r"(?i)bearer\s+\S+|\bsk-[\w-]+", "[redacted]", value)
+            return value
+        try:
+            return json.dumps(clean(json.loads(arguments or "{}")), ensure_ascii=False, separators=(",", ":"))[:200]
+        except (ValueError, TypeError):
+            return "[invalid JSON]"
+
     async def finish_route(self, response):
         if response.get("status") != "completed":
             return
         calls = [i for i in response.get("output", []) if i.get("type") == "function_call"]
-        self.log("route_done", tools=[c["name"] for c in calls])
+        self.log("route_done", tools=[c["name"] for c in calls],
+                 arguments=[self.audit_args(c.get("arguments")) for c in calls])
         if len(calls) != 1:
             await self.error("Routing did not select one action; please try again.")
             return
@@ -910,7 +927,7 @@ class Session:
         await self.rt_send({"type": "conversation.item.create", "item": {
             "type": "function_call_output", "call_id": call["call_id"],
             "output": json.dumps(result, ensure_ascii=False)}})
-        self.log("tool", name=name, ok=result.get("ok", True))
+        self.log("tool", name=name, arguments=self.audit_args(call.get("arguments")), ok=result.get("ok", True))
         if result.get("suppress_answer"):
             return
         if name == "ask_expert" and result.get("context") and not self.expert_result_current(result):
