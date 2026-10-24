@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Optional Chromium CDP smoke test; run with mock on 8767 and CDP on 9223.
+"""Optional Chromium CDP smoke test; run with mock on 8877 and CDP on 9223.
 Uses only stdlib + websockets. Writes screenshot.png and self-test-results.json.
 """
 import asyncio
@@ -49,9 +49,11 @@ async def main():
         await call('Emulation.setDeviceMetricsOverride', width=390, height=844, deviceScaleFactor=1, mobile=True)
         await call('Emulation.setTouchEmulationEnabled', enabled=True)
         await call('Emulation.setGeolocationOverride', latitude=43.66, longitude=-79.39, accuracy=10)
-        await call('Browser.grantPermissions', permissions=['audioCapture', 'geolocation'], origin='http://localhost:8767')
+        await call('Browser.grantPermissions', permissions=['audioCapture', 'geolocation'], origin='http://localhost:8877')
         await call('Page.addScriptToEvaluateOnNewDocument', source='''
-            window.__stops = 0; window.__contexts = []; window.__sockets = [];
+            window.__stops = 0; window.__contexts = []; window.__sockets = []; window.__micRequests = 0;
+            const gum = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+            navigator.mediaDevices.getUserMedia = (...args) => { window.__micRequests++; return gum(...args); };
             const WS = window.WebSocket;
             window.WebSocket = class extends WS { constructor(...args) { super(...args); window.__sockets.push(this); } };
             const AC = window.AudioContext;
@@ -62,7 +64,7 @@ async def main():
             const originalURL = URL.createObjectURL.bind(URL);
             URL.createObjectURL = blob => { window.__csvBlob = blob; return originalURL(blob); };
         ''')
-        await call('Page.navigate', url='http://localhost:8767/')
+        await call('Page.navigate', url='http://localhost:8877/?session=phone-test')
         await asyncio.sleep(1)
         events.clear()
         await evaluate("document.getElementById('start').click()")
@@ -81,7 +83,14 @@ async def main():
         assert results['sampleRate'] == 48000 and results['flushStoppedSources'] > 0 and not results['overflow'], results
         shot = await call('Page.captureScreenshot', format='png', captureBeyondViewport=False)
         (ROOT / 'screenshot.png').write_bytes(base64.b64decode(shot['data']))
-        await evaluate("window.__sockets[0].close()")
+        results['phoneSessionURL'] = await evaluate("window.__sockets[0].url")
+        assert 'role=mic' in results['phoneSessionURL'] and 'session=phone-test' in results['phoneSessionURL']
+        await evaluate("document.getElementById('map-card').open = true")
+        await asyncio.sleep(.4)
+        results['phoneMapMarkers'] = await evaluate("document.querySelectorAll('.leaflet-marker-icon').length")
+        results['youAreHereDot'] = await evaluate("!!document.querySelector('.leaflet-interactive')")
+        assert results['phoneMapMarkers'] == 4 and results['youAreHereDot']
+        await evaluate("document.getElementById('map-card').open = false; window.__sockets[0].close()")
         await asyncio.sleep(2.5)
         results['autoReconnect'] = await evaluate("window.__sockets.length >= 2 && document.getElementById('connection').classList.contains('online')")
         assert results['autoReconnect'], results
@@ -91,7 +100,7 @@ async def main():
         await evaluate("document.querySelector('.delete-button').click()")
         await asyncio.sleep(.2)
         assert await evaluate("document.querySelectorAll('.observation').length") == 3
-        await evaluate("document.getElementById('text-input').value='再加一只绿头鸭'; document.getElementById('text-form').requestSubmit()")
+        await evaluate("document.getElementById('text-input').value='One more mallard'; document.getElementById('text-form').requestSubmit()")
         await asyncio.sleep(.2)
         assert await evaluate("document.querySelectorAll('.observation').length") == 4
         await evaluate("document.getElementById('quiet').click(); document.getElementById('mic').click()")
@@ -125,16 +134,85 @@ async def main():
         results['microphoneBinaryFrames'] = sum(frame['opcode'] == 2 for frame in sent)
         results['microphoneFrameBytes'] = sorted({len(base64.b64decode(frame['payloadData'])) for frame in sent if frame['opcode'] == 2})
         assert results['microphoneFrameBytes'] == [1920]
-        assert results['firstSentFrame']['type'] == 'hello' and results['microphoneBinaryFrames'] > 0
+        assert results['firstSentFrame']['type'] == 'hello' and results['firstSentFrame']['lang'] == 'en' and results['microphoneBinaryFrames'] > 0
         results['runtimeExceptions'] = [e['params'] for e in events if e.get('method') == 'Runtime.exceptionThrown']
         assert not results['runtimeExceptions'], results['runtimeExceptions']
         # Offline-ish: only the cached app shell is expected to work without a server.
         await call('Network.emulateNetworkConditions', offline=True, latency=0, downloadThroughput=-1, uploadThroughput=-1)
         await call('Page.reload')
         await asyncio.sleep(1)
-        results['offlineShell'] = await evaluate("!!document.getElementById('start') && document.title.includes('Field companion')")
+        results['offlineShell'] = await evaluate("!!document.getElementById('start') && document.title.includes('Field Companion')")
         await call('Network.emulateNetworkConditions', offline=False, latency=0, downloadThroughput=-1, uploadThroughput=-1)
         assert results['offlineShell'], results
+        # Display never opens a microphone, and silent display never creates an audio context.
+        await call('Emulation.setDeviceMetricsOverride', width=1280, height=720, deviceScaleFactor=1, mobile=False)
+        events.clear()
+        await call('Page.navigate', url='http://localhost:8877/?display=1&session=display-test')
+        await asyncio.sleep(3)
+        results['display'] = await evaluate("""({
+          items: document.querySelectorAll('.observation').length,
+          heard: document.querySelectorAll('.heard-card').length,
+          markers: document.querySelectorAll('.leaflet-marker-icon').length,
+          micRequests: window.__micRequests,
+          audioContexts: window.__contexts.length,
+          socketURL: window.__sockets[0].url,
+          phoneHint: document.getElementById('phone-hint').innerText,
+          photos: document.querySelectorAll('.observation img').length,
+          loadedPhotos: [...document.querySelectorAll('.observation img')].filter(i => i.complete && i.naturalWidth > 0).length,
+          userCaption: document.getElementById('user-caption').innerText,
+          assistantCaption: document.getElementById('assistant-caption').innerText,
+          overflow: document.documentElement.scrollWidth > innerWidth || document.documentElement.scrollHeight > innerHeight,
+          checklistRight: document.querySelector('.checklist-section').getBoundingClientRect().right,
+          mapLeft: document.getElementById('map-card').getBoundingClientRect().left,
+          mapHeight: document.getElementById('map').getBoundingClientRect().height
+        })""")
+        d = results['display']
+        assert d['items'] == 4 and d['heard'] == 2 and d['markers'] == 4 and not d['overflow'], d
+        assert d['micRequests'] == 0 and d['audioContexts'] == 0 and 'role=display' in d['socketURL'] and 'audio=0' in d['socketURL'], d
+        assert d['checklistRight'] < d['mapLeft'] and d['mapHeight'] > 100, d
+        shot = await call('Page.captureScreenshot', format='png', captureBeyondViewport=False)
+        (ROOT / 'screenshot-display.png').write_bytes(base64.b64decode(shot['data']))
+        # Shared session edits reach a second display socket and highlight the updated card.
+        await evaluate("""window.__peer = new WebSocket('ws://localhost:8877/ws?role=display&session=display-test');
+          window.__peer.onopen = () => { window.__peer.send(JSON.stringify({type:'hello',lang:'en'})); setTimeout(() => window.__peer.send(JSON.stringify({type:'edit',id:'o1',count:9})), 100); };""")
+        await asyncio.sleep(.4)
+        results['display']['sharedUpdate'] = await evaluate("document.querySelector('.counter output').value === '9' && document.querySelector('.observation').classList.contains('updated')")
+        assert results['display']['sharedUpdate']
+        await evaluate('window.__peer.close()')
+        await evaluate("document.querySelector('.leaflet-marker-icon').click()")
+        results['display']['mapPopup'] = await evaluate("document.querySelector('.leaflet-popup-content').innerText.includes('Mallard')")
+        assert results['display']['mapPopup']
+        await evaluate("""window.__sockets[0].dispatchEvent(new MessageEvent('message', {data: JSON.stringify({type:'checklist',items:[
+          {id:'fallback1',en:'Missing photo',sci:'Test species',count:1,source:'voice'},
+          {id:'fallback2',en:'Failed photo',sci:'Test species two',count:1,source:'photo',photo:'/missing-photo.png'}
+        ]})}));
+        window.__sockets[0].dispatchEvent(new MessageEvent('message', {data: JSON.stringify({type:'candidates',items:[{en:'Candidate without photo',sci:'Test species',source:'photo'}]})}));""")
+        await asyncio.sleep(.4)
+        results['photoFallbacks'] = await evaluate("({checklist: document.querySelectorAll('.observation .source-icon').length, candidates: document.querySelectorAll('.candidate-card .source-icon').length})")
+        assert results['photoFallbacks'] == {'checklist': 2, 'candidates': 1}, results['photoFallbacks']
+        await call('Emulation.setDeviceMetricsOverride', width=1920, height=1080, deviceScaleFactor=1, mobile=False)
+        await asyncio.sleep(.3)
+        results['display1080'] = await evaluate("({overflow: document.documentElement.scrollWidth > innerWidth || document.documentElement.scrollHeight > innerHeight, captionFont: getComputedStyle(document.getElementById('user-caption')).fontSize})")
+        assert not results['display1080']['overflow']
+        await call('Page.navigate', url='http://localhost:8877/?display=1&session=audio-test&audio=1')
+        await asyncio.sleep(.2)
+        assert await evaluate("!document.getElementById('audio-overlay').hidden && window.__micRequests === 0 && window.__contexts.length === 0")
+        await evaluate("document.getElementById('enable-audio').click()")
+        await asyncio.sleep(.2)
+        # Explicitly trigger a mock response after audio is unlocked; network/image
+        # timing must not decide whether the initial demo tone precedes the click.
+        await evaluate("""window.__audioPeer = new WebSocket('ws://localhost:8877/ws?role=mic&session=audio-test');
+          window.__audioPeer.onopen = () => { window.__audioPeer.send(JSON.stringify({type:'hello',lang:'en'})); window.__audioPeer.send(JSON.stringify({type:'tap'})); };""")
+        await asyncio.sleep(1)
+        await evaluate('window.__audioPeer.close()')
+        results['displayAudio'] = await evaluate("({overlayHidden: document.getElementById('audio-overlay').hidden, micRequests: window.__micRequests, audioState: window.__contexts[0]?.state, flushStoppedSources: window.__stops, socketURL: window.__sockets[0].url})")
+        a = results['displayAudio']
+        assert a['overlayHidden'] and a['micRequests'] == 0 and a['audioState'] == 'running' and a['flushStoppedSources'] > 0 and 'audio=1' in a['socketURL'], a
+        display_sent = [e['params']['response'] for e in events if e.get('method') == 'Network.webSocketFrameSent']
+        assert not any(frame['opcode'] == 2 for frame in display_sent)
+        results['displayMicrophoneBinaryFrames'] = 0
+        results['displayRuntimeExceptions'] = [e['params'] for e in events if e.get('method') == 'Runtime.exceptionThrown']
+        assert not results['displayRuntimeExceptions'], results['displayRuntimeExceptions']
         (ROOT / 'self-test-results.json').write_text(json.dumps(results, ensure_ascii=False, indent=2) + '\n')
         print(json.dumps(results, ensure_ascii=False, indent=2))
         reading.cancel()

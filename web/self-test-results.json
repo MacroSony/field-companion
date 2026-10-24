@@ -1,5 +1,5 @@
 {
-  "connection": "已连接 · Connected",
+  "connection": "Connected",
   "items": 4,
   "heard": 2,
   "candidates": 3,
@@ -7,6 +7,9 @@
   "flushStoppedSources": 13,
   "overflow": false,
   "serviceWorker": true,
+  "phoneSessionURL": "ws://localhost:8877/ws?role=mic&session=phone-test",
+  "phoneMapMarkers": 4,
+  "youAreHereDot": true,
   "autoReconnect": true,
   "micPauseStopsFrames": true,
   "ebirdRows": 3,
@@ -18,14 +21,50 @@
   ],
   "firstSentFrame": {
     "type": "hello",
-    "lang": "zh",
+    "lang": "en",
     "lat": 43.66,
     "lng": -79.39
   },
-  "microphoneBinaryFrames": 279,
+  "microphoneBinaryFrames": 305,
   "microphoneFrameBytes": [
     1920
   ],
   "runtimeExceptions": [],
-  "offlineShell": true
+  "offlineShell": true,
+  "display": {
+    "items": 4,
+    "heard": 2,
+    "markers": 4,
+    "micRequests": 0,
+    "audioContexts": 0,
+    "socketURL": "ws://localhost:8877/ws?role=display&session=display-test&audio=0",
+    "phoneHint": "Phone: localhost:8877/?session=display-test",
+    "photos": 4,
+    "loadedPhotos": 4,
+    "userCaption": "Four mallards by the pond, and two cardinals.",
+    "assistantCaption": "Noted. Keep your eyes on the birds.",
+    "overflow": false,
+    "checklistRight": 717.359375,
+    "mapLeft": 741.359375,
+    "mapHeight": 169.21875,
+    "sharedUpdate": true,
+    "mapPopup": true
+  },
+  "photoFallbacks": {
+    "checklist": 2,
+    "candidates": 1
+  },
+  "display1080": {
+    "overflow": false,
+    "captionFont": "32.64px"
+  },
+  "displayAudio": {
+    "overlayHidden": true,
+    "micRequests": 0,
+    "audioState": "running",
+    "flushStoppedSources": 13,
+    "socketURL": "ws://localhost:8877/ws?role=display&session=audio-test&audio=1"
+  },
+  "displayMicrophoneBinaryFrames": 0,
+  "displayRuntimeExceptions": []
 }

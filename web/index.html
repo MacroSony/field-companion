@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="zh-Hans">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
@@ -7,65 +7,70 @@
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="description" content="A quiet, hands-free companion for your time in the field.">
-  <title>野伴 · Field companion</title>
+  <title>Field Companion</title>
   <link rel="icon" href="icon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="icon.svg">
   <link rel="manifest" href="manifest.json">
+  <link rel="stylesheet" href="vendor/leaflet/leaflet.css">
   <link rel="stylesheet" href="style.css">
+  <script src="vendor/leaflet/leaflet.js" defer></script>
   <script src="app.js" defer></script>
 </head>
 <body>
   <div class="app-shell">
     <header class="topbar">
-      <a class="brand" href="./" aria-label="野伴 Field companion home"><svg viewBox="0 0 32 32" aria-hidden="true"><path d="M5 24c8 0 10-11 20-17-1 10-5 17-13 16M7 25 22 11M9 18l7 1M15 12l4 1"/></svg><span>野伴<small>FIELD COMPANION</small></span></a>
-      <button id="quiet" class="quiet-toggle" type="button" aria-pressed="false" title="Quiet mode: assistant speaks only after a tap"><span aria-hidden="true">☾</span><span>静默<small>Quiet</small></span><i aria-hidden="true"></i></button>
+      <a class="brand" href="./" aria-label="Field Companion home"><svg viewBox="0 0 32 32" aria-hidden="true"><path d="M5 24c8 0 10-11 20-17-1 10-5 17-13 16M7 25 22 11M9 18l7 1M15 12l4 1"/></svg><span>Field Companion<small>Eyes up. Ears open.</small></span></a>
+      <div class="display-meta"><span id="display-status">Connecting</span><a id="phone-hint"></a></div>
+      <button id="quiet" class="quiet-toggle" type="button" aria-pressed="false" title="Quiet mode: assistant speaks only after a tap"><span aria-hidden="true">☾</span><span>Quiet</span><i aria-hidden="true"></i></button>
     </header>
 
     <main>
-      <section class="session-heading">
-        <div><p class="eyebrow">EYES UP. EARS OPEN.</p><h1>把遇见，留下来<span class="title-dot">.</span></h1><p class="subtitle">Stay in the moment. We’ll keep the list.</p></div>
-        <span class="session-mark" aria-hidden="true">✦</span>
-      </section>
-
       <section class="listening-panel" aria-label="Session controls and status">
-        <div class="status-line"><span id="connection" class="connection"><i></i><span>未连接 · Offline</span></span><span id="activity">Ready when you are</span></div>
+        <div class="status-line"><span id="connection" class="connection"><i></i><span>Offline</span></span><span id="activity">Ready when you are</span></div>
         <div class="soundscape" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div>
         <div id="mic-meter" class="level-meter" role="meter" aria-label="Microphone level" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="level-fill"></div></div>
         <div class="panel-foot"><span id="model">Open mic · hands free</span><span id="session-time">00:00</span></div>
-        <button id="start" class="start-button" type="button"><span aria-hidden="true">◉</span> Start · 开始聆听 <span aria-hidden="true">↗</span></button>
-        <p id="start-note" class="start-note">Use earphones · 麦克风需要 HTTPS 或 localhost</p>
-        <button id="stop" class="stop-button" type="button" hidden>结束本次 · End session</button>
+        <button id="start" class="start-button" type="button"><span aria-hidden="true">◉</span> Start listening <span aria-hidden="true">↗</span></button>
+        <p id="start-note" class="start-note">Use earphones · Microphone needs HTTPS or localhost</p>
+        <button id="stop" class="stop-button" type="button" hidden>End session</button>
       </section>
 
       <div id="notice" class="notice" role="status" hidden></div>
 
       <section class="heard-section" aria-labelledby="heard-heading">
-        <div class="section-label"><h2 id="heard-heading">附近听见 <span>HEARD NEARBY</span></h2><span class="live-label"><i></i> LIVE</span></div>
-        <div id="heard" class="heard-strip"><p class="empty-inline">林间的声音，会出现在这里。<small>Bird song detections will appear here.</small></p></div>
+        <div class="section-label"><h2 id="heard-heading">Heard nearby</h2><span class="live-label"><i></i> LIVE</span></div>
+        <div id="heard" class="heard-strip"><p class="empty-inline">Listening for the next discovery.<small>Bird song detections will appear here.</small></p></div>
       </section>
 
       <section class="checklist-section" aria-labelledby="checklist-heading">
-        <div class="section-label"><h2 id="checklist-heading">我的观察 <span>FIELD NOTES</span></h2><span id="totals" class="totals">0 种 · 0 只</span></div>
-        <div id="checklist" class="checklist"><div class="empty-checklist"><span aria-hidden="true">⌁</span><h3>第一声鸟鸣，第一条记录</h3><p>说一句“两只绿头鸭”，其余交给野伴。</p><small>Try “two mallards on the pond.”</small></div></div>
+        <div class="section-label"><h2 id="checklist-heading">Field checklist</h2><span id="totals" class="totals">0 species · 0 individuals</span></div>
+        <div id="checklist" class="checklist"><div class="empty-checklist"><span aria-hidden="true">⌁</span><h3>Your next discovery starts here</h3><p>Try “two mallards on the pond.”</p></div></div>
       </section>
 
-      <section id="candidates-section" class="candidates-section" aria-labelledby="candidates-heading" hidden><div class="section-label"><h2 id="candidates-heading">是它吗？ <span>POSSIBLE MATCHES</span></h2></div><div id="candidates" class="candidate-strip"></div></section>
+      <details id="map-card" class="map-card">
+        <summary>Observation map <span aria-hidden="true">⌄</span></summary>
+        <div id="map" role="region" aria-label="Map of observations"></div>
+        <p id="map-note" class="map-note">Waiting for location data</p>
+      </details>
+
+      <section id="candidates-section" class="candidates-section" aria-labelledby="candidates-heading" hidden><div class="section-label"><h2 id="candidates-heading">Possible matches</h2></div><div id="candidates" class="candidate-strip"></div></section>
 
       <section class="captions-section" aria-label="Live captions">
-        <div class="caption-label"><span aria-hidden="true">❝</span> 对话 <span>LIVE CAPTIONS</span></div>
-        <div class="caption-row"><span class="speaker">你</span><p id="user-caption">说出你看见的，或问问刚才的鸟鸣。</p></div>
-        <div class="caption-row assistant"><span class="speaker">野伴</span><p id="assistant-caption">A little less screen. A little more wild.</p></div>
+        <div class="caption-label"><span aria-hidden="true">❝</span> Live captions</div>
+        <div class="caption-row"><span class="speaker">You</span><p id="user-caption">Say what you see, or ask about a bird song.</p></div>
+        <div class="caption-row assistant"><span class="speaker">Assistant</span><p id="assistant-caption">Ready for your next discovery.</p></div>
       </section>
-      <p class="privacy-note">声音仅在运行时传送 · Audio streams only while running</p>
+      <p class="privacy-note">Audio streams only while running</p>
     </main>
 
     <footer class="bottom-bar">
-      <div class="primary-controls"><button id="tap" class="talk-button" type="button" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10v2a7 7 0 0 0 14 0v-2M12 19v3M8 22h8"/></svg><span>跟野伴说 <small>Tap to talk</small></span><span class="talk-arrow" aria-hidden="true">↗</span></button><button id="mic" class="square-button" type="button" aria-pressed="false" aria-label="Pause microphone" disabled><span id="mic-icon" aria-hidden="true">Ⅱ</span><small id="mic-label">暂停</small></button><button id="export" class="square-button" type="button" aria-haspopup="dialog"><span aria-hidden="true">↥</span><small>导出 CSV</small></button></div>
-      <form id="text-form" class="text-form"><label class="sr-only" for="text-input">Message the companion</label><input id="text-input" name="text" placeholder="也可以打字 · Type a sighting…" maxlength="2000" autocomplete="off"><button id="send" type="submit" aria-label="Send message" disabled>↑</button></form>
+      <div class="primary-controls"><button id="tap" class="talk-button" type="button" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10v2a7 7 0 0 0 14 0v-2M12 19v3M8 22h8"/></svg><span>Tap to talk<small>Ask your companion</small></span><span class="talk-arrow" aria-hidden="true">↗</span></button><button id="mic" class="square-button" type="button" aria-pressed="false" aria-label="Pause microphone" disabled><span id="mic-icon" aria-hidden="true">Ⅱ</span><small id="mic-label">Pause</small></button><button id="export" class="square-button" type="button" aria-haspopup="dialog"><span aria-hidden="true">↥</span><small>Export CSV</small></button></div>
+      <form id="text-form" class="text-form"><label class="sr-only" for="text-input">Message the companion</label><input id="text-input" name="text" placeholder="Type a sighting…" maxlength="2000" autocomplete="off"><button id="send" type="submit" aria-label="Send message" disabled>↑</button></form>
     </footer>
   </div>
 
-  <dialog id="export-dialog" aria-labelledby="export-heading"><form method="dialog"><button class="dialog-close" aria-label="Close" value="cancel">×</button></form><p class="eyebrow">TAKE YOUR FIELD NOTES HOME</p><h2 id="export-heading">导出观察记录</h2><p id="export-summary"></p><label>地点 · Location name<input id="location-name" placeholder="e.g. High Park"></label><div class="export-location"><label>州 / 省 · State<input id="export-state" placeholder="e.g. ON"></label><label>国家 · Country<input id="export-country" placeholder="e.g. CA"></label></div><p class="export-note">eBird 仅包含鸟类，无表头。使用 Incidental 协议；本版本不记录完整调查努力。<br>Generic CSV includes all taxa and column headers.</p><button id="export-ebird" class="start-button" type="button">下载 eBird CSV <span>↓</span></button><button id="export-all" class="secondary-button" type="button">所有物种 · Generic CSV ↓</button></dialog>
+  <div id="audio-overlay" class="audio-overlay" hidden><div><p class="eyebrow">PROJECTOR AUDIO</p><h2>Let the field speak.</h2><p>Click to enable assistant audio. This screen never uses a microphone.</p><p class="echo-note">While audio is enabled, phone voice input pauses during assistant speech. The phone’s tap button can still interrupt.</p><button id="enable-audio" class="start-button" type="button">Start display audio <span>↗</span></button><a id="silent-display" href="?display=1">Continue without audio</a></div></div>
+  <dialog id="export-dialog" aria-labelledby="export-heading"><form method="dialog"><button class="dialog-close" aria-label="Close" value="cancel">×</button></form><p class="eyebrow">TAKE YOUR FIELD NOTES HOME</p><h2 id="export-heading">Export observations</h2><p id="export-summary"></p><label>Location name<input id="location-name" placeholder="e.g. High Park"></label><div class="export-location"><label>State / province<input id="export-state" placeholder="e.g. ON"></label><label>Country<input id="export-country" placeholder="e.g. CA"></label></div><p class="export-note">eBird includes birds only, without headers. Incidental protocol: this version does not collect complete survey effort.<br>Generic CSV includes all taxa and column headers.</p><button id="export-ebird" class="start-button" type="button">Download eBird CSV <span>↓</span></button><button id="export-all" class="secondary-button" type="button">All taxa · Generic CSV ↓</button></dialog>
   <noscript>This companion needs JavaScript for audio and field notes.</noscript>
 </body>
 </html>

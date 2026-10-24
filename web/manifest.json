@@ -1,9 +1,9 @@
 {
   "id": "/",
-  "name": "野伴 · Field Companion",
-  "short_name": "野伴",
+  "name": "Field Companion",
+  "short_name": "Field Companion",
   "description": "A hands-free birding companion. Eyes up, ears open.",
-  "lang": "zh-Hans",
+  "lang": "en",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",

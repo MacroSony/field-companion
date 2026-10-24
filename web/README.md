@@ -1,50 +1,55 @@
-# 野伴 · Field Companion (v0)
+# Field Companion (placeholder name)
 
-Plain HTML/CSS/JS. No install or build step, no framework/CDN. The real backend should serve this directory at `/` with its WebSocket at `/ws`.
+Eyes up. Ears open.
 
-## Run the protocol mock
+Plain HTML/CSS/JS, no build step. Serve this directory at `/` with the protocol WebSocket at `/ws`.
+
+## Phone and projector
+
+- Phone: `/?session=demo` (the session defaults to `demo`). Tap **Start listening**, allow the microphone, and use earphones. Phones require HTTPS; localhost also works.
+- Projector: `/?display=1&session=demo`. Connects automatically with `role=display`, never requests the microphone or GPS, and is silent by default. Designed for 1280×720 and 1920×1080 landscape.
+- Projector audio: add `&audio=1`, then click **Start display audio** to unlock WebAudio. The backend enables its half-duplex echo guard for this connection: phone speech is gated while the assistant speaks and for 300 ms afterward; the phone tap button still cancels speech.
+- Session and role parameters are forwarded to the WebSocket, including when using the optional `?ws=wss%3A%2F%2Fother-host%2Fws` override. Hello is always first and uses `lang: "en"`.
+- English common names are primary, scientific names italicized below. `zh` fields are ignored. Photos appear on observations, heard detections, candidates, and map popups. Missing or failed photos fall back to a local source icon.
+- The phone's **Observation map** is collapsed initially. The projector map is always open. Observation coordinates determine markers and bounds; the phone additionally shows its available GPS position as a blue dot. Displays do not invent a phone location.
+
+## Protocol mock
 
 From the repository root:
 
 ```sh
-/data/build/birding-demo/.venv/bin/python web/mock-server.py
-# Open http://localhost:8766
+/data/build/birding-demo/.venv/bin/python web/mock-server.py --port 8877 --host 127.0.0.1
+# Phone: http://localhost:8877/?session=demo
+# Display: http://localhost:8877/?display=1&session=demo
 ```
 
-If that port is occupied (it was during this build):
+Choose an unused port; do not use the live backend port. Static assets and `/ws` share the chosen port. The mock fetches six default taxon photos from iNaturalist at startup (bounded timeouts, source-icon fallback offline). It sends English example observations with coordinates, detections, captions, candidates, earcons, a 24 kHz tone, and a flush. The tone is not speech.
 
-```sh
-/data/build/birding-demo/.venv/bin/python web/mock-server.py --port 8767
-# Open http://localhost:8767
-```
+Mock checklist state is shared per session, persists through reconnects, and resets when the mock process restarts. Edit/delete/text changes fan out to all clients in that session. A new mic replaces the previous mic. Displays receive binary audio only with `audio=1`; sending microphone frames from a display is rejected. The mock simulates echo gating but has no BirdNET, speech recognition, identification, or persistent storage. Typed input always adds a mallard, regardless of wording.
 
-Both static assets and `/ws` are on the same port. Use an HTTPS tunnel to that port on a physical phone; plain LAN HTTP cannot access the mic. An optional `?ws=wss%3A%2F%2Fother-host%2Fws` override supports a separate WebSocket server. HTTPS pages need secure `wss` endpoints.
+## Implementation notes
 
-Tap **Start** and grant mic access. The mock supplies four observations (including one plant), detections, captions, three candidate illustrations, earcons, a 24 kHz tone and a flush. `+`, `−`, delete/swipe, quiet, mic pause, tap and typed input exercise protocol messages. Typed input increments the mock mallard regardless of wording; this is deliberately not real identification. Mock state resets on reconnect; the real backend owns state and must resend its checklist after hello.
+- Start unlocks a shared AudioContext and requests unprocessed 48 kHz mono input. An AudioWorklet captures PCM16 in 20 ms chunks. A stateful linear JS resampler handles other negotiated rates; it is not a production band-limited resampler.
+- Incoming 24 kHz PCM is queued through WebAudio. Flush stops speech and earcons. Disconnected edits are disabled; reconnect uses backoff. Stale mic frames are dropped instead of buffered.
+- Screen Wake Lock is best effort. Pause disables mic tracks/transmission. End releases tracks, socket, audio, and wake lock.
+- Backend checklist messages are the only source of observation state; counts are not updated optimistically. New/changed cards animate (respects reduced motion).
+- eBird export uses 19 columns, no header, exact `group: "Aves"`, and the honest `Incidental` protocol with no invented survey effort. Generic CSV contains English/scientific names and all taxa, preferring item coordinates where available.
+- Leaflet 1.9.4 JS, CSS, images, and license are vendored in `vendor/leaflet/`, from `https://unpkg.com/leaflet@1.9.4/`. Only map tiles need an external map service (OpenStreetMap, attributed in the map). Photos also need network access.
+- The versioned service worker caches the app shell and Leaflet assets. Offline reload does not restore backend checklist data. No recordings/checklists are stored locally.
 
-## Implementation
+## Verification evidence
 
-- Start gesture unlocks a shared AudioContext; requests 48 kHz unprocessed mono input. AudioWorklet captures PCM16 in 20 ms native-rate chunks. If the context negotiates another rate, a stateful **linear JS resampler** converts to 48 kHz (not a band-limited production resampler).
-- Incoming little-endian mono PCM16 is placed in 24 kHz AudioBuffers and scheduled consecutively on that same context. Flush stops all active/scheduled speech sources and local earcons immediately.
-- No optimistic checklist mutations: only server `checklist` messages render observations. Socket backoff reconnects automatically, and disconnected edits are disabled. Stale mic frames are dropped rather than buffered on a slow connection.
-- Screen Wake Lock is requested while running and reacquired when visible, where supported. Pause disables the mic track and transmission; End stops tracks, releases wake lock and closes audio/socket.
-- eBird export: 19 columns, no header, only exact `group: "Aves"`; English common names, genus/species, local session date/time and GPS if available. All-taxa CSV includes headers and Chinese names. Location/state/country are editable in the export dialog. **Incidental remains the protocol even after End**: this v0 does not collect complete survey effort, movement or all-species reporting, so it must not invent a Stationary/Traveling checklist. Duration/distance/area are blank; all observations reported is `N`.
-- A service worker caches the app shell after the first successful visit. Offline UI and current-page CSV export work; identification/audio assistance requires the server. Reloading offline does **not** restore the backend checklist. No audio recordings or checklist data are stored locally.
+`self-test-results.json` records an actual headless Chromium CDP run against mock port **8877** (not the live backend):
 
-## Verification and evidence
+- Phone: 390×844, fake microphone/GPS, hello-first English framing, session routing, 48 kHz/1920-byte mic frames, flush, reconnect, edit/delete/text, quiet/tap/pause, both CSV exports, GPS marker, and offline shell reload.
+- Display: 1280×720 screenshot; four loaded species photos and map markers, both caption roles, session hint, shared-session updates, no mic requests or binary uplink, and silent-by-default WebAudio behavior.
+- 1920×1080 layout checked for page overflow and larger captions. Opt-in display audio tested with a user gesture, including flush and zero mic requests.
+- No runtime exceptions in either mode. Syntax checks: `node --check` for every JS file (including Leaflet), Python AST parsing for the mock and test.
 
-- `node --check web/app.js`, `web/audio-worklet.js`, `web/sw.js`: passed.
-- Python compile checks for mock and smoke test: passed.
-- `self-test-results.json`: actual Chromium 149 CDP smoke-test results using a fake mic and granted fake GPS, against the mock on 8767. Covers hello-first framing, 48 kHz mic capture, scheduled-source flush, checklist edit/delete, typed input, quiet/tap, mic pause transmission stop, reconnect, CSV column/row counts, GPS export, offline shell reload and absence of runtime exceptions.
-- `screenshot.png`: actual 390×844 viewport against that mock.
-- Linear-resampler unit exercise: 1 second at 44.1/32/96 kHz produced 47,999 / 47,999 / 48,000 samples. Tested 440 Hz continuity error below 17 PCM units. No physical input-device fallback was tested.
+Screenshots: `screenshot.png` (phone) and `screenshot-display.png` (1280×720 projector).
 
-`self-test.py` can rerun the browser checks using `websockets`; it expects the mock on 8767 and an existing Chrome CDP instance on 9223 launched with fake-media flags. It denies actual file downloads and checks generated CSV Blobs directly.
+To rerun: start a **fresh** mock on 8877 and Chrome with `--headless=new --no-sandbox --use-fake-device-for-media-stream --use-fake-ui-for-media-stream --remote-debugging-port=9223`, then run `/data/build/birding-demo/.venv/bin/python web/self-test.py`. The test denies real downloads and examines CSV Blobs directly. Its sessions should be fresh for deterministic initial counts.
 
-## Known limitations / phone caveats
+## Known gaps
 
-- Not tested on physical iOS Safari or Android hardware; the browser test uses synthetic mic audio. Start must be a user gesture. Safari may suspend/interfere with audio after interruption, route changes or backgrounding; tap **Tap to talk** to resume, or End/Start if capture stops. Wake Lock is best effort and cannot keep background microphone access alive. Keep the page foregrounded/screen on. Use wired earphones to prevent feedback.
-- Browsers/devices can ignore requested hardware rate and mic-processing constraints. Bluetooth microphones may be narrowband; resampling cannot recover missing bird frequencies.
-- GPS never blocks hello. If permission resolves after the socket opens, coordinates are used for export but cannot be sent retroactively under this protocol.
-- eBird files may need species/name review before import; no effort/track editor or validation against eBird taxonomy. Generic export is not an iNaturalist-specific importer.
-- SVG manifest icon is a simple v0 asset; older iOS install icons may need dedicated PNGs. No camera upload/map, persistent offline checklist, background recording or real speech/BirdNET inference in the mock. Candidate photos supplied by a backend may require network access; failed images get a local placeholder.
+No physical Android/iOS or live-model/backend verification in this pass. Mobile backgrounding, device audio routes, ignored capture constraints, and autoplay after interruptions still need hardware testing; keep the app foregrounded and use wired earphones. GPS does not block hello, and late coordinates are used locally rather than retroactively changing the protocol hello. Map tiles and photos require internet; imagery may fail independently of the session. Captions show the latest utterance for each speaker, not an archived conversation. Long checklists/timelines/captions scroll within display panels. No camera upload, offline checklist persistence, full survey-effort collection, or eBird taxonomy validation.
