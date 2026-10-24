@@ -6,7 +6,7 @@ comparisons and species-fact follow-ups without changing the logging fast path.
 ```bash
 source /data/build/birding-demo/.venv/bin/activate
 # BOSON_API_KEY, or the existing ~/.config/boson/api_key; never copy into the repo
-python -B backend/server.py --port 8792
+python -B backend/server.py --port 8793
 ```
 
 The backend serves the existing `web/` at `/` and WebSockets at `/ws`. A phone
@@ -29,15 +29,31 @@ expose it publicly. Server restart loses session state.
 - Input: 48 kHz mono PCM16; output: 24 kHz mono PCM16. Stateful 63-tap FIR
   downsampling preserves packet phase. BirdNET uses three-second windows every
   1.5 seconds, a 30-second ring and one worker thread per session.
-- State includes `echo_guard`: true while any audio-enabled display is attached.
-  In that mode microphone PCM is withheld from Realtime during estimated assistant
-  playback plus 300 ms, but still enters BirdNET. The estimate uses sent PCM bytes
-  / 48,000 bytes per second; it is not a playback acknowledgement from the browser.
-  `tap` sends cancellation and broadcasts flush, including for queued playback.
+- The mic defaults to **speaker** (`earphones=false`): safe half-duplex without
+  needing a display. `audio_mode` (or hello's boolean `earphones`) selects
+  earphones/full-duplex; any display with `audio=1` still forces echo guarding.
+- Guarding starts before the first outgoing assistant PCM. Browser `playback`
+  reports track actual scheduled start and final source completion, including
+  flush. Active reports hold the gate closed. Input resumes after the later of
+  reported end and PCM-duration estimate plus 500 ms; old/non-reporting clients
+  use estimate plus 800 ms. The latest audio-output deadline wins. Guarded VAD
+  starts are ignored, not treated as barge-in; Tap still cancels and flushes.
+- Speaker-mode BirdNET windows overlapping assistant playback or its tail are
+  marked in the audio ring, dropped even if processed after playback, and logged
+  as `bird_window_skipped` / `assistant_playback`. Earphone BirdNET is unchanged.
+- Always-on STT echo defense remembers the last three spoken assistant captions
+  (including partial captions before cancellation). Within ten seconds of speech,
+  a contiguous match of at least three normalized words covering >=70% of the
+  input drops it before routing and logs `echo_dropped`; shorter inputs pass.
+  Typed text is unaffected. Genuine repeated words can also be filtered: this is
+  a conservative heuristic, not AEC. Browser AEC stays off for BirdNET.
+- The phone status toggle persists Speaker/Earphones in localStorage. The hint
+  distinguishes Tap interruption from voice interruption; first run recommends
+  earphones. See `docs/PROTOCOL.md` for wire details.
 
 ## Route first, answer second
 
-Server VAD explicitly uses `create_response=false`, `interrupt_response=true`.
+Server VAD explicitly uses `create_response=false`, `interrupt_response=false`.
 Each completed transcription queues one routing turn; typed text uses the same
 router. One turn worker serializes session phase changes, tool execution and
 responses, while an independent reader resolves `session.updated` and response
@@ -83,8 +99,8 @@ still goes to BirdNET but is not replayed upstream.
 
 ```bash
 python -B -m unittest discover -s backend -p 'test_*.py' -v
-python -B backend/server.py --host 127.0.0.1 --port 8792
-python -B backend/selftest.py --url ws://127.0.0.1:8792/ws
+python -B backend/server.py --host 127.0.0.1 --port 8793
+python -B backend/selftest.py --url ws://127.0.0.1:8793/ws
 # Stop only the test instance when finished; leave live port 8780 untouched.
 ```
 
@@ -124,10 +140,98 @@ Small synthetic samples do not establish natural-speech routing reliability,
 language compliance, taxonomy correctness or echo cancellation on real speakers.
 Echo suppression itself is covered offline; live selftest checks the flag and
 fanout, not acoustic feedback. Lifecycle tests accelerate the ten-minute expiry;
-no ten-minute live wait or forced live upstream-disconnect test was run. Browser
-playback duration and network buffering are estimated, and BirdNET intentionally
-continues to hear assistant playback. Previous historical test logs may describe
-older server behavior; the router logs above are the current evidence.
+no ten-minute live wait or forced live upstream-disconnect test was run. Previous historical test logs describe older server behavior; in particular the
+old guard did not cover speaker-only phones or suppress BirdNET windows. See the
+speaker-echo verification below for current behavior.
+
+## Batched proactive suggestions (feat/batched-suggestions)
+
+The existing two-window / ten-second / >=0.5 rule now populates an ordered
+session suggestion buffer, retaining best confidence and first/last heard times.
+A 3.5-second debounce produces one batch; prompt starts are at least 25 seconds
+apart (measured again at first output audio). New species accumulate during the
+limit. User turns take priority, and active generation, user speech, pending
+transcription and estimated playback block proactive speech. Quiet mode keeps
+chips only, even after a tap. At most three names are supplied for speech, in
+confidence order, with an “N more on screen” instruction for larger batches.
+Unprompted species stale for >60 seconds are removed; prompted suggestions expire
+120 seconds after dispatch. Suggested/dismissed species stay deduplicated for the
+session. Detection timestamps still update the UI while confirmation is pending.
+
+`accept_suggestions(species?, counts?)` and `dismiss_suggestions(species?)` use
+omitted/empty species for all pending, or select an unambiguous named subset.
+The router gets the current list in each route session's instructions, so yes,
+yes both, just the cardinal and no have explicit context. Accept uses cached
+BirdNET taxon metadata, without another network lookup. `add_observations(items)`
+resolves and validates the entire multi-species report before mutation. These
+write actions return a single earcon and no answer generation. Existing
+`add_observation` is unchanged for single-species callers. The web Heard area
+shows highlighted Add? chips with independent accept/dismiss buttons; displays
+can use them too. See `docs/PROTOCOL.md` for the wire format.
+
+### Current verification (2026-10-23, port 8793 only)
+
+```bash
+/data/build/birding-demo/.venv/bin/python -B -m unittest discover -s backend -p 'test_*.py' -v
+node --check web/app.js
+# With a test server running on 8793:
+/data/build/birding-demo/.venv/bin/python -B backend/selftest.py --url ws://127.0.0.1:8793/ws --chorus
+```
+
+All **26 unit tests passed**; `node --check web/app.js` and `git diff --check`
+also passed. Evidence is reproducible in `backend/test_server.py` and
+`backend/selftest.py`; live output was captured by the execution command, not
+written as extra repo files.
+Chorus session `chorus-afc07fc5` passed real BirdNET + Higgs STT/router on 8793:
+- Mixed testmix cardinal/robin/bluejay recordings in memory (gains .5/1/.05);
+  the five-species fixture did not exist. Two species qualified.
+- Exactly one spoken prompt: “BirdNET just heard a Northern Cardinal and an
+  American Robin. Would you like me to add either or both to your checklist?”
+- Probe `tts("Yes, add them all.")` transcribed “Yes. Add them all.”; one
+  `accept_suggestions` call added both checklist species with exactly one logged
+  earcon and no spoken acknowledgement.
+- Buffer-to-dispatch **3,640 ms**; stream-start-to-first-audio **10,059.6 ms**
+  (includes time needed for two BirdNET windows); speech-stopped-to-earcon
+  **897.5 ms**. One sample, not a latency distribution. Test server was stopped.
+
+Earlier live attempts failed honestly: equal-gain audio qualified only a cardinal;
+then a second mix put cardinal's second hit just beyond the 3-second boundary,
+so only robin was spoken (although accept-all did log both). The final 3.5-second
+debounce includes that boundary and passed. Audio mixing can also create false
+positive detections (one unusual treecreeper hit was seen but never suggested).
+No detection thresholds were relaxed. Spoken max-three/extra wording is model
+instructed and covered at injection level offline, not live with >3 species.
+Natural speech subset/no routing, physical browser playback/chip appearance and
+real-speaker echo behavior remain unverified live; unit tests cover the action
+semantics, guards, rate limit, expiry, deduplication and atomic multi-add.
+
+## Speaker self-echo verification (2026-10-23, port 8794 only)
+
+`backend/test_server.py` now has **31 passing offline tests**, including speaker
+and earphone policy, display override, playback end/estimate/fallback timing,
+flush tail retention, guarded VAD ignoring vs earphone barge-in, overlapping
+BirdNET window rejection, and echo fragment vs genuine question filtering.
+`node --check web/app.js`, `node --check web/sw.js`, and `git diff --check` pass.
+
+A temporary test server on **8794** generated one real Higgs spoken answer per
+mode. Its outgoing 24 kHz PCM was recorded **in memory**, resampled to 48 kHz and
+streamed back as real-time mic input, with playback start/end reports and trailing
+silence. Evidence was printed by the execution command (no extra audio/log files):
+
+- `echo-speaker-c86321`: 376,320 PCM bytes; exactly one `route_done` (`speak`),
+  zero `barge_in`, five BirdNET windows skipped for assistant playback; no loop.
+- `echo-earphones-7f026f`: 336,000 PCM bytes; guard off, exactly one route,
+  zero barge-in, zero playback-related BirdNET skips. Actual STT of the replay
+  matched the assistant answer and logged `echo_dropped`; no second route/audio.
+
+The test instance was stopped; port **8780 was not restarted or killed**. Backend
+changes need a later deployment/restart to affect that existing Python process;
+web assets take effect on reload (service-worker shell v5). These live tests use
+PCM loopback after recording the answer, not a physical phone speaker/room or
+browser WebAudio scheduling. Simultaneous guarded speech-start handling is tested
+offline. Mobile playback timing, UI appearance, and physical acoustic conditions
+remain unverified. A client reporting start but never end stays safely muted
+until it reports completion, disconnects, or switches to unguarded earphone mode.
 
 ## Protocol v0.2 observation backend
 
@@ -148,8 +252,8 @@ observation with a resolved description detection. Logging remains silent + earc
 Router additions: `look(hint?, group?)`, `get_observation`, `confirm_observation`,
 `discard_observation`, `new_observation(group?)`, `describe(text, name?)`, and
 `ask_expert(question)`. Existing tools and route/answer config separation remain.
-`expert_answer(question, observation_dict) -> str | None` is the module-level
-provider seam; the default returns null with “expert provider not configured”.
+`Session.ask_expert` calls the optional `NaturalistExpert` provider with a snapshot;
+the structured result, grounding and fallbacks are described in `docs/EXPERT.md`.
 Only explicit species names supplied to describe are resolved through iNat;
 arbitrary descriptive prose does not become guessed evidence.
 
@@ -175,7 +279,7 @@ arbitrary descriptive prose does not become guessed evidence.
 - Each BirdNET window attaches its top five candidates once if within 10 seconds
   of focus activity; recent pre-look windows are also attached. Sound alone does
   not keep an otherwise idle focus alive. The existing BirdNET rarity/range filter
-  and proactive notification behavior are retained.
+  are retained; proactive prompts follow the batching policy above.
 
 ### Current verification (2026-10-24 UTC)
 

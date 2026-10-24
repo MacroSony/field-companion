@@ -51,7 +51,7 @@ async def main():
         await call('Emulation.setGeolocationOverride', latitude=43.66, longitude=-79.39, accuracy=10)
         await call('Browser.grantPermissions', permissions=['audioCapture', 'geolocation'], origin='http://localhost:8877')
         await call('Page.addScriptToEvaluateOnNewDocument', source='''
-            window.__stops = 0; window.__contexts = []; window.__sockets = []; window.__micRequests = 0;
+            window.__stops = 0; window.__starts = []; window.__contexts = []; window.__sockets = []; window.__micRequests = 0;
             const gum = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
             navigator.mediaDevices.getUserMedia = (...args) => { window.__micRequests++; return gum(...args); };
             const WS = window.WebSocket;
@@ -59,7 +59,12 @@ async def main():
             const AC = window.AudioContext;
             window.AudioContext = class extends AC {
               constructor(...args) { super(...args); window.__contexts.push(this); }
-              createBufferSource() { const s = super.createBufferSource(); const stop = s.stop.bind(s); s.stop = (...args) => { window.__stops++; return stop(...args); }; return s; }
+              createBufferSource() {
+                const s = super.createBufferSource(), stop = s.stop.bind(s), start = s.start.bind(s);
+                s.stop = (...args) => { window.__stops++; return stop(...args); };
+                s.start = (...args) => { if (Number.isFinite(args[0])) window.__starts.push({scheduled: args[0], now: this.currentTime}); return start(...args); };
+                return s;
+              }
             };
             const originalURL = URL.createObjectURL.bind(URL);
             URL.createObjectURL = blob => { window.__csvBlob = blob; return originalURL(blob); };
@@ -81,6 +86,27 @@ async def main():
         })''')
         assert results['items'] == 4 and results['heard'] == 2 and results['candidates'] == 3, results
         assert results['sampleRate'] == 48000 and results['flushStoppedSources'] > 0 and not results['overflow'], results
+        assert await evaluate("document.getElementById('audio-mode').getAttribute('aria-pressed')") == 'false'
+        await evaluate("document.getElementById('audio-mode').click()")
+        assert await evaluate("document.getElementById('audio-mode').getAttribute('aria-pressed') === 'true' && localStorage.getItem('field-earphones') === 'true'")
+        await evaluate("document.getElementById('audio-mode').click()")
+        await evaluate("""window.__sockets[0].dispatchEvent(new MessageEvent('message', {data: JSON.stringify({type:'suggestions',items:[
+          {sci:'Cardinalis cardinalis',en:'Northern Cardinal',conf:.87}, {sci:'Turdus migratorius',en:'American Robin',conf:.82}
+        ]})}));""")
+        assert await evaluate("document.querySelectorAll('#suggestions .suggestion-chip').length") == 2
+        await evaluate("document.querySelector('#suggestions .suggestion-chip button').click(); document.querySelectorAll('#suggestions .suggestion-dismiss')[1].click()")
+        await asyncio.sleep(.2)
+        messages = [json.loads(e['params']['response']['payloadData']) for e in events
+                    if e.get('method') == 'Network.webSocketFrameSent' and e['params']['response']['opcode'] == 1]
+        assert {'type': 'audio_mode', 'earphones': True} in messages
+        assert {'type': 'audio_mode', 'earphones': False} in messages
+        assert {'type': 'suggestion_action', 'sci': 'Cardinalis cardinalis', 'action': 'accept'} in messages
+        assert {'type': 'suggestion_action', 'sci': 'Turdus migratorius', 'action': 'dismiss'} in messages
+        assert {'type': 'playback', 'active': True} in messages
+        assert {'type': 'playback', 'active': False} in messages
+        results['audioModesAndPlaybackReports'] = True
+        results['suggestionChipActions'] = True
+        await evaluate("window.__sockets[0].dispatchEvent(new MessageEvent('message', {data:JSON.stringify({type:'suggestions',items:[]})}))")
         shot = await call('Page.captureScreenshot', format='png', captureBeyondViewport=False)
         (ROOT / 'screenshot.png').write_bytes(base64.b64decode(shot['data']))
         results['phoneSessionURL'] = await evaluate("window.__sockets[0].url")
@@ -129,6 +155,15 @@ async def main():
         await evaluate("document.getElementById('export-dialog').close(); document.getElementById('stop').click()")
         await asyncio.sleep(.3)
         assert await evaluate("document.getElementById('start').hidden") is False
+        await evaluate("window.__starts=[]; document.getElementById('start').click()")
+        await asyncio.sleep(1)
+        await evaluate("document.getElementById('tap').click()")
+        await asyncio.sleep(.7)
+        results['restartPlayback'] = await evaluate("({contexts:window.__contexts.length, starts:window.__starts.length, maxDelay:Math.max(...window.__starts.map(s=>s.scheduled-s.now))})")
+        assert results['restartPlayback']['contexts'] == 2 and results['restartPlayback']['starts'] > 0, results['restartPlayback']
+        assert results['restartPlayback']['maxDelay'] < 1, results['restartPlayback']
+        await evaluate("document.getElementById('stop').click()")
+        await asyncio.sleep(.2)
         sent = [e['params']['response'] for e in events if e.get('method') == 'Network.webSocketFrameSent']
         results['firstSentFrame'] = json.loads(sent[0]['payloadData'])
         results['microphoneBinaryFrames'] = sum(frame['opcode'] == 2 for frame in sent)

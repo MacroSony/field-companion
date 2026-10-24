@@ -80,7 +80,7 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_hello_and_vad(self):
         await self.c.handle_phone({"type": "hello", "lang": "zh"})
-        self.assertEqual([e["type"] for e in self.phone.events], ["state", "checklist"])
+        self.assertEqual([e["type"] for e in self.phone.events], ["state", "checklist", "suggestions"])
         vad = self.c.session()["audio"]["input"]["turn_detection"]
         self.assertFalse(vad["create_response"])
         self.assertFalse(vad["interrupt_response"])  # manual barge-in only
@@ -143,7 +143,7 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         await self.c.handle_rt({"type": "response.output_audio.delta", "response_id": "r1", "delta": "AAA="})
         self.assertFalse(self.phone.audio)
 
-    async def test_echo_guard_blocks_realtime_not_birdnet(self):
+    async def test_echo_guard_blocks_realtime_and_keeps_ring(self):
         display = FakePhone()
         self.c.clients.add(s.Client(display, self.c, "display", True))
         self.c.connected = True
@@ -152,9 +152,112 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.c.state_payload()["echo_guard"])
         self.assertTrue(self.c.audio_queue.empty())
         self.assertEqual(self.c.position, 2400)
-        self.c.play_until = time.monotonic() - .4
+        self.c.play_until = time.monotonic() - .9
         await self.c.ingest_audio(bytes(4800))
         self.assertFalse(self.c.audio_queue.empty())
+
+    async def test_audio_modes_and_display_override(self):
+        self.c.play_until = time.monotonic() + 3
+        self.assertTrue(self.c.echo_guard)  # speaker is the default, no display needed
+        self.assertTrue(self.c.echo_blocked())
+        await self.c.handle_phone({"type": "hello", "earphones": True})
+        self.assertFalse(self.c.echo_guard)
+        self.assertFalse(self.c.echo_blocked())
+        display = s.Client(FakePhone(), self.c, "display", True)
+        self.c.clients.add(display)
+        self.assertTrue(self.c.echo_blocked())
+        self.c.clients.remove(display)
+        await self.c.handle_phone({"type": "audio_mode", "earphones": False})
+        self.assertTrue(self.c.echo_blocked())
+        with self.assertRaises(ValueError):
+            await self.c.handle_phone({"type": "audio_mode", "earphones": "false"})
+
+    async def test_playback_report_end_and_legacy_fallback(self):
+        with patch.object(s, "time", SimpleNamespace(monotonic=lambda: 100)):
+            self.c.echo_estimate = 102
+            self.assertEqual(self.c.echo_deadline(), 102.8)
+            await self.c.handle_phone({"type": "playback", "active": True})
+            self.assertTrue(self.c.echo_blocked())
+            await self.c.handle_phone({"type": "playback", "active": False})
+            self.assertEqual(self.c.echo_deadline(), 102.5)  # early end cannot shorten estimate
+        with patch.object(s, "time", SimpleNamespace(monotonic=lambda: 104)):
+            await self.c.handle_phone({"type": "playback", "active": False})
+            self.assertEqual(self.c.echo_deadline(), 104.5)
+            await self.c.cancel_speech()  # flush retains the acoustic tail
+            self.assertTrue(self.c.echo_blocked())
+        with patch.object(s, "time", SimpleNamespace(monotonic=lambda: 104.51)):
+            self.assertFalse(self.c.echo_blocked())
+
+    async def test_guarded_vad_ignored_but_earphones_barge_in(self):
+        self.c.play_until = time.monotonic() + 2
+        self.c.response_id = "answer"
+        with patch.object(self.c, "log") as log:
+            await self.c.handle_rt({"type": "input_audio_buffer.speech_started"})
+            log.assert_called_with("vad_ignored", reason="assistant_playback")
+        self.assertFalse(self.c.user_speaking)
+        self.assertFalse(self.c.awaiting_transcript)
+        self.assertNotIn({"type": "flush"}, self.phone.events)
+        self.c.rt_send.assert_not_awaited()
+        await self.c.handle_phone({"type": "audio_mode", "earphones": True})
+        await self.c.handle_rt({"type": "input_audio_buffer.speech_started"})
+        self.assertTrue(self.c.user_speaking)
+        self.assertIn({"type": "flush"}, self.phone.events)
+
+    async def test_birdnet_drops_all_overlapping_windows_including_tail(self):
+        self.c.bird_window = AsyncMock()
+        self.c.play_until = time.monotonic() + 2
+        with patch.object(self.c, "log") as log:
+            for _ in range(3):
+                await self.c.ingest_audio(bytes(2 * s.SR))
+            log.assert_called_with("bird_window_skipped", reason="assistant_playback", stream_s=3.0)
+        self.c.play_until = 0
+        # Even after playback, windows containing earlier contaminated samples must drop.
+        for _ in range(2):
+            await self.c.ingest_audio(bytes(2 * s.SR))
+        await asyncio.sleep(0)
+        self.c.bird_window.assert_not_awaited()
+        for _ in range(3):
+            await self.c.ingest_audio(bytes(2 * s.SR))
+        await asyncio.sleep(0)
+        self.c.bird_window.assert_awaited()
+        other = s.Session("earphones")
+        try:
+            client = s.Client(FakePhone(), other)
+            client.earphones = True
+            other.clients.add(client)
+            other.bird_window = AsyncMock()
+            other.play_until = time.monotonic() + 10
+            for _ in range(3):
+                await other.ingest_audio(bytes(2 * s.SR))
+            await asyncio.sleep(0)
+            other.bird_window.assert_awaited_once()
+        finally:
+            await other.close()
+
+    async def test_echo_filter_drops_fragment_and_passes_genuine_question(self):
+        self.c.phase = "answer"
+        await self.c.handle_rt({"type": "response.output_audio_transcript.delta", "response_id": "r1",
+                               "delta": "I appreciate the quiet woods. What would you like to ask?"})
+        self.assertTrue(self.c.transcript_is_echo("I appreciate the."))
+        self.assertTrue(self.c.transcript_is_echo("What would you like to ask?"))
+        # Short replies are never treated as echo (the speaker-mode gate covers those);
+        # answers that reuse the prompt's words must pass.
+        self.assertFalse(self.c.transcript_is_echo("quiet"))
+        self.assertFalse(self.c.transcript_is_echo("Yes, add them."))
+        self.assertFalse(self.c.transcript_is_echo("Just the cardinal."))
+        self.assertFalse(self.c.transcript_is_echo("Which bird has a red head and black wings?"))
+        self.client.earphones = True  # filter is independent of the guard
+        with patch.object(self.c, "log") as log:
+            await self.c.handle_rt({"type": "conversation.item.input_audio_transcription.completed",
+                                    "transcript": "I appreciate the."})
+            log.assert_called_with("echo_dropped", text="I appreciate the.")
+        self.assertFalse(self.c.pending)
+        await self.c.handle_rt({"type": "conversation.item.input_audio_transcription.completed",
+                                "transcript": "Which bird has a red head and black wings?"})
+        self.assertEqual(len(self.c.pending), 1)
+        self.c.spoken.clear()
+        self.c.spoken.append(("old", "I appreciate the.", time.monotonic() - 11))
+        self.assertFalse(self.c.transcript_is_echo("I appreciate the."))
 
     async def test_audio_fanout_and_session_isolation(self):
         silent, loud = FakePhone(), FakePhone()
@@ -199,10 +302,177 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         await self.c.bird_window(np.zeros(1), 3 * s.SR)
         self.assertFalse(self.c.pending)
         await self.c.bird_window(np.zeros(1), int(4.5 * s.SR))
+        self.assertFalse(self.c.pending)
+        self.assertEqual(len(self.c.suggestions), 1)
+        now = time.monotonic()
+        await self.c.suggestion_tick(now + 2.9)
+        self.assertFalse(self.c.pending)
+        await self.c.suggestion_tick(now + 3.6)
         self.assertEqual(len(self.c.pending), 1)
         self.assertEqual(len(self.c.history), 2)
         heard = next(e for e in self.phone.events if e["type"] == "heard")
         self.assertTrue(all(k in heard for k in ("en", "sci", "photo", "lat", "lng")))
+
+    def seed_suggestions(self, n=2):
+        now = time.monotonic()
+        for i in range(n):
+            sci = f"Bird {i}"
+            self.c.suggestions[sci] = {"sci": sci, "en": f"English Bird {i}", "photo": "",
+                "conf": .7 + i * .05, "t": s.now_iso(), "first_heard": now - 2,
+                "last_heard": now, "buffered_at": now, "prompt_at": None}
+            self.c.notified.add(sci)
+        return now
+
+    async def test_batch_rate_limit_and_stale_expiry(self):
+        now = self.seed_suggestions()
+        self.c.last_proactive = now - 10
+        await self.c.suggestion_tick(now + 3.6)
+        self.assertFalse(self.c.pending)
+        await self.c.suggestion_tick(now + 15)
+        await self.c.suggestion_tick(now + 16)
+        self.assertEqual(len(self.c.pending), 1)
+        self.assertEqual([r["sci"] for r in self.c.suggestion_batch()], ["Bird 1", "Bird 0"])
+        await self.c.suggestion_tick(now + 61)
+        self.assertFalse(self.c.suggestions)
+
+    async def test_prompt_expiry_not_extended_by_hearing(self):
+        now = self.seed_suggestions()
+        for r in self.c.suggestions.values():
+            r.update(prompt_at=now, last_heard=now + 119)
+        await self.c.suggestion_tick(now + 119)
+        self.assertEqual(len(self.c.suggestions), 2)
+        await self.c.suggestion_tick(now + 120)
+        self.assertFalse(self.c.suggestions)
+        self.assertEqual(len(self.c.notified), 2)
+
+    async def test_accept_all_one_earcon_no_speech(self):
+        self.seed_suggestions()
+        self.c.generate = AsyncMock()
+        await self.route("accept_suggestions", {"counts": {"English Bird 0": 2}})
+        self.assertFalse(self.c.suggestions)
+        self.assertEqual([r["count"] for r in self.c.items], [2, 1])
+        self.assertTrue(all(r["source"] == "birdnet" for r in self.c.items))
+        self.assertEqual(sum(e == {"type": "earcon", "kind": "logged"} for e in self.phone.events), 1)
+        self.c.generate.assert_not_awaited()
+
+    async def test_subset_dismiss_and_ui_action(self):
+        self.seed_suggestions(3)
+        await self.route("accept_suggestions", {"species": ["English Bird 1"]})
+        self.assertEqual([r["sci"] for r in self.c.items], ["Bird 1"])
+        await self.c.handle_phone({"type": "suggestion_action", "sci": "Bird 0", "action": "dismiss"})
+        self.assertEqual(list(self.c.suggestions), ["Bird 2"])
+        await self.route("dismiss_suggestions")
+        self.assertFalse(self.c.suggestions)
+        self.assertEqual(len(self.c.items), 1)
+
+    async def test_accept_batch_preserves_open_focus_and_expert_context(self):
+        focus = await self.c.new_focus()
+        focus.detections.append(s.Detection("camera-evidence", "image", s.now_iso()))
+        self.seed_suggestions()
+        await self.route("accept_suggestions")
+        self.assertEqual(self.c.focus, focus.id)
+        self.assertEqual(focus.status, "open")
+        self.assertEqual([d.id for d in focus.detections], ["camera-evidence"])
+        confirmed = [o for o in self.c.observations.values() if o.status == "confirmed"]
+        self.assertEqual(len(confirmed), 2)
+        self.assertTrue(all(o.detections[0].kind == "sound" for o in confirmed))
+        with patch.object(self.c.expert, "answer", new=AsyncMock(return_value={
+                "ok": True, "status": "completed", "action": "clarify", "answer": "Please look closer."})) as expert:
+            await self.c.tool("ask_expert", {"question": "What is it?"})
+        self.assertEqual(expert.call_args.args[1]["id"], focus.id)
+
+    async def test_sound_and_voice_records_share_derived_checklist_edits(self):
+        self.seed_suggestions(1)
+        await self.c.tool("accept_suggestions", {})
+        with patch.object(s, "resolve", return_value={"sci": "Bird 0", "en": "English Bird 0", "group": "Aves"}):
+            await self.c.tool("add_observations", {"items": [{"name": "English Bird 0", "count": 2}]})
+        self.assertEqual(len(self.c.items), 1)
+        self.assertEqual(self.c.items[0]["count"], 3)
+        self.assertEqual(len([o for o in self.c.observations.values() if o.status == "confirmed"]), 2)
+        row_id = self.c.items[0]["id"]
+        await self.c.handle_phone({"type": "edit", "id": row_id, "count": 5})
+        self.assertEqual(self.c.items[0]["count"], 5)
+        await self.c.handle_phone({"type": "delete", "id": row_id})
+        self.assertFalse(self.c.items)
+        self.assertTrue(all(o.status == "discarded" for o in self.c.observations.values()))
+
+    async def test_multi_add_atomic_and_one_earcon(self):
+        taxons = [{"sci": "Anas platyrhynchos", "en": "Mallard"}, {"sci": "Ardea herodias", "en": "Great Blue Heron"}]
+        with patch.object(s, "resolve", side_effect=taxons):
+            await self.route("add_observations", {"items": [{"name": "mallard", "count": 2}, {"name": "heron"}]})
+        self.assertEqual([r["count"] for r in self.c.items], [2, 1])
+        self.assertEqual(sum(e.get("kind") == "logged" for e in self.phone.events), 1)
+        with patch.object(s, "resolve", side_effect=[taxons[0], None]):
+            result = await self.c.tool("add_observations", {"items": [{"name": "mallard"}, {"name": "unknown"}]})
+        self.assertFalse(result["ok"])
+        self.assertEqual(self.c.items[0]["count"], 2)
+
+    async def test_worker_batch_guards_and_max_three(self):
+        now = self.seed_suggestions(5)
+        for r in self.c.suggestions.values():
+            r["buffered_at"] = now - 4
+        self.c.connected = True
+        self.c.generate = AsyncMock(return_value={"status": "completed", "output": []})
+        self.c.quiet = True
+        self.c.tap_at = now  # taps must not enable proactive speech in quiet mode
+        worker = asyncio.create_task(self.c.turn_worker())
+        try:
+            await self.c.suggestion_tick()
+            await asyncio.sleep(.01)
+            self.c.generate.assert_not_awaited()
+            self.c.quiet = False
+            for guard in ("active", "user_speaking", "awaiting_transcript"):
+                setattr(self.c, guard, True)
+                self.c.work_ready.set()
+                await asyncio.sleep(.01)
+                self.c.generate.assert_not_awaited()
+                setattr(self.c, guard, False)
+            self.c.play_until = now + 10
+            self.c.work_ready.set()
+            await asyncio.sleep(.01)
+            self.c.generate.assert_not_awaited()
+            self.c.play_until = 0
+            self.c.work_ready.set()
+            await asyncio.sleep(.01)
+            self.c.generate.assert_awaited_once_with("answer")
+            text = self.c.rt_send.call_args.args[0]["item"]["content"][0]["text"]
+            self.assertIn("English Bird 4", text)
+            self.assertNotIn("English Bird 0", text)
+            self.assertIn("2 more on screen", text)
+            self.assertTrue(all(r["prompt_at"] is not None for r in self.c.suggestions.values()))
+        finally:
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+
+    async def test_best_confidence_distinct_windows_and_dedup(self):
+        names = {"sci": "Cardinalis cardinalis", "en": "Northern Cardinal", "photo": ""}
+        self.c.names[names["sci"]] = names
+        detection = {"scientific_name": names["sci"], "common_name": names["en"], "confidence": .95}
+        self.c.analyze = lambda _: [detection]
+        await self.c.bird_window(np.zeros(1), 3 * s.SR)
+        await self.c.bird_window(np.zeros(1), 3 * s.SR)
+        self.assertFalse(self.c.suggestions)  # duplicate window is not a second hit
+        detection["confidence"] = .55
+        await self.c.bird_window(np.zeros(1), int(4.5 * s.SR))
+        self.assertEqual(self.c.suggestions[names["sci"]]["conf"], .95)
+        self.assertLess(self.c.suggestions[names["sci"]]["first_heard"], self.c.suggestions[names["sci"]]["last_heard"])
+        await self.c.tool("dismiss_suggestions", {})
+        await self.c.bird_window(np.zeros(1), 6 * s.SR)
+        self.assertFalse(self.c.suggestions)
+
+    async def test_invalid_accept_is_atomic_and_pending_context(self):
+        self.seed_suggestions()
+        self.assertIn("English Bird 0", self.c.config("route")["instructions"])
+        with self.assertRaises(ValueError):
+            await self.c.tool("accept_suggestions", {"counts": {"English Bird 1": -1}})
+        self.assertFalse(self.c.items)
+        self.assertEqual(len(self.c.suggestions), 2)
+        with self.assertRaises(ValueError):
+            await self.c.tool("accept_suggestions", {"species": ["unknown"]})
+        self.assertFalse(self.c.items)
+        await self.c.handle_phone({"type": "suggestion_action", "sci": "Bird 0", "action": "accept"})
+        self.assertEqual([r["sci"] for r in self.c.items], ["Bird 0"])
+        self.assertEqual(list(self.c.suggestions), ["Bird 1"])
 
     async def test_update_waits_for_matching_echo(self):
         config = self.c.config("answer")

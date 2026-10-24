@@ -12,6 +12,7 @@ from datetime import date, datetime, timedelta
 from dataclasses import dataclass, field, asdict
 import math
 import io
+from difflib import SequenceMatcher
 import json
 import logging
 from pathlib import Path
@@ -175,6 +176,16 @@ def tool_schema(name, description, properties=None, required=()):
 VISION_URL = os.environ.get("VISION_URL", "http://127.0.0.1:8795")
 NAME = {"type": "string"}
 COUNT = {"type": "integer", "minimum": 1}
+SUGGEST_DEBOUNCE = 3.5
+SUGGEST_INTERVAL = 25
+SUGGEST_STALE = 60
+SUGGEST_TTL = 120
+SPECIES = {"type": "array", "items": NAME}
+OBSERVATION = {"type": "object", "properties": {
+    "name": NAME, "group": {"type": "string", "enum": GROUPS},
+    "count": COUNT, "notes": NAME}, "required": ["name"]}
+WRITE_TOOLS = ("add_observation", "add_observations", "accept_suggestions",
+               "dismiss_suggestions", "set_count", "remove_observation", "confirm_observation")
 TOOLS = [
     tool_schema("look", "Identify what the user is looking at ('what is that?'); request camera frames. Stay silent until frames arrive. Set group for nonbirds.", {"hint": NAME, "group": {"type": "string", "enum": GROUPS}}),
     tool_schema("get_observation", "Read focus evidence for pronouns and follow-up naturalist questions."),
@@ -183,6 +194,11 @@ TOOLS = [
     tool_schema("new_observation", "Start a different organism as a new focus.", {"group": {"type": "string", "enum": GROUPS}}),
     tool_schema("describe", "Attach a user description to the focus; resolve only explicit species names.", {"text": NAME, "name": NAME}, ("text",)),
     tool_schema("ask_expert", "Reason about the current focus: candidate comparisons, 'could it be X?', conflicting evidence, diet, habitat or behaviour. Read-only; never log.", {"question": NAME}, ("question",)),
+    tool_schema("accept_suggestions", "Confirm pending BirdNET suggestions. Yes/both/all = all pending; just X = subset. Silent.",
+                {"species": SPECIES, "counts": {"type": "object", "additionalProperties": COUNT}}),
+    tool_schema("dismiss_suggestions", "Decline pending suggestions. No = all; optional subset. Silent.", {"species": SPECIES}),
+    tool_schema("add_observations", "Log multiple user-confirmed species in ONE action, one earcon, no speech.",
+                {"items": {"type": "array", "items": OBSERVATION, "minItems": 1}}, ("items",)),
     tool_schema("add_observation", "Log a user-confirmed sighting; increases existing count. No spoken acknowledgement.",
                 {"name": NAME, "group": {"type": "string", "enum": GROUPS}, "count": COUNT,
                  "notes": {"type": "string"}}, ("name", "group", "count", "notes")),
@@ -202,6 +218,11 @@ Reply in English by default; the user may speak Chinese: answer in the language 
 Classify ONLY the latest user turn. Ordinary off-topic remarks/questions to a companion,
 self-talk, phone calls, noise and pet-dog chatter are NOT addressed to you: call ignore.
 Nature sighting reports are addressed even without a wake word: call add_observation.
+Multiple species in one report: call add_observations with all items in ONE call.
+When pending BirdNET suggestions exist: yes / yes both / add them all -> accept_suggestions
+with omitted species (all pending); just the cardinal -> accept_suggestions with that species.
+No / don't add them -> dismiss_suggestions. These actions are silent, not speak.
+Only accept explicit user confirmation, never a BirdNET notification itself.
 For total count corrections use set_count; for deletion use remove_observation.
 Never claim to have logged anything without a successful tool call. Logging has an earcon,
 not speech. Never give delayed logging acknowledgements, including "I've logged X".
@@ -283,15 +304,21 @@ class Session:
         self.cancelled_ids = deque(maxlen=100)
         self.audio_allowed = True
         self.play_until = 0.0
+        self.echo_estimate = 0.0
+        self.spoken = deque(maxlen=3)
         self.playback_task = None
         self.pending = deque()
         self.history = deque(maxlen=3000)
         self.windows = defaultdict(deque)
         self.seen = set()
         self.notified = set()
+        self.suggestions = {}  # insertion ordered; monotonic times stay server-side
+        self.last_proactive = float("-inf")
+        self.proactive_turn = False
         self.names = {}
         self.nearby_cache = {}
         self.ring = np.zeros(30 * SR, dtype=np.float32)
+        self.echo_ring = np.zeros(len(self.ring), dtype=bool)
         self.position = 0
         self.next_window = 3 * SR
         self.filter_taps = firwin(63, 10800, fs=SR)
@@ -477,8 +504,57 @@ class Session:
                                if c.role == "mic" or c.audio), return_exceptions=True)
 
     @property
+    def speaker_mode(self):
+        mic = self.mic or next((c for c in self.clients if c.role == "mic"), None)
+        return mic is None or not mic.earphones
+
+    @property
     def echo_guard(self):
-        return any(c.role == "display" and c.audio for c in self.clients)
+        return self.speaker_mode or any(c.role == "display" and c.audio for c in self.clients)
+
+    def playback_clients(self):
+        return [c for c in self.clients if c.role == "mic" or c.audio]
+
+    def echo_deadline(self):
+        clients = self.playback_clients()
+        # A start without an end keeps the gate closed, including suspended WebAudio.
+        if any(c.playback_active for c in clients):
+            return float("inf")
+        estimate = max(self.echo_estimate, self.play_until)
+        return max((max(estimate, c.playback_end) + (.5 if c.playback_end else .8)
+                    for c in clients), default=estimate + .8)
+
+    @staticmethod
+    def normalized_words(text):
+        return "".join(c.lower() if c.isalnum() else " " for c in text).split()
+
+    def remember_spoken(self, key, text):
+        if not text.strip():
+            return
+        for row in list(self.spoken):
+            if row[0] == key:
+                self.spoken.remove(row)
+                break
+        self.spoken.append((key, text, time.monotonic()))
+
+    def transcript_is_echo(self, text):
+        words = self.normalized_words(text)
+        if not words:
+            return False
+        now = time.monotonic()
+        recent = [line for _, line, at in self.spoken
+                  if now - max(at, self.play_until, self.echo_estimate,
+                               max((c.playback_end for c in self.clients), default=0)) <= 10]
+        # Echo = a long CONTIGUOUS run of the assistant's own words. Bag-of-words overlap
+        # misfired on answers like "Yes, add them" to "...add them?" or "Cardinal." (10/23).
+        if len(words) < 3:
+            return False
+        for line in recent + ([" ".join(recent)] if len(recent) > 1 else []):
+            other = self.normalized_words(line)
+            m = SequenceMatcher(None, words, other, autojunk=False).find_longest_match(0, len(words), 0, len(other))
+            if m.size >= 3 and m.size >= .7 * len(words):
+                return True
+        return False
 
     def state_payload(self):
         return {"type": "state", "listening": self.mic_on,
@@ -507,7 +583,9 @@ class Session:
 
     def config(self, phase):
         return {"output_modalities": ["text" if phase == "route" else "audio"],
-                "instructions": ROUTING if phase == "route" else ANSWER,
+                "instructions": (ROUTING + "\nCurrent pending BirdNET suggestions (unconfirmed; latest turn only): "
+                                 + json.dumps([r["en"] for r in self.suggestions.values()])
+                                 if phase == "route" else ANSWER),
                 "tools": TOOLS if phase == "route" else [],
                 "tool_choice": "required" if phase == "route" else "none"}
 
@@ -565,6 +643,42 @@ class Session:
         await self.rt_send({"type": "conversation.item.create", "item": {"type": "message", "role": "user",
                             "content": [{"type": "input_text", "text": text}]}})
 
+    def suggestions_payload(self):
+        return {"type": "suggestions", "items": [
+            {k: r[k] for k in ("sci", "en", "photo", "conf", "t")}
+            for r in sorted(self.suggestions.values(), key=lambda r: -r["conf"])]}
+
+    async def broadcast_suggestions(self):
+        await self.phone_json(self.suggestions_payload())
+
+    async def suggestion_tick(self, now=None):
+        now = time.monotonic() if now is None else now
+        expired = [sci for sci, r in self.suggestions.items()
+                   if (r["prompt_at"] is not None and now - r["prompt_at"] >= SUGGEST_TTL)
+                   or (r["prompt_at"] is None and now - r["last_heard"] > SUGGEST_STALE)
+                   or any(i["sci"] == sci for i in self.items)]
+        for sci in expired:
+            del self.suggestions[sci]
+        if expired:
+            await self.broadcast_suggestions()
+        fresh = [r for r in self.suggestions.values() if r["prompt_at"] is None]
+        if (fresh and now - min(r["buffered_at"] for r in fresh) >= SUGGEST_DEBOUNCE
+                and now - self.last_proactive >= SUGGEST_INTERVAL
+                and not any(p[0] == "notify" for p in self.pending)):
+            self.pending.append(("notify", None, None))
+        if self.pending:
+            self.work_ready.set()
+
+    async def suggestion_loop(self):
+        while not self.closed:
+            await self.suggestion_tick()
+            await asyncio.sleep(.2)
+
+    def suggestion_batch(self):
+        now = time.monotonic()
+        return sorted((r for r in self.suggestions.values() if r["prompt_at"] is None
+                       and now - r["last_heard"] <= SUGGEST_STALE), key=lambda r: -r["conf"])
+
     async def flush_pending(self):
         self.work_ready.set()
 
@@ -591,20 +705,33 @@ class Session:
                     self.pending[0] = (kind, value, stopped)
                     self.log("turns_merged", n=len(parts))
             self.turn_stale = stopped is not None and time.monotonic() - stopped > 12
-            if kind == "notify" and (self.awaiting_transcript or not self.may_speak()
-                                     or time.monotonic() < self.play_until):
+            if kind == "notify" and (self.awaiting_transcript or self.quiet
+                                     or time.monotonic() < self.play_until
+                                     or time.monotonic() - self.last_proactive < SUGGEST_INTERVAL):
                 continue
             self.pending.popleft()
-            if kind == "notify" and any(r["sci"] == value["sci"] for r in self.items):
-                self.work_ready.set()
-                continue
+            if kind == "notify":
+                batch = self.suggestion_batch()
+                if not batch:
+                    self.work_ready.set()
+                    continue
             self.active = True
             self.turn_stopped_at = stopped
             try:
                 if kind == "vision":
                     await self.answer_vision(value)
                 elif kind == "notify":
-                    await self.inject("[NOTIFY] BirdNET heard " + value["en"])
+                    self.proactive_turn = True
+                    self.last_proactive = time.monotonic()
+                    for r in batch:
+                        r["prompt_at"] = self.last_proactive
+                    spoken = ", ".join(f"{r['en']} ({r['conf']:.2f})" for r in batch[:3])
+                    extra = f" Say 'and {len(batch) - 3} more on screen'." if len(batch) > 3 else ""
+                    await self.inject("[NOTIFY] BirdNET heard: " + spoken
+                                      + ". Ask briefly in one short sentence, first person, e.g. 'I'm hearing a Northern Cardinal and an American Robin, add them?'. Don't mention BirdNET. List at most 3."
+                                      + extra + " Do not speak confidence scores. Do not log anything.")
+                    self.log("suggestion_prompt", species=[r["sci"] for r in batch],
+                             buffered_ms=round((self.last_proactive - min(r["buffered_at"] for r in batch)) * 1000))
                     await self.generate("answer")
                 else:
                     if kind == "text":
@@ -617,6 +744,7 @@ class Session:
                 self.log("turn_failed", error_type=type(exc).__name__)
                 await self.error("Turn failed; please try again.")
             finally:
+                self.proactive_turn = False
                 self.active = False
                 self.transcripts.clear()
                 await self.state()
@@ -643,7 +771,7 @@ class Session:
         except Exception as exc:
             self.log("tool_failed", name=name, error_type=type(exc).__name__)
             result = {"ok": False, "error": "External service unavailable; try again"}
-        if name in ("add_observation", "set_count", "remove_observation", "confirm_observation"):
+        if name in WRITE_TOOLS:
             await self.broadcast_checklist()
             if result.get("ok"):
                 await self.phone_json({"type": "earcon", "kind": "logged"})
@@ -754,6 +882,9 @@ class Session:
                         waiter.set_exception(RuntimeError("Realtime request rejected"))
                 await self.error("Realtime request failed (" + str(code)[:100] + ").")
         elif ty == "input_audio_buffer.speech_started":
+            if self.echo_blocked():
+                self.log("vad_ignored", reason="assistant_playback")
+                return
             self.input_revision += 1
             self.user_speaking = True
             self.awaiting_transcript = True
@@ -774,6 +905,11 @@ class Session:
             # With create_response=false the server never commits the buffer, so STT
             # re-transcribes everything since session start. Clear it per turn (tested 10/23).
             await self.rt_send({"type": "input_audio_buffer.clear"})
+            self.user_speaking = False
+            if self.transcript_is_echo(text):
+                self.log("echo_dropped", text=text)
+                await self.flush_pending()
+                return
             await self.phone_json({"type": "transcript", "role": "user", "text": text, "final": True})
             self.log("user_transcript", text=text)
             if text.strip():
@@ -792,12 +928,19 @@ class Session:
                 return
             pcm = base64.b64decode(event["delta"])
             was_speaking = time.monotonic() < self.play_until
+            # Close the gate BEFORE sending audio: mic ingestion runs concurrently.
+            self.play_until = max(time.monotonic(), self.play_until) + len(pcm) / 48000
+            self.echo_estimate = self.play_until
+            if not self.first_audio:
+                for client in self.playback_clients():
+                    client.playback_end = 0.0
             await self.phone_audio(pcm)
             self.total_audio_out += len(pcm)
             if not self.first_audio:
                 self.first_audio = True
+                if self.proactive_turn:
+                    self.last_proactive = time.monotonic()
                 self.latency("first_audio")
-            self.play_until = max(time.monotonic(), self.play_until) + len(pcm) / 48000
             if not was_speaking:
                 await self.state()
             if self.playback_task is None or self.playback_task.done():
@@ -807,9 +950,13 @@ class Session:
                 return
             key = (rid, event.get("item_id", ""), "text" if "output_text" in ty else "audio")
             self.transcripts[key] = self.transcripts.get(key, "") + event.get("delta", "")
+            if "output_text" not in ty:
+                self.remember_spoken(key, self.transcripts[key])
             await self.phone_json({"type": "transcript", "role": "assistant", "text": self.transcripts[key], "final": False})
         elif ty in ("response.output_audio_transcript.done", "response.audio_transcript.done", "response.output_text.done"):
             if rid not in self.cancelled_ids and self.audio_allowed:
+                if "output_text" not in ty:
+                    self.remember_spoken((rid, event.get("item_id", ""), "audio"), event.get("transcript", ""))
                 await self.phone_json({"type": "transcript", "role": "assistant",
                                        "text": event.get("transcript", event.get("text", "")), "final": True})
         elif ty == "response.done":
@@ -827,6 +974,27 @@ class Session:
         if taxon:
             return next((r["id"] for r in self.items if r["sci"] == taxon["sci"]), None)
         return None
+
+    async def log_taxon(self, taxon, count, notes, source="voice"):
+        """Write confirmed evidence; checklist rows remain derived observations."""
+        group = taxon.get("group") or "Aves"
+        active = self.observations.get(self.focus)
+        # Confirming background sound must not discard an open camera focus.
+        if source == "birdnet" and active and active.status == "open":
+            obs = Observation("ob" + uuid.uuid4().hex[:10], lat=self.lat, lng=self.lng, group=group)
+            self.observations[obs.id] = obs
+        else:
+            obs = await self.new_focus(group)
+        candidate = {k: taxon.get(k, "") for k in ("sci", "en", "zh", "photo")}
+        candidate["p"] = float(taxon.get("conf", 1)) if source == "birdnet" else 1.0
+        obs.detections.append(Detection("d" + uuid.uuid4().hex[:12],
+            "sound" if source == "birdnet" else "description", now_iso(), [candidate],
+            text=None if source == "birdnet" else candidate["en"]))
+        # Explicit confirmation is never removed by the local-range filter.
+        obs.fused, obs.uncertain = fuse(obs.detections)
+        obs.count, obs.notes, obs.status = count, notes, "confirmed"
+        await self.broadcast_observation(obs)
+        return next(dict(r) for r in self.items if r["sci"] == taxon["sci"])
 
     async def tool(self, name, args):
         if name == "look":
@@ -888,22 +1056,61 @@ class Session:
             if not cached or time.monotonic() - cached[0] > 300:
                 self.nearby_cache[key] = (time.monotonic(), await asyncio.to_thread(nearby, self.lat, self.lng, group))
             return self.nearby_cache[key][1]
-        if name == "add_observation":
-            count = valid_count(args.get("count", 1))
-            group = args.get("group", "Aves")
-            if group not in GROUPS:
-                raise ValueError("invalid iconic group")
-            taxon = await asyncio.to_thread(resolve, str(args["name"]), group)
-            if not taxon:
-                return {"ok": False, "error": "No matching taxon in that iconic group"}
-            obs = await self.new_focus(group)
-            obs.detections.append(Detection("d" + uuid.uuid4().hex[:12], "description", now_iso(),
-                                             [{**taxon, "p": 1.0}], text=str(args["name"])))
-            # Explicit user sightings are not erased by a bird range filter.
-            obs.fused, obs.uncertain = fuse(obs.detections)
-            obs.count, obs.notes, obs.status = count, str(args.get("notes", "")), "confirmed"
-            await self.broadcast_observation(obs)
-            return {"ok": True, "observation": obs.payload()}
+        if name in ("accept_suggestions", "dismiss_suggestions"):
+            await self.suggestion_tick()
+            species = args.get("species") or []
+            if not isinstance(species, list) or any(not isinstance(n, str) for n in species):
+                raise ValueError("species must be an array of names")
+            selected = list(self.suggestions.values()) if not species else []
+            for n in species:
+                needle = n.strip().casefold()
+                matches = [r for r in self.suggestions.values()
+                           if needle in (r["sci"].casefold(), r["en"].casefold())]
+                if not matches:
+                    # Allow common short forms such as 'cardinal', only if unambiguous.
+                    matches = [r for r in self.suggestions.values() if needle and needle in r["en"].casefold()]
+                if len(matches) != 1:
+                    raise ValueError("Unknown or ambiguous pending suggestion: " + n)
+                if matches[0] not in selected:
+                    selected.append(matches[0])
+            if not selected:
+                return {"ok": False, "error": "No pending suggestions"}
+            counts = args.get("counts") or {}
+            if not isinstance(counts, dict):
+                raise ValueError("counts must be an object")
+            prepared = []
+            for r in selected:
+                count = valid_count(next((v for k, v in counts.items() if k.casefold() in
+                                          (r["sci"].casefold(), r["en"].casefold())), 1))
+                prepared.append((r, count, ""))
+            async with self.item_lock:
+                rows = [await self.log_taxon(r, count, notes, "birdnet") for r, count, notes in prepared] if name == "accept_suggestions" else []
+                for r in selected:
+                    self.suggestions.pop(r["sci"], None)
+            await self.broadcast_suggestions()
+            return {"ok": True, "items": rows}
+        if name in ("add_observation", "add_observations"):
+            entries = [args] if name == "add_observation" else args.get("items")
+            if not isinstance(entries, list) or not entries or len(entries) > 100:
+                raise ValueError("items must contain 1–100 observations")
+            prepared = []
+            for entry in entries:
+                count = valid_count(entry.get("count", 1))
+                group = entry.get("group", "Aves")
+                if group not in GROUPS:
+                    raise ValueError("invalid iconic group")
+                taxon = await asyncio.to_thread(resolve, str(entry["name"]), group)
+                if not taxon:
+                    return {"ok": False, "error": "No matching taxon in that iconic group"}
+                prepared.append((taxon, count, str(entry.get("notes", ""))))
+            async with self.item_lock:
+                rows = [await self.log_taxon(taxon, count, notes) for taxon, count, notes in prepared]
+                for taxon, _, _ in prepared:
+                    self.suggestions.pop(taxon["sci"], None)
+            if any(taxon["sci"] in self.notified for taxon, _, _ in prepared):
+                await self.broadcast_suggestions()
+            return {"ok": True, "items": rows, "item": rows[0],
+                    "observation": self.observations[self.focus].payload()}
         if name in ("remove_observation", "set_count"):
             count = valid_count(args.get("count")) if name == "set_count" else None
             item_id = await self.find_item(args["name"])
@@ -992,10 +1199,19 @@ class Session:
                     hits.popleft()
                 if confidence >= 0.5 and (not hits or hits[-1] != end):
                     hits.append(end)
-                if len(hits) >= 2 and sci not in self.notified and not any(r["sci"] == sci for r in self.items):
+                now = time.monotonic()
+                if sci in self.suggestions:
+                    r = self.suggestions[sci]
+                    r.update(conf=max(r["conf"], confidence), last_heard=now, t=heard["t"])
+                    await self.broadcast_suggestions()
+                elif confidence >= .5 and len(hits) >= 2 and sci not in self.notified and not any(r["sci"] == sci for r in self.items):
                     self.notified.add(sci)
-                    self.pending.append(("notify", names, None))
-                    self.log("notify_queued", sci=sci, windows=len(hits))
+                    best = max((h["conf"] for t, h in self.history if t >= now - 10 and h["sci"] == sci), default=confidence)
+                    self.suggestions[sci] = {**names, "conf": best, "t": heard["t"],
+                        "first_heard": now - (end - hits[0]) / SR, "last_heard": now,
+                        "buffered_at": now, "prompt_at": None}
+                    await self.broadcast_suggestions()
+                    self.log("suggestion_buffered", sci=sci, windows=len(hits))
             if sound_candidates:
                 stamp = time.monotonic() - max(0, (self.position - end) / SR) - 1.5
                 detection = Detection("d" + uuid.uuid4().hex[:12], "sound", now_iso(),
@@ -1022,9 +1238,12 @@ class Session:
         n = len(frame)
         pos = self.position % len(self.ring)
         first = min(n, len(self.ring) - pos)
+        contaminated = self.speaker_mode and self.echo_blocked()
+        self.echo_ring[pos:pos + first] = contaminated
         self.ring[pos:pos + first] = frame[:first]
         if first < n:
             self.ring[:n - first] = frame[first:]
+            self.echo_ring[:n - first] = contaminated
         self.position += n
         self.total_audio_in += len(raw)
         # Stateful 63-tap anti-alias filter, ~0.65 ms delay; phase survives odd-length packets.
@@ -1037,7 +1256,10 @@ class Session:
                 self.log("audio_queue_drop")
             self.audio_queue.put_nowait(pcm)
         while self.position >= self.next_window:
-            if self.bird_task is None or self.bird_task.done():
+            indices = np.arange(self.next_window - 3 * SR, self.next_window) % len(self.ring)
+            if self.echo_ring[indices].any():
+                self.log("bird_window_skipped", reason="assistant_playback", stream_s=round(self.next_window / SR, 2))
+            elif self.bird_task is None or self.bird_task.done():
                 end = self.next_window
                 samples = self.ring[np.arange(end - 3 * SR, end) % len(self.ring)].copy()
                 self.bird_task = asyncio.create_task(self.bird_window(samples, end))
@@ -1046,7 +1268,7 @@ class Session:
             self.next_window += int(1.5 * SR)
 
     def echo_blocked(self):
-        return self.echo_guard and time.monotonic() < self.play_until + 0.3
+        return self.echo_guard and time.monotonic() < self.echo_deadline()
 
     async def audio_sender(self):
         while True:
@@ -1059,8 +1281,30 @@ class Session:
             finally:
                 self.audio_queue.task_done()
 
-    async def handle_phone(self, event):
+    async def handle_phone(self, event, client=None):
+        client = client or self.mic or next((c for c in self.clients if c.role == "mic"), None)
         ty = event.get("type")
+        if ty == "audio_mode" or (ty == "hello" and "earphones" in event):
+            if not isinstance(event.get("earphones"), bool):
+                raise ValueError("earphones must be boolean")
+            if client is None or client.role != "mic":
+                raise ValueError("Only the microphone can set audio_mode")
+            client.earphones = event["earphones"]
+            self.log("audio_mode", earphones=client.earphones)
+            if ty == "audio_mode":
+                await self.state()
+                return
+        if ty == "playback":
+            if not isinstance(event.get("active"), bool):
+                raise ValueError("playback.active must be boolean")
+            if client is None or (client.role == "display" and not client.audio):
+                raise ValueError("Client has no audio output")
+            client.playback_active = event["active"]
+            if not client.playback_active:
+                client.playback_end = time.monotonic()
+            self.log("playback", active=client.playback_active, role=client.role)
+            await self.state()
+            return
         if ty == "hello":
             if event.get("lat") is not None and event.get("lng") is not None:
                 lat, lng = float(event["lat"]), float(event["lng"])
@@ -1070,6 +1314,16 @@ class Session:
             self.lang = str(event.get("lang", "en"))[:32]
             await self.state()
             await self.phone_json({"type": "checklist", "items": [dict(r) for r in self.items]})
+            await self.broadcast_suggestions()
+        elif ty == "suggestion_action":
+            action = event.get("action")
+            if action not in ("accept", "dismiss"):
+                raise ValueError("Invalid suggestion action")
+            result = await self.tool(action + "_suggestions", {"species": [event["sci"]]})
+            if not result.get("ok"):
+                raise ValueError(result["error"])
+            await self.broadcast_checklist()
+            await self.phone_json({"type": "earcon", "kind": "logged"})
         elif ty == "mic":
             if not isinstance(event.get("on"), bool):
                 raise ValueError("mic.on must be boolean")
@@ -1150,7 +1404,8 @@ class Session:
     def start(self):
         self.tasks = [asyncio.create_task(self.realtime_loop()),
                       asyncio.create_task(self.audio_sender()), asyncio.create_task(self.turn_worker()),
-                      asyncio.create_task(self.focus_watch())]
+                      asyncio.create_task(self.focus_watch()),
+                      asyncio.create_task(self.suggestion_loop())]
 
     async def close(self):
         self.closed = True
@@ -1171,6 +1426,9 @@ class Client:
     def __init__(self, phone, session, role="mic", audio=False):
         self.phone, self.session, self.role, self.audio = phone, session, role, audio
         self.lock = asyncio.Lock()
+        self.earphones = False
+        self.playback_active = False
+        self.playback_end = 0.0
 
     async def send_json(self, event):
         async with self.lock:
@@ -1202,6 +1460,7 @@ class Client:
             await self.send_json({"type": "checklist", "items": [dict(r) for r in s.items]})
             for obs in list(s.observations.values()):
                 await self.send_json({"type": "observation", **obs.payload(), "focus": s.focus == obs.id})
+            await self.send_json(s.suggestions_payload())
             while True:
                 packet = await self.phone.receive()
                 if packet["type"] == "websocket.disconnect":
@@ -1216,13 +1475,13 @@ class Client:
                         event = json.loads(packet["text"])
                         if not isinstance(event, dict):
                             raise ValueError("JSON message must be an object")
-                        if self.role == "display" and event.get("type") not in ("hello", "text", "edit", "delete", "tap", "look", "observation_action"):
+                        if self.role == "display" and event.get("type") not in ("hello", "text", "edit", "delete", "tap", "suggestion_action", "playback", "look", "observation_action"):
                             raise ValueError("Display cannot control microphone or mode")
                         if event.get("type") == "hello" and self.role == "display":
                             await self.send_json(s.state_payload())
                             await self.send_json({"type": "checklist", "items": [dict(r) for r in s.items]})
                         else:
-                            await s.handle_phone(event)
+                            await s.handle_phone(event, self)
                 except (ValueError, KeyError, TypeError) as exc:
                     await s.error(str(exc)[:180])
                 except Exception as exc:

@@ -288,6 +288,22 @@ class ExpertSessionTests(unittest.IsolatedAsyncioTestCase):
         await self.route("ask_expert", {"question": "What is it?"})
         self.c.generate.assert_not_awaited()
 
+    async def test_speaker_echo_keeps_expert_context_but_real_barge_in_invalidates(self):
+        client = s.Client(SimpleNamespace(send_json=AsyncMock()), self.c)
+        self.c.clients.add(client)
+        self.c.mic = client
+        for earphones in (False, True):
+            client.earphones = earphones
+            self.c.play_until = s.time.monotonic() + 2
+            self.c.user_speaking = self.c.awaiting_transcript = False
+            async def incoming_audio(*args):
+                await self.c.handle_rt({"type": "input_audio_buffer.speech_started"})
+                return {"ok": True, "status": "completed", **decision()}
+            self.c.expert.answer.side_effect = incoming_audio
+            result = await self.c.tool("ask_expert", {"question": "What is it?"})
+            self.assertEqual(bool(result.get("suppress_answer")), earphones)
+            self.assertEqual(self.c.user_speaking, earphones)
+
     async def test_simple_checklist_and_count_paths_never_call_expert(self):
         self.obs.status, self.obs.count = "confirmed", 2
         await self.route("get_checklist")

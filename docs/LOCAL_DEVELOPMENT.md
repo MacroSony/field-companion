@@ -111,12 +111,17 @@ Start with a fresh mock process and browser profile for each full browser run.
 The unmodified test copy puts its screenshots and JSON results in ignored
 `out/local-checks/`, preserving the committed reference screenshots in `web/`.
 
-The separate `backend/selftest.py` exercises real Boson TTS/Realtime calls.
-It requires a valid key, network access, and a running backend; it is not part
-of the credential-free tests above.
+The separate `backend/selftest.py` now includes photo-look/confirmation and optional
+chorus tests. It requires a valid Boson key, network access and the prototype's
+photo/recording fixtures, which currently use `/data/build/birding-demo` paths.
+Those fixture paths need adapting before running that live test on Windows.
+It is not part of the credential-free tests above. Both `--serve` and `--chorus`
+remain available after integration.
 
 ```powershell
-.\.venv\Scripts\python.exe -X utf8 -B backend/selftest.py --url ws://127.0.0.1:8791/ws
+.\.venv\Scripts\python.exe -X utf8 -B backend/selftest.py --help
+# Portable, opt-in GPT check with synthetic observation data (two API calls):
+.\.venv\Scripts\python.exe -X utf8 -B backend/expert_smoke.py --live
 ```
 
 Use UTF-8 mode for this test on Windows because it reads the UTF-8 probe source.
