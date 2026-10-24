@@ -14,6 +14,12 @@ The phone uses the existing v0.2 `capture`, `observation`, `/api/frame` and
    three frames ~400 ms apart, selects the sharpest within the selected region,
    and uploads one JPEG. The long side is at most 1920 pixels. Crop coordinates
    refer to the already digitally zoomed JPEG, matching the preview.
+
+Voice requests first play a short "Let me take a look." / "好的，我看一下。" before
+the slow lookup and capture request, with the camera either closed or open.
+This uses bundled Higgs audio through the normal playback queue; it adds no
+runtime synthesis request. Quiet and interruption rules still apply. Button
+requests retain the visible photo-capture progress without an extra spoken line.
 4. The **Current observation** card shows up to three ranked candidates, the last
    six evidence items and any expert hint. Rankings are uncalibrated scores.
    **Look again** adds evidence to the same focus. **New subject** closes an open,

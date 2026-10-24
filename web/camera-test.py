@@ -52,6 +52,10 @@ def serve(port):
         async def generate(self, phase, *, guard=None):
             if guard is not None and not guard():
                 return {"status": "deferred"}
+            if phase == "route" and self.turn_question == "What is that?":
+                return {"status": "completed", "output": [{"type": "function_call",
+                    "name": "look", "call_id": "fixture-look-" + uuid.uuid4().hex,
+                    "arguments": "{}"}]}
             if phase == "answer" and self.expert_readout:
                 await self.phone_json({"type": "transcript", "role": "assistant",
                                        "text": self.expert_readout, "final": True})
@@ -66,7 +70,10 @@ def serve(port):
         async def handle_phone(self, event, client=None):
             text = event.get("text", "")
             if event.get("type") == "text" and text.startswith("fixture:"):
-                if text == "fixture:finish":
+                if text == "fixture:voice-look":
+                    await self.handle_rt({"type": "conversation.item.input_audio_transcription.completed",
+                        "transcript": "What is that?", "item_id": "voice-" + uuid.uuid4().hex})
+                elif text == "fixture:finish":
                     self.research_release.set()
                 elif text == "fixture:checklist":
                     await self.phone_json({"type": "transcript", "role": "assistant",
@@ -261,14 +268,29 @@ async def test(port, cdp):
         await js("window.__failUpload=false; document.getElementById('camera-toggle').click()")
         assert await js("window.__streams.filter(s=>s.getVideoTracks().length).every(s=>s.getTracks().every(t=>t.readyState==='ended'))")
         assert await js("window.__streams[0].getAudioTracks()[0].readyState === 'live'")
-        # Spoken Look requests open the camera and capture without a shutter click.
-        await js("window.__sockets[0].send(JSON.stringify({type:'look'}))")
+        # A completed voice transcript routes to Look and emits feedback BEFORE
+        # capture, both with the camera closed and with an existing preview.
+        before_voice = len(events)
+        await js("window.__sockets[0].send(JSON.stringify({type:'text',text:'fixture:voice-look'}))")
         await until("document.querySelectorAll('#observation-evidence img').length === 1 && !document.getElementById('camera-shutter').disabled")
+        def feedback_before_capture(start):
+            messages = [json.loads(e["params"]["response"]["payloadData"]) for e in events[start:]
+                        if e.get("method") == "Network.webSocketFrameReceived" and e["params"]["response"]["opcode"] == 1]
+            feedback = next(i for i, e in enumerate(messages) if e.get("text") == "Let me take a look.")
+            capture = next(i for i, e in enumerate(messages) if e.get("type") == "capture")
+            assert feedback < capture
+            assert any(e.get("type") == "audio_end" and e["id"].startswith("feedback-") for e in messages[:capture])
+        feedback_before_capture(before_voice)
+        before_voice = len(events)
+        await js("window.__sockets[0].send(JSON.stringify({type:'text',text:'fixture:voice-look'}))")
+        await until("document.querySelectorAll('#observation-evidence img').length === 2 && !document.getElementById('camera-shutter').disabled")
+        feedback_before_capture(before_voice)
+        results["voiceFeedbackBeforeCaptureWithCameraClosedAndOpen"] = True
         await js("Object.defineProperty(document,'hidden',{configurable:true,value:true}); document.dispatchEvent(new Event('visibilitychange'))")
         assert await js("window.__streams.filter(s=>s.getVideoTracks().length).every(s=>s.getTracks().every(t=>t.readyState==='ended'))")
         assert await js("window.__streams[0].getAudioTracks()[0].readyState === 'live'")
-        await js("delete document.hidden; window.__sockets[0].send(JSON.stringify({type:'look'}))")
-        await until("document.querySelectorAll('#observation-evidence img').length === 2 && !document.getElementById('camera-shutter').disabled")
+        await js("delete document.hidden; window.__sockets[0].send(JSON.stringify({type:'text',text:'fixture:voice-look'}))")
+        await until("document.querySelectorAll('#observation-evidence img').length === 3 && !document.getElementById('camera-shutter').disabled")
         results["backgroundStopsCameraOnly"] = True
         await js("document.getElementById('stop').click()")
         await until("window.__streams.every(s=>s.getTracks().every(t=>t.readyState==='ended'))")

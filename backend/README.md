@@ -3,6 +3,31 @@
 The optional [GPT Naturalist expert path](../docs/EXPERT.md) handles complex
 comparisons and species-fact follow-ups without changing the logging fast path.
 
+## Feedback before slow tools (2026-10-24)
+
+Voice-routed Look/new-subject requests say "Let me take a look." / "好的，我看一下。"
+before range lookup and the camera capture request. Nearby-species and description
+lookups use "Let me check." / "好的，我查一下。" These short Higgs-generated recordings
+are bundled in `backend/audio/` and cached locally: runtime feedback does not wait
+for another model/synthesis request. Regenerate only explicitly with
+`python -B backend/tool_feedback.py --generate`, using the existing Boson key.
+
+Feedback uses the normal PCM playback queue, start/end IDs and drained reports.
+Quiet, user speech, pending playback, stop and stale input suppress it. Guarding
+inside the client send lock prevents cancelled feedback from leaking after flush.
+Logging and fast checklist/status reads have no extra preamble; expert questions
+retain their single "Investigation R1 is scheduled." confirmation. The Identify
+button retains its existing on-screen capture feedback.
+
+Validation: 127 offline tests and both isolated browser suites passed. The camera
+fixture feeds a completed voice transcript through the routing worker and checks
+feedback before capture with both closed and open previews. Real Higgs routing of
+two fixed English/Chinese text questions also sent feedback before a held fixture
+tool: first PCM at 532 / 391 ms (two samples, no physical playback). No GPT calls
+or photo uploads were made in that live check. Evidence: ignored
+`out/tool-feedback-checks/live-results.json` and `out/merge-checks/`.
+Current build: `2026-10-24-tool-feedback`.
+
 ## Current round-two integration (2026-10-24)
 
 `fix/round2` is integrated with the background investigation queue. Failed route

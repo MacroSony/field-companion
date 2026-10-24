@@ -30,6 +30,7 @@ from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from expert import NaturalistExpert, revision as expert_revision
 from investigations import ACTIVE, InvestigationQueue, QueueFull
+from tool_feedback import TOOLS as FEEDBACK_TOOLS, recording as feedback_recording
 
 MODEL = "higgs-realtime-1.5-preview"
 SR = 48000
@@ -752,9 +753,50 @@ class Session:
     async def phone_json(self, event):
         await asyncio.gather(*(c.send_json(event) for c in list(self.clients)), return_exceptions=True)
 
-    async def phone_audio(self, pcm):
-        await asyncio.gather(*(c.send_audio(pcm) for c in list(self.clients)
+    async def phone_audio(self, pcm, *, guard=None):
+        await asyncio.gather(*(c.send_audio(pcm, guard=guard) for c in list(self.clients)
                                if c.role == "mic" or c.audio), return_exceptions=True)
+
+    async def acknowledge_tool(self, name):
+        """Send a cached short phrase before a slow tool, through the PCM queue."""
+        kind = FEEDBACK_TOOLS.get(name)
+        revision = self.input_revision
+        def current():
+            return (not self.closed and self.connected and self.may_speak()
+                    and not self.auto_speech_paused and not self.user_speaking
+                    and not self.awaiting_transcript and self.input_revision == revision)
+        if not kind or not current() or self.playback_pending() or time.monotonic() < self.play_until:
+            return
+        language = "zh" if self.chinese(self.turn_question) or (not self.turn_question and self.lang.startswith("zh")) else "en"
+        try:
+            text, pcm = feedback_recording(kind, language)
+        except (OSError, ValueError) as exc:
+            self.log("tool_feedback_unavailable", error_type=type(exc).__name__)
+            return  # Feedback failure must not prevent the requested tool.
+        if not current():
+            return
+        playback_id = "feedback-" + uuid.uuid4().hex
+        await self.begin_audio(playback_id)
+        def audible():
+            return current() and self.audio_playback_id == playback_id
+        if not audible():
+            if self.audio_playback_id == playback_id:
+                await self.flush_audio()
+            return
+        self.play_until = max(time.monotonic(), self.play_until) + len(pcm) / 48000
+        self.echo_estimate = self.play_until
+        self.remember_spoken((playback_id, "feedback"), text)
+        await self.phone_json({"type": "transcript", "role": "assistant", "text": text, "final": True})
+        await self.phone_audio(pcm, guard=audible)
+        if audible():
+            self.total_audio_out += len(pcm)
+            await self.end_audio()
+            self.latency("tool_feedback")
+        elif self.audio_playback_id == playback_id:
+            await self.flush_audio()
+        if self.playback_task is None or self.playback_task.done():
+            self.playback_task = asyncio.create_task(self.playback_finished())
+        await self.state()
 
     @property
     def speaker_mode(self):
@@ -1220,6 +1262,7 @@ class Session:
         name = call["name"]
         try:
             args = json.loads(call.get("arguments") or "{}")
+            await self.acknowledge_tool(name)
             self.tools_executed = True
             result = {"ok": True} if name == "ignore" else (
                 {"ready_to_answer": True, "reason": args.get("reason")} if name == "speak"
@@ -2097,9 +2140,10 @@ class Client:
         async with self.lock:
             await self.phone.send_json(event)
 
-    async def send_audio(self, pcm):
+    async def send_audio(self, pcm, *, guard=None):
         async with self.lock:
-            await self.phone.send_bytes(pcm)
+            if guard is None or guard():
+                await self.phone.send_bytes(pcm)
 
     async def run(self):
         s = self.session

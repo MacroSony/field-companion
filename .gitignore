@@ -2,6 +2,10 @@
 __pycache__/
 out/
 *.wav
+!backend/audio/look-en.wav
+!backend/audio/look-zh.wav
+!backend/audio/check-en.wav
+!backend/audio/check-zh.wav
 *.pcm
 *.src
 .env
