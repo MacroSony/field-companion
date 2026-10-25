@@ -1,6 +1,7 @@
 param(
     [ValidateRange(1,65535)][int]$Port = 8805,
-    [ValidateRange(1,65535)][int]$BirdPort = 8811
+    [ValidateRange(1,65535)][int]$BirdPort = 8811,
+    [switch]$SkipVision
 )
 $ErrorActionPreference = 'Stop'
 $livekitRoot = Split-Path -Parent $PSScriptRoot
@@ -12,6 +13,33 @@ foreach ($livekitPath in @($livekitPython,$livekitBirdPython)) {
 foreach ($livekitPort in @($Port,$BirdPort)) {
     if (Get-NetTCPConnection -LocalPort $livekitPort -State Listen -ErrorAction SilentlyContinue) {
         throw "Port $livekitPort is already in use; existing services will not be replaced."
+    }
+}
+# Include the installed camera dependency when restoring a complete local app.
+# Reuse a healthy service; never stop or replace another listener.
+$livekitVisionPython = Join-Path $livekitRoot '.venv-vision\Scripts\python.exe'
+$livekitDefaultVision = -not $env:VISION_URL -or $env:VISION_URL.TrimEnd('/') -eq 'http://127.0.0.1:8795'
+if (-not $SkipVision -and $livekitDefaultVision) {
+    if (Test-Path -LiteralPath $livekitVisionPython) {
+        if (-not (Get-NetTCPConnection -LocalPort 8795 -State Listen -ErrorAction SilentlyContinue)) {
+            & (Join-Path $PSScriptRoot 'start_vision.ps1') -Background
+        }
+        Write-Output 'Waiting for BioCLIP model readiness...'
+        $livekitVisionDeadline = [DateTime]::UtcNow.AddMinutes(3)
+        $livekitVisionReady = $false
+        do {
+            try {
+                $livekitVisionHealth = Invoke-RestMethod -Uri 'http://127.0.0.1:8795/health' -TimeoutSec 2
+                $livekitVisionReady = $livekitVisionHealth.loaded -and $livekitVisionHealth.model -eq 'imageomics/bioclip-2'
+            } catch { $livekitVisionReady = $false }
+            if (-not $livekitVisionReady) { Start-Sleep -Seconds 2 }
+        } while (-not $livekitVisionReady -and [DateTime]::UtcNow -lt $livekitVisionDeadline)
+        if (-not $livekitVisionReady) {
+            throw 'BioCLIP is not ready. Check out/vision-service/, or use -SkipVision for a voice-only session.'
+        }
+        Write-Output 'Photo identification: BioCLIP ready.'
+    } else {
+        Write-Warning 'Photo identification is unavailable: install .venv-vision as described in docs/LOCAL_DEVELOPMENT.md.'
     }
 }
 $livekitLogs = Join-Path $livekitRoot 'out\livekit'

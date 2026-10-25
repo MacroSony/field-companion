@@ -24,6 +24,13 @@ configuration. The launcher starts:
 - the application on `http://localhost:8805` using `.venv-livekit`;
 - a private, authenticated BirdNET worker on `127.0.0.1:8811` using `.venv`.
 
+If `.venv-vision` is installed, it also starts (or reuses) BioCLIP on
+`127.0.0.1:8795` and waits for model readiness before starting the voice app.
+Photo identification needs this separate service; microphone and photo upload
+can work even when the classifier is stopped. See the camera setup in
+[LOCAL_DEVELOPMENT.md](LOCAL_DEVELOPMENT.md). Use `-SkipVision` for a deliberate
+voice-only run. A custom `VISION_URL` leaves that service under your control.
+
 The launcher refuses to replace an existing listener. Logs and launcher PIDs are
 under ignored `out/livekit/`. The worker is loopback-only and does not have a
 public tunnel.
