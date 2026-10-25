@@ -64,7 +64,27 @@ The voice model receives a fresh compact task summary for routing. Tools:
   an explanation; only `explain=true` reads completed answers. Accepting a single
   offer targets the offered job even if newer tasks exist. Accepting a multiple
   offer without selecting a task asks which result to explain.
-- `manage_investigation(action, id?, selection?)`: cancel or retry.
+- `manage_investigation(action=cancel, id?, selection?)`: cancel. The phone's
+  existing task-card retry control also retains its explicit-ID API.
+- `retry_task(scope=auto, id?, selection?)`: the voice retry entry point for
+  both photo identification and expert investigations. An unqualified retry
+  uses the latest spoken failed-task reference, or the actual failed tasks;
+  it asks which one when ambiguous. Explicit task kind/ID/order take priority.
+  A photo retry prepares the same subject and waits for a new Start/Identify
+  before capturing. Expert retry keeps the original question, evidence and
+  origin. Running work and superseded failed ancestors are not duplicated.
+
+This resolver uses structured task state, not a list of retry phrases. Spoken
+failure/selection references expire after 45 seconds or when another assistant
+reply supersedes them. Unknown/stale IDs never fall back to a different task.
+
+Retry validation includes 21 offline state/action tests and 13 frozen real-GPT
+routing cases (all tool choices, arguments and silent route checks passed in the
+reviewed run). See [the routing report](benchmarks/task_retry_routing.json).
+The LiveKit application smoke also exercises a failed photo, natural retry,
+renewed camera readiness and a second Start using real GPT and framework audio;
+its classifier failure is simulated. These checks do not establish field speech
+accuracy or physical speaker echo performance.
 
 `selection` is `first`, `latest` or `all`. Explicit “first” refers to `R1`, not the
 next running task. Cancelling an already completed task cannot cancel a different

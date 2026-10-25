@@ -58,6 +58,12 @@ def status(scope="auto", **selector):
     return tuple(variants)
 
 
+def retry(scope='auto', **selector):
+    return choice('retry_task', scope={'$default':scope},
+                  id=selector.get('id', {'$absent':True}),
+                  selection=selector.get('selection', {'$absent':True}))
+
+
 def case(id, category, text, *expected, **kwargs):
     return Case(id, category, text, expected, **kwargs)
 
@@ -151,7 +157,27 @@ CASES = [
          choice("manage_investigation", action="cancel", selection="first"),
          choice("manage_investigation", action="cancel", id="R1"), state="research"),
     case("retry-id", "expert", "Try R1 again.",
-         choice("manage_investigation", action="retry", id="R1"), state="research-failed"),
+         retry(id='R1'), retry('investigations',id='R1'), state="research-failed"),
+    case('retry-photo-plain','retry','Retry.',retry(),state='photo-failed'),
+    case('retry-photo-observed','retry','Okay, I want to retry.',retry(),state='photo-failed'),
+    case('retry-photo-paraphrase','retry',"Let's give that another go.",retry(),state='photo-failed'),
+    case('retry-photo-zh','retry','再试一次',retry(),state='photo-failed'),
+    case('retry-photo-explicit','retry','Retry the photo identification.',retry('camera'),
+         retry('camera',id='photo:capture-1'),state='retry-mixed'),
+    case('retry-photo-spoken-offer','retry','Try again.',retry(),state='retry-photo-offer',
+         history=(('assistant','Photo identification could not finish; say Retry to prepare another photo.'),)),
+    case('retry-ambiguous','retry','Try again.',retry(),state='retry-mixed'),
+    case('retry-selection-photo','retry','The photo.',retry('camera'),retry(id='photo:capture-1'),
+         retry('camera',id='photo:capture-1'),state='retry-selection',history=(('assistant',
+         'Which task should I retry: investigation R1, investigation R2, photo identification?'),)),
+    case('retry-selection-expert','retry','R1.',retry(id='R1'),retry('investigations',id='R1'),
+         state='retry-selection',history=(('assistant',
+         'Which task should I retry: investigation R1, investigation R2, photo identification?'),)),
+    case('retry-photo-running','retry','Retry the photo identification.',retry('camera'),
+         retry('camera',id='photo:capture-1'),state='photo-running'),
+    case('retry-explicit-latest','retry','Retry the latest investigation.',
+         retry('investigations',selection='latest'),retry('investigations',id='R2'),retry(id='R2'),state='research-failed'),
+    case('retry-empty','retry','Retry.',retry(),state='empty'),
     case("log-while-research", "checklist", "Two mallards.", *log_mallards(2), state="research"),
     case("suggest-yes", "sounds", "Yes, add them all.",
          choice("accept_suggestions", species={"$all_pending": True}), state="suggestions",

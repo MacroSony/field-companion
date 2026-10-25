@@ -32,6 +32,7 @@ from expert import NaturalistExpert, revision as expert_revision
 from investigations import ACTIVE, InvestigationQueue, QueueFull
 from tool_feedback import TOOLS as FEEDBACK_TOOLS, recording as feedback_recording
 from route_safety import route_guard
+from task_retry import select_retry_tasks
 from realtime_provider import RealtimeConfig
 
 MODEL = "higgs-realtime-1.5-preview"
@@ -230,6 +231,10 @@ TOOLS = [
     tool_schema("get_observation", "Read the existing focus evidence/identification without taking a new photo. For progress use get_task_status; for species facts or comparisons use ask_expert."),
     tool_schema("get_task_status", "Read actual photo identification or expert investigation progress without restarting work or explaining results. Use for identification process, status, progress, is it done; select a task when ambiguous.",
                 {**TASK_SELECTOR, "scope": {"type": "string", "enum": ["auto", "camera", "investigations", "all"]}}),
+    tool_schema("retry_task", "Retry a photo identification OR an expert investigation using actual task state. For an unqualified retry use scope=auto and omit id/selection; backend resolves the latest spoken failure or asks which task. Use camera/investigations or an actual task id only when the user specifies it. Do not invent latest/all. Photo retry prepares the same subject and still waits for Start/Identify; running work is not duplicated.",
+                {"id": {"type":"string", "description":"Actual task ID when the user names/selects it; omit for a generic retry."},
+                 "selection": {"type":"string", "enum":["first","latest","all"], "description":"Preserve explicitly requested task order, including first or latest. Omit when no order was requested."},
+                 "scope": {"type":"string", "enum":["auto","camera","investigations","all"], "description":"Use camera for an explicit photo request, investigations for an explicit research/investigation request. Use auto ONLY when the user does not specify the task kind."}}),
     tool_schema("confirm_observation", "Add it / log it / two of them: confirm the focus, not a new named sighting. No speech.", {"count": COUNT, "notes": NAME}),
     tool_schema("discard_observation", "Discard the focus; do not log it."),
     tool_schema("new_observation", "Start identifying a new unknown organism, even when the user does not say new/another. Creates independent evidence and prepares a preview; waits for Start/Identify. Set group for nonbirds. Equivalent to look(target=new).", {"group": {"type": "string", "enum": GROUPS}}),
@@ -237,8 +242,8 @@ TOOLS = [
     tool_schema("ask_expert", "Start a background investigation about the current focus: comparisons, conflicting evidence, diet, habitat or behaviour. Returns immediately; never log.", {"question": NAME}, ("question",)),
     tool_schema("get_investigations", "Read investigations or explain a requested result. Prefer get_task_status for progress. Set explain=true ONLY when the user asks to hear/explain a result or accepts the latest explanation offer. Use id (R1 etc.) or first/latest/all.",
                 {**TASK_SELECTOR, "explain": {"type": "boolean"}}),
-    tool_schema("manage_investigation", "Cancel or retry an investigation. Retry uses its ORIGINAL question and evidence, even after changing focus. Use id or first/latest/all; default latest active for cancel.",
-                {**TASK_SELECTOR, "action": {"type": "string", "enum": ["cancel", "retry"]}}, ("action",)),
+    tool_schema("manage_investigation", "Cancel an expert investigation. Use id or first/latest/all; default latest active. ALL retries, including investigation retries, use retry_task.",
+                {**TASK_SELECTOR, "action": {"type": "string", "enum": ["cancel"]}}, ("action",)),
     tool_schema("accept_suggestions", "Accept pending suggestions only on explicit yes/yeah/sure or an intelligible add command. Never accept on lone Ah/Okay/Uh/Oh/Mm/Mm-hmm, questions, or a notification. Silent.",
                 {"species": SPECIES, "counts": {"type": "object", "additionalProperties": COUNT}}),
     tool_schema("dismiss_suggestions", "Decline pending suggestions. No = all; optional subset. Silent.", {"species": SPECIES}),
@@ -316,7 +321,19 @@ If several results were offered and no one is selected, ask which result to expl
 Completed investigations are only offered at a conversational pause; never read
 their findings without the user's request or acceptance.
 "Cancel the first investigation" / "取消第一个调查" uses manage_investigation(action=cancel).
-"Try R1 again" / "继续查第一个" uses manage_investigation(action=retry).
+ALL requests to retry/try again use retry_task, never manage_investigation or speak.
+For an unqualified retry omit id/selection and use scope=auto: the backend binds
+it to the latest spoken failed task or asks which task. Do not assume research,
+invent latest/all, or choose an ID when the user has not specified one.
+For an explicit photo retry use scope=camera; for an explicit investigation use
+scope=investigations. "Try R1 again" uses retry_task(id=R1).
+Preserve explicitly requested first/latest ordering and task kind in the retry
+arguments; auto is only for requests without a specified task kind.
+If the backend asks which task to retry, a short task-selection reply also uses
+retry_task with that real task ID/scope. Photo retry prepares the same subject
+and waits for Start/Identify; it never silently captures or logs a sighting.
+Retry routing emits only the function call. Do not add a textual preamble or
+promise to rerun anything: the backend result/camera confirmation owns speech.
 An explicit request to start another investigation uses ask_expert, not a status read.
 Never invent progress, percentages, results or completion times.
 For a newly encountered organism call new_observation or look(target=new), even if
@@ -442,6 +459,7 @@ class Session:
         self.expert_readout = None
         self.investigation_offer_ids = []
         self.task_status_offer = None
+        self.retry_offer = None
         self.first_audio = False
         self.audio_playback_id = None
         self.rt_lock = asyncio.Lock()
@@ -618,6 +636,9 @@ class Session:
                 await defer()
                 return
             response = await self.speak_expert(answer, guard=uninterrupted)
+            if response and response.get('status') == 'completed' and self.input_revision == revision:
+                self.remember_retry_offer({'answer': answer, 'tasks': [row for row in self.task_status_snapshot()
+                    if row['id'] in {item.id for item in batch}]})
             if response and response.get("status") == "deferred":
                 self.investigation_offer_ids = previous_offer
                 await defer()
@@ -660,7 +681,8 @@ class Session:
                         if job.status not in ACTIVE:
                             job.announced = True
                     await self.investigations.emit()
-            return {"ok": True, "answer": answer, "investigations": [
+            return {"ok": True, "answer": answer, "tasks": [row for row in self.task_status_snapshot()
+                    if row['id'] in {job.id for job in jobs}], "investigations": [
                 {**j.payload(), **({} if explain else {"result": None})} for j in jobs]}
         action = args.get("action")
         if action not in ("cancel", "retry"):
@@ -683,7 +705,7 @@ class Session:
         if not self.expert.available:
             from expert import fallback
             return fallback(self.turn_question or old.question, "not_configured")
-        job = await self.investigations.submit(old.question, old.observation, parent_id=old.id)
+        job = await self.investigations.submit(old.question, old.observation, origin=old.origin, parent_id=old.id)
         return {"ok": True, "investigation_id": job.id,
                 "answer": f"调查 {job.id} 已安排。" if zh else f"Investigation {job.id} is scheduled."}
 
@@ -700,6 +722,7 @@ class Session:
         """Read canonical work state; never copy findings or change task ownership."""
         queued = [j.id for j in self.investigations.jobs.values() if j.status == "queued"]
         rows = [{"id": j.id, "kind": "investigation", "observation_id": j.observation["id"],
+                 "parent_id": j.parent_id,
                  "status": j.status, "stage": j.stage, "created_at": j.created_at,
                  "queue_position": queued.index(j.id) + 1 if j.id in queued else 0}
                 for j in self.investigations.jobs.values()]
@@ -767,7 +790,7 @@ class Session:
             "fusing": ("正在综合图片、地点和声音证据。", "I'm combining the image results with local and sound evidence."),
             "awaiting_expert": ("图片识别已完成，专家分析正在等待启动。", "Image recognition is complete; expert analysis is waiting to start."),
             "ready": ("照片识别已完成，结果已就绪。", "Photo identification is complete; the result is ready."),
-            "failed": ("照片识别未能完成，可以重新尝试。", "Photo identification could not finish; you can request a retry."),
+            "failed": ("照片识别未能完成，可以说重试，重新准备拍照。", "Photo identification could not finish; say Retry to prepare another photo."),
             "cancelled": ("照片识别已取消。", "Photo identification was cancelled.")}
         return words.get(stage, ("照片任务正在处理。", "The photo task is being processed."))[0 if zh else 1]
 
@@ -819,6 +842,56 @@ class Session:
                     "tasks": [{"id": r["id"], "kind": r["kind"]} for r in offer["tasks"]]}
         return None
 
+    def task_retry_context(self):
+        offer = self.retry_offer
+        if (offer and time.monotonic() - offer['at'] <= 45
+                and self.normalized_words(self.last_assistant_text) == self.normalized_words(offer['question'])):
+            return {'question': offer['question'], 'tasks': offer['tasks']}
+        return None
+
+    async def retry_task(self, args):
+        context = self.task_retry_context()
+        rows = select_retry_tasks(self.task_status_snapshot(), args,
+                                  [row['id'] for row in context['tasks']] if context else ())
+        zh = self.chinese(self.turn_question) if self.turn_question else self.lang.startswith('zh')
+        if not rows:
+            return {'ok': False, 'answer': '没有匹配的可重试任务。' if zh else 'There is no matching task to retry.'}
+        if len(rows) != 1:
+            names = [('照片识别' if zh else 'photo identification') if row['kind'] == 'camera'
+                     else (('调查 ' if zh else 'investigation ') + row['id']) for row in rows]
+            return {'ok': True, 'requires_selection': True, 'tasks': rows,
+                    'answer': ('你想重试哪一项：' + '、'.join(names) + '？') if zh else
+                              ('Which task should I retry: ' + ', '.join(names) + '?')}
+        row = rows[0]
+        if row['status'] in ('running', 'queued', 'waiting'):
+            return {'ok': True, 'tasks': rows, 'answer': self.task_status_sentence(row, zh)}
+        if row['kind'] == 'investigation' or row['stage'].startswith('expert_'):
+            job_id = row['id'] if row['kind'] == 'investigation' else row['related_investigation_ids'][-1]
+            result = await self.investigation_tool('manage_investigation', {'id': job_id, 'action': 'retry'})
+            return {**result, 'tasks': rows}
+        obs = self.observations.get(row['observation_id'])
+        if (row['status'] != 'failed' or not obs or obs.id != self.focus or obs.status != 'open'
+                or obs.analysis_request_id != row['request_id']):
+            return {'ok': False, 'answer': '该照片任务无法重试，请重新准备拍照。' if zh else
+                    'That photo task cannot be retried; please prepare a new photo.'}
+        if not self.camera_route_current('look', {'target': 'current'}):
+            return {'ok': False, 'suppress_answer': True, 'guard': 'stale_camera_context'}
+        expected = (obs.id, obs.analysis_request_id, self.input_revision)
+        await self.acknowledge_tool('look')
+        if (self.focus, obs.analysis_request_id, self.input_revision) != expected:
+            return {'ok': False, 'suppress_answer': True, 'guard': 'stale_camera_context'}
+        self.retry_offer = None
+        result = await self.request_look(obs.hint, obs.group)
+        return {**result, 'suppress_answer': True, 'retried_task_id': row['id']}
+
+    def remember_retry_offer(self, result):
+        if result.get('ok') and result.get('investigation_id'):
+            self.retry_offer = None
+            return
+        tasks = [{'id': row['id'], 'kind': row['kind']} for row in result.get('tasks', ())
+                 if result.get('requires_selection') or row['status'] in ('failed', 'timed_out', 'cancelled')]
+        self.retry_offer = {'question': result['answer'], 'tasks': tasks, 'at': time.monotonic()} if tasks else None
+
     async def speak_task_status(self, args):
         revision = self.input_revision
         for _ in range(2):
@@ -833,6 +906,8 @@ class Session:
             guard = lambda: self.input_revision == revision and fingerprint() == snapshot
             response = await self.speak_expert(result["answer"], guard=guard)
             if self.input_revision != revision or not response or response.get("status") != "deferred":
+                if self.input_revision == revision and response and response.get('status') == 'completed':
+                    self.remember_retry_offer(result)
                 if (self.input_revision == revision and response and response.get("status") == "completed"
                         and result.get("requires_selection")):
                     self.task_status_offer = {"question": result["answer"], "tasks": result["tasks"],
@@ -1548,6 +1623,8 @@ class Session:
                                  + json.dumps(self.task_status_snapshot())
                                  + "\nActive task-selection question (a short reply selects one of these real IDs; otherwise null): "
                                  + json.dumps(self.task_status_context())
+                                 + "\nLatest spoken failure or retry-selection context (an unqualified retry uses scope=auto, not a guessed ID): "
+                                 + json.dumps(self.task_retry_context())
                                  + "\nLatest investigation explanation offer (accept only if it is the latest assistant question): "
                                  + json.dumps(self.investigation_offer_ids)
                                  + "\nInvestigations (context only; never invent progress): "
@@ -1987,6 +2064,8 @@ class Session:
                 raise ValueError("describe requires text")
             if name == "recent_sounds" and not np.isfinite(float(args.get("seconds", 15))):
                 raise ValueError("seconds must be finite")
+            if name == 'manage_investigation' and args.get('action') == 'retry':
+                raise ValueError('Use retry_task to resolve photo or investigation retries')
             decision, reason = route_guard(name, args, self.turn_question,
                 suggestions=bool(self.suggestions), **self.consent_context())
             if ((name in WRITE_TOOLS or name == "discard_observation") and self.turn_context is not None
@@ -2051,15 +2130,23 @@ class Session:
         if name == "get_task_status" and not result.get("ok"):
             self.queue_feedback("clarify")
             return
-        if name in ("speak", "get_checklist", "recent_sounds", "nearby_species", "get_observation", "ask_expert", "describe", "get_investigations", "manage_investigation", "get_task_status") and self.may_speak():
+        if name in ("speak", "get_checklist", "recent_sounds", "nearby_species", "get_observation", "ask_expert", "describe", "get_investigations", "manage_investigation", "get_task_status", "retry_task") and self.may_speak():
             if (getattr(self, "turn_stale", False) or (self.turn_stopped_at is not None
                     and time.monotonic() - self.turn_stopped_at > 12)):
                 self.log("stale_answer_skipped")  # answering a question asked >12 s ago is confusing
                 return
             if name == "get_task_status":
                 await self.speak_task_status(args)
+            elif name == 'retry_task' and result.get('answer'):
+                revision = self.input_revision
+                response = await self.speak_expert(result['answer'], guard=lambda: self.input_revision == revision)
+                if self.input_revision == revision and response and response.get('status') == 'completed':
+                    self.remember_retry_offer(result)
             elif name in ("ask_expert", "get_investigations", "manage_investigation") and result.get("answer"):
-                await self.speak_expert(result["answer"])
+                revision = self.input_revision
+                response = await self.speak_expert(result["answer"])
+                if self.input_revision == revision and response and response.get('status') == 'completed':
+                    self.remember_retry_offer(result)
             else:
                 read_identity = (result.get("observation", {}).get("id"),
                                  result.get("observation", {}).get("image_revision"))
@@ -2390,6 +2477,8 @@ class Session:
         return next(dict(r) for r in self.items if r["sci"] == taxon["sci"])
 
     async def tool(self, name, args):
+        if name == 'retry_task':
+            return await self.retry_task(args)
         if name == "get_task_status":
             return await self.task_status(args)
         if name in ("get_investigations", "manage_investigation"):
@@ -2927,6 +3016,7 @@ class Session:
         await self.phone_json(self.investigations.payload())
 
     async def reset(self):
+        self.retry_offer = None
         self.epoch += 1
         if self.turn_task is not None:
             self.turn_task.cancel()

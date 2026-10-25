@@ -65,6 +65,22 @@ async def cases(owner,voice,phone,client,report,events):
     await owner.voice_input('Start.')
     assert any(event.get('type')=='capture' for event in phone.events)
     report['checks'].append({'case':'Camera waits for readiness and explicit Start before sending capture','passed':True})
+
+    # Simulate a classifier/service failure, then exercise the actual GPT route,
+    # application retry resolver and LiveKit cue playback together.
+    await owner.photo_failed(owner.observations[request['obs']],request)
+    captures=sum(event.get('type')=='capture' for event in phone.events)
+    await owner.voice_input('Okay, I want to retry.')
+    await until(lambda:owner.camera_request and owner.camera_request['id']!=request['id'] and not owner.turn_in_progress)
+    retry_request=owner.camera_request
+    assert retry_request['obs']==request['obs'] and retry_request['phase']=='opening'
+    assert sum(event.get('type')=='capture' for event in phone.events)==captures
+    assert not owner.investigations.jobs, 'Photo retry accidentally scheduled expert work'
+    await owner.handle_phone({'type':'camera_ready','request_id':retry_request['id']},client)
+    await until(lambda:not owner.pending and not owner.turn_in_progress)
+    await owner.voice_input('Start.')
+    assert sum(event.get('type')=='capture' for event in phone.events)==captures+1
+    report['checks'].append({'case':'Failed photo retry prepares the same subject and recaptures only after a new Start','passed':True})
     assert not any(event['event']=='turn_failed' for event in events)
 
 

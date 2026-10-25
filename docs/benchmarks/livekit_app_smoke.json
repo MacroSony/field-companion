@@ -6,8 +6,6 @@
   "acoustic_echo_test": false,
   "adaptive_cloud_inference_test": false,
   "taxonomy_fixture": true,
-  "input": "accepted text transcripts; real GPT routing and voice generation",
-  "sdk_runtime_errors": 0,
   "checks": [
     {
       "case": "Real GPT route logs two mallards silently with an earcon",
@@ -20,6 +18,11 @@
     {
       "case": "Camera waits for readiness and explicit Start before sending capture",
       "passed": true
+    },
+    {
+      "case": "Failed photo retry prepares the same subject and recaptures only after a new Start",
+      "passed": true
     }
-  ]
+  ],
+  "sdk_runtime_errors": 0
 }

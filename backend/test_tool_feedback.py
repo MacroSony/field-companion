@@ -100,7 +100,7 @@ class FeedbackTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_expert_keeps_only_existing_scheduled_confirmation(self):
         self.c.tool = AsyncMock(return_value={"ok": True, "answer": "Investigation R1 is scheduled."})
-        self.c.speak_expert = AsyncMock()
+        self.c.speak_expert = AsyncMock(return_value={"status": "completed"})
         await self.c.finish_route({"status": "completed", "output": [{"type": "function_call",
             "name": "ask_expert", "call_id": "expert", "arguments": '{"question":"What does it eat?"}'}]})
         self.phone.send_bytes.assert_not_awaited()
@@ -215,7 +215,7 @@ class FeedbackTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_okay_can_accept_latest_investigation_offer_without_extra_receipt(self):
         self.c.tool = AsyncMock(return_value={"ok": True, "answer": "The requested result."})
-        self.c.speak_expert = AsyncMock()
+        self.c.speak_expert = AsyncMock(return_value={"status": "completed"})
         # A retained offer id alone does not make a later unrelated Okay consent.
         self.c.investigation_offer_ids = ["R1"]
         self.c.last_assistant_text = "Camera ready. Say start to take a photo."

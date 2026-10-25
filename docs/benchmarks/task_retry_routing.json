@@ -1,0 +1,253 @@
+{
+  "date": "2026-10-25",
+  "provider": "openai",
+  "model": "gpt-realtime-2.1",
+  "rounds": 1,
+  "physical_phone": false,
+  "tool_execution": false,
+  "synthetic_contexts": true,
+  "summary": {
+    "model": "gpt-realtime-2.1",
+    "samples": 13,
+    "completed": 13,
+    "passed": 13,
+    "tool_correct": 13,
+    "arguments_correct": 13,
+    "schema_errors": 0,
+    "forbidden_attempts": 0,
+    "guard_interceptions": 0,
+    "route_speech": 0,
+    "retries": 0,
+    "route_median_ms": 782.0,
+    "route_p95_ms": 1093.0,
+    "categories": {
+      "expert": {
+        "passed": 1,
+        "total": 1,
+        "action_correct": 1
+      },
+      "retry": {
+        "passed": 12,
+        "total": 12,
+        "action_correct": 12
+      }
+    }
+  },
+  "samples": [
+    {
+      "case": "retry-photo-zh",
+      "passed": true,
+      "tool_correct": true,
+      "arguments_correct": true,
+      "schema_valid": true,
+      "route_silent": true,
+      "calls": [
+        {
+          "tool": "retry_task",
+          "arguments": {
+            "scope": "auto"
+          }
+        }
+      ]
+    },
+    {
+      "case": "retry-selection-photo",
+      "passed": true,
+      "tool_correct": true,
+      "arguments_correct": true,
+      "schema_valid": true,
+      "route_silent": true,
+      "calls": [
+        {
+          "tool": "retry_task",
+          "arguments": {
+            "id": "photo:capture-1",
+            "scope": "camera"
+          }
+        }
+      ]
+    },
+    {
+      "case": "retry-ambiguous",
+      "passed": true,
+      "tool_correct": true,
+      "arguments_correct": true,
+      "schema_valid": true,
+      "route_silent": true,
+      "calls": [
+        {
+          "tool": "retry_task",
+          "arguments": {
+            "scope": "auto"
+          }
+        }
+      ]
+    },
+    {
+      "case": "retry-photo-explicit",
+      "passed": true,
+      "tool_correct": true,
+      "arguments_correct": true,
+      "schema_valid": true,
+      "route_silent": true,
+      "calls": [
+        {
+          "tool": "retry_task",
+          "arguments": {
+            "scope": "camera"
+          }
+        }
+      ]
+    },
+    {
+      "case": "retry-id",
+      "passed": true,
+      "tool_correct": true,
+      "arguments_correct": true,
+      "schema_valid": true,
+      "route_silent": true,
+      "calls": [
+        {
+          "tool": "retry_task",
+          "arguments": {
+            "id": "R1"
+          }
+        }
+      ]
+    },
+    {
+      "case": "retry-empty",
+      "passed": true,
+      "tool_correct": true,
+      "arguments_correct": true,
+      "schema_valid": true,
+      "route_silent": true,
+      "calls": [
+        {
+          "tool": "retry_task",
+          "arguments": {
+            "scope": "auto"
+          }
+        }
+      ]
+    },
+    {
+      "case": "retry-photo-plain",
+      "passed": true,
+      "tool_correct": true,
+      "arguments_correct": true,
+      "schema_valid": true,
+      "route_silent": true,
+      "calls": [
+        {
+          "tool": "retry_task",
+          "arguments": {
+            "scope": "auto"
+          }
+        }
+      ]
+    },
+    {
+      "case": "retry-photo-running",
+      "passed": true,
+      "tool_correct": true,
+      "arguments_correct": true,
+      "schema_valid": true,
+      "route_silent": true,
+      "calls": [
+        {
+          "tool": "retry_task",
+          "arguments": {
+            "scope": "camera"
+          }
+        }
+      ]
+    },
+    {
+      "case": "retry-photo-paraphrase",
+      "passed": true,
+      "tool_correct": true,
+      "arguments_correct": true,
+      "schema_valid": true,
+      "route_silent": true,
+      "calls": [
+        {
+          "tool": "retry_task",
+          "arguments": {
+            "scope": "auto"
+          }
+        }
+      ]
+    },
+    {
+      "case": "retry-photo-observed",
+      "passed": true,
+      "tool_correct": true,
+      "arguments_correct": true,
+      "schema_valid": true,
+      "route_silent": true,
+      "calls": [
+        {
+          "tool": "retry_task",
+          "arguments": {
+            "scope": "auto"
+          }
+        }
+      ]
+    },
+    {
+      "case": "retry-selection-expert",
+      "passed": true,
+      "tool_correct": true,
+      "arguments_correct": true,
+      "schema_valid": true,
+      "route_silent": true,
+      "calls": [
+        {
+          "tool": "retry_task",
+          "arguments": {
+            "id": "R1",
+            "scope": "investigations"
+          }
+        }
+      ]
+    },
+    {
+      "case": "retry-photo-spoken-offer",
+      "passed": true,
+      "tool_correct": true,
+      "arguments_correct": true,
+      "schema_valid": true,
+      "route_silent": true,
+      "calls": [
+        {
+          "tool": "retry_task",
+          "arguments": {
+            "scope": "auto"
+          }
+        }
+      ]
+    },
+    {
+      "case": "retry-explicit-latest",
+      "passed": true,
+      "tool_correct": true,
+      "arguments_correct": true,
+      "schema_valid": true,
+      "route_silent": true,
+      "calls": [
+        {
+          "tool": "retry_task",
+          "arguments": {
+            "selection": "latest",
+            "scope": "investigations"
+          }
+        }
+      ]
+    }
+  ],
+  "limits": [
+    "Frozen routing examples, not a representative field-user sample.",
+    "Camera and queue execution are tested separately; this run calls no app tools."
+  ]
+}

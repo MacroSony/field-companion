@@ -103,7 +103,7 @@ def fixture(case, config):
         obs = backend.Observation("logged-mallard", status="confirmed", count=2, uncertain=False,
             t_start=FIXED_TIME, fused=[{"sci": "Anas platyrhynchos", "en": "Mallard", "p": 1.0}])
         session.observations[obs.id] = obs
-    if case.state.startswith("photo") or case.state in ("research", "research-ready", "research-failed", "explanation-offer", "mixed"):
+    if case.state.startswith("photo") or case.state in ("research", "research-ready", "research-failed", "explanation-offer", "mixed", "retry-mixed", "retry-photo-offer", "retry-selection"):
         obs = backend.Observation("photo-eagle", t_start=FIXED_TIME,
             fused=[{"sci": "Haliaeetus leucocephalus", "en": "Bald Eagle", "p": .9}],
             uncertain=False, analysis_status="ready", analysis_stage="ready",
@@ -114,11 +114,15 @@ def fixture(case, config):
             obs.fused = []  # The current image has not been classified yet.
             obs.analysis_status, obs.analysis_stage = "analyzing", "recognizing"
             session.camera_request = {"id": "capture-1", "obs": obs.id, "phase": "classifying", "language": "en"}
+        if case.state in ('photo-failed', 'retry-mixed', 'retry-photo-offer', 'retry-selection'):
+            obs.fused = []
+            obs.analysis_status = obs.analysis_stage = 'failed'
+            session.camera_request = {'id':'capture-1','obs':obs.id,'phase':'ready','confirmed':False,'language':'en'}
         session.observations[obs.id] = obs
         session.focus = obs.id
-    if case.state.startswith("research") or case.state in ("mixed", "explanation-offer"):
+    if case.state.startswith("research") or case.state in ("mixed", "explanation-offer", "retry-mixed", "retry-photo-offer", "retry-selection"):
         ready = case.state in ("research-ready", "explanation-offer")
-        failed = case.state == "research-failed"
+        failed = case.state in ('research-failed','retry-mixed','retry-photo-offer','retry-selection')
         for i in range(1, 3):
             job = Investigation(f"R{i}", "What does the original bird eat?" if i == 1 else "Where does it migrate?",
                 {"id": "research-original", "fused": [{"sci": "Cyanocitta cristata", "en": "Blue Jay"}]},
@@ -135,6 +139,13 @@ def fixture(case, config):
             session.suggestions[sci] = {"sci": sci, "en": en, "conf": .9, "photo": "", "t": FIXED_TIME}
             session.history.append((0, {"sci": sci, "en": en, "conf": .9}))
     session.last_assistant_text = next((text for role, text in reversed(case.history) if role == "assistant"), "")
+    if case.state in ('retry-photo-offer','retry-selection'):
+        import time
+        rows=session.task_status_snapshot()
+        if case.state=='retry-photo-offer':
+            rows=[row for row in rows if row['kind']=='camera']
+        session.retry_offer={'question':session.last_assistant_text,'tasks':[
+            {'id':row['id'],'kind':row['kind']} for row in rows],'at':time.monotonic()}
     return session
 
 

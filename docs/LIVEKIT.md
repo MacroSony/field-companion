@@ -114,9 +114,10 @@ see the [reviewed report](benchmarks/livekit_sdk_smoke.json).
 `backend/livekit_app_smoke.py` additionally connects the real text-only GPT
 router to the real LiveKit-managed voice session, using accepted text inputs
 and in-memory checklist/camera state. It verifies silent logging, a grounded
-checklist answer and the explicit camera Start handshake. Taxonomy is a fixture;
+checklist answer, the explicit camera Start handshake, and a failed-photo retry
+that waits for a new confirmation. Taxonomy and the classifier failure are fixtures;
 it does not test recognition. It also makes billed API calls. The initial run
-passed all three checks with no SDK runtime errors; see the
+passed all four checks with no SDK runtime errors; see the
 [application report](benchmarks/livekit_app_smoke.json).
 
 After saving Cloud credentials and starting the application, run
