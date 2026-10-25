@@ -112,6 +112,18 @@ it does not test recognition. It also makes billed API calls. The initial run
 passed all three checks with no SDK runtime errors; see the
 [application report](benchmarks/livekit_app_smoke.json).
 
+After saving Cloud credentials and starting the application, run
+`backend/livekit_cloud_smoke.py --port 8805` in `.venv-livekit` to test the real
+room transport. It uses the generated microphone-check and barge WAV fixtures,
+publishes a synthetic microphone through the RTC SDK and receives real agent
+audio. It creates an isolated temporary app session and closes it afterward.
+This also makes billed API calls. The initial run passed signaling, spoken
+question/answer and a spoken follow-up during a reply. The server log showed
+adaptive initialization, an interrupted reply, and no fallback to VAD. See the
+[Cloud smoke report](benchmarks/livekit_cloud_smoke.json). Its follow-up was
+split into two transcripts before the checklist answer, so this is not a claim
+of perfect segmentation. The test does not evaluate browser AEC or phone echo.
+
 ## Limits and rollback
 
 Adaptive interruption requires LiveKit Cloud credentials and service access.

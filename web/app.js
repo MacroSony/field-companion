@@ -546,8 +546,9 @@
         state.listening = !!message.listening; state.speaking = !!message.speaking;
         if (typeof message.model === 'string') state.model = message.model;
         // Socket transport status remains independent of backend/model connectivity.
-        if (message.connected === false) notice('The server is reconnecting to the voice model.');
-        else if (message.connected && $('notice').textContent === 'The server is reconnecting to the voice model.') notice('');
+        const connectionNotice = livekitMode ? (displayMode ? 'Waiting for the phone voice connection.' : 'Connecting to LiveKit voice…') : 'The server is reconnecting to the voice model.';
+        if (message.connected === false) notice(connectionNotice);
+        else if (message.connected && $('notice').textContent === connectionNotice) notice('');
         updateControls(); break;
       case 'error': notice(String(message.message || 'Unknown server error')); earcon('error'); break;
     }
@@ -1005,6 +1006,8 @@
     if ($('phone-hint')) {
       const phoneURL = new URL('/', location.href);
       phoneURL.searchParams.set('session', session);
+      if (managedAudio) phoneURL.searchParams.set('transport', livekitMode ? 'livekit' : 'webrtc');
+      if (webrtcMode) phoneURL.searchParams.set('duplex', webrtcDuplex ? '1' : '0');
       $('phone-hint').textContent = `Phone: ${phoneURL.host}${phoneURL.pathname}${phoneURL.search}`;
       $('phone-hint').href = phoneURL.href;
     }

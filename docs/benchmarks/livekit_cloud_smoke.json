@@ -1,0 +1,34 @@
+{
+  "date": "2026-10-25",
+  "livekit_agents_version": "1.8.9",
+  "model": "gpt-realtime-2.1",
+  "passed": true,
+  "physical_phone": false,
+  "browser_aec_test": false,
+  "acoustic_echo_test": false,
+  "cloud_transport_test": true,
+  "adaptive_initialization_observed": true,
+  "fallback_to_vad_observed": false,
+  "interrupted_reply_observed": true,
+  "barge_started_while_speaking": true,
+  "received_audio_frames": 2767,
+  "audible_audio_frames": 672,
+  "checks": [
+    {
+      "case": "Application signaling and both participants connect through LiveKit Cloud",
+      "passed": true
+    },
+    {
+      "case": "Synthetic spoken question is transcribed and answered over real Cloud RTP audio",
+      "passed": true
+    },
+    {
+      "case": "Natural spoken follow-up during a reply reaches checklist routing and a new answer",
+      "passed": true
+    }
+  ],
+  "limits": [
+    "The synthetic follow-up was split into two transcripts; its final checklist question was handled.",
+    "Synthetic input contains no acoustic echo. No browser or phone audio route was evaluated."
+  ]
+}

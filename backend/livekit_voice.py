@@ -132,6 +132,7 @@ class LiveKitVoice:
         @self.session.on('conversation_item_added')
         def conversation(event):
             if isinstance(event.item, llm.ChatMessage) and event.item.role == 'assistant' and event.item.text_content:
+                self.owner.log('livekit_assistant_turn', interrupted=event.item.interrupted)
                 self.task(self.owner.voice_answer(event.item.text_content))
 
         @self.session.on('agent_state_changed')
@@ -167,6 +168,7 @@ class LiveKitVoice:
         await handle
         if handle.exception():
             raise ConnectionError('LiveKit voice generation failed')
+        self.owner.log('livekit_reply_finished', interrupted=handle.interrupted)
         return {'status': 'cancelled' if handle.interrupted else 'completed', 'output': []}
 
     async def say(self, text, pcm):
