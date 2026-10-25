@@ -32,6 +32,7 @@ from expert import NaturalistExpert, revision as expert_revision
 from investigations import ACTIVE, InvestigationQueue, QueueFull
 from tool_feedback import TOOLS as FEEDBACK_TOOLS, recording as feedback_recording
 from route_safety import route_guard
+from realtime_provider import RealtimeConfig
 
 MODEL = "higgs-realtime-1.5-preview"
 SR = 48000
@@ -201,7 +202,7 @@ VISION_URL = os.environ.get("VISION_URL", "http://127.0.0.1:8795")
 
 def _web_build():
     try:
-        m = re.search(r"CLIENT_BUILD = '([^']+)'", (Path(__file__).resolve().parent.parent / "web" / "app.js").read_text())
+        m = re.search(r"CLIENT_BUILD = '([^']+)'", (Path(__file__).resolve().parent.parent / "web" / "app.js").read_text(encoding="utf-8"))
         return m.group(1) if m else "unknown"
     except OSError:
         return "unknown"
@@ -395,8 +396,9 @@ class TurnText(str):
 
 
 class Session:
-    def __init__(self, session_id):
+    def __init__(self, session_id, realtime=None):
         self.id = session_id
+        self.realtime = realtime or RealtimeConfig.load()
         self.clients = set()
         self.mic = None
         self.observations = {}
@@ -1423,7 +1425,8 @@ class Session:
     def state_payload(self):
         return {"type": "state", "listening": self.mic_on,
                 "speaking": time.monotonic() < self.play_until,
-                "model": MODEL, "connected": self.connected, "echo_guard": self.echo_guard,
+                "model": self.realtime.model, "provider": self.realtime.provider,
+                "connected": self.connected, "echo_guard": self.echo_guard,
                 "session": self.id, "server_build": SERVER_BUILD}
 
     def input_context(self):
@@ -1495,7 +1498,7 @@ class Session:
                 "Preserve its original language and every species identifier. "
                 "Speak only this text, with no additions, hints, translation or explanation. "
                 "Text to read: " + json.dumps(self.expert_readout, ensure_ascii=False))
-        return {"output_modalities": ["text" if phase == "route" else "audio"],
+        return self.realtime.phase({"output_modalities": ["text" if phase == "route" else "audio"],
                 "instructions": (ROUTING + "\nFresh state snapshot (context only; sounds are unconfirmed): "
                                  + json.dumps(self.route_snapshot())
                                  + "\nCurrent pending BirdNET suggestions (unconfirmed; latest turn only): "
@@ -1516,7 +1519,7 @@ class Session:
                                                for row in self.investigations.payload()["items"][-8:]])
                                  if phase == "route" else answer_instructions),
                 "tools": TOOLS if phase == "route" else [],
-                "tool_choice": "required" if phase == "route" else "none"}
+                "tool_choice": "required" if phase == "route" else "none"})
 
     def route_snapshot(self):
         return {"checklist": [{"sci": r["sci"], "en": r["en"], "count": r["count"]} for r in self.items],
@@ -1546,13 +1549,10 @@ class Session:
                 self.log("history_pruned", deleted=deleted, retained=len(self.conversation_ids))
 
     def session(self):
-        return {"model": MODEL, **self.config("route"),
-                "audio": {"input": {"format": {"type": "audio/pcm", "rate": 24000},
-                                    "turn_detection": {"type": "server_vad", "threshold": 0.5,
-                                                       "prefix_padding_ms": 300, "silence_duration_ms": 600,
-                                                       "create_response": False, "interrupt_response": False},
-                                    "transcription": {"model": "higgs-stt-3.1"}},
-                          "output": {"format": {"type": "audio/pcm", "rate": 24000}}}}
+        return self.realtime.session(self.config("route"))
+
+    def realtime_key(self):
+        return self.realtime.openai_key() if self.realtime.provider == "openai" else api_key()
 
     async def update_session(self, config):
         # Reader resolves the echo future; no waiting inside the reader.
@@ -2041,8 +2041,8 @@ class Session:
         delay = 1
         while not self.closed:
             try:
-                key = api_key()
-                async with websockets.connect("wss://api.boson.ai/v1/realtime?model=" + MODEL,
+                key = self.realtime_key()
+                async with websockets.connect(self.realtime.url,
                         additional_headers={"Authorization": "Bearer " + key}, max_size=None,
                         open_timeout=20, ping_interval=20, ping_timeout=20) as ws:
                     self.rt = ws
@@ -2058,17 +2058,22 @@ class Session:
                     self.item_owners.clear()
                     self.response_owners.clear()
                     self.transcripts.clear()
-                    # Higgs waits for the first update before emitting session.created.
-                    await self.rt_send({"type": "session.update", "session": self.session()})
-                    while True:
-                        event = json.loads(await asyncio.wait_for(ws.recv(), 20))
-                        if event.get("type") in ("session.created", "session.updated"):
-                            break
-                        if event.get("type") == "error":
-                            raise RuntimeError("Realtime setup rejected")
+                    initial_config = self.session()
+                    await self.rt_send({"type": "session.update", "session": initial_config})
+                    # OpenAI first emits a default session.created. Do not start
+                    # mic ingestion/routing until our actual config is acknowledged.
+                    async with asyncio.timeout(20):
+                        while True:
+                            event = json.loads(await ws.recv())
+                            if event.get("type") == "error":
+                                await self.handle_rt(event)
+                                raise RuntimeError("Realtime setup rejected")
+                            if self.realtime.accepts_initial(event, initial_config):
+                                break
                     self.connected = True
                     delay = 1
-                    self.log("realtime_connected", model=MODEL, acknowledgement=event.get("type"))
+                    self.log("realtime_connected", provider=self.realtime.provider,
+                             model=self.realtime.model, acknowledgement=event.get("type"))
                     self.log("history_strategy", strategy="conversation.item.delete", keep=8)
                     summary = "; ".join(f"{r['count']} {r['en']} ({r.get('zh', '')})" for r in self.items) or "empty"
                     await self.rt_send({"type": "conversation.item.create", "item": {"type": "message", "role": "user",
@@ -2160,15 +2165,16 @@ class Session:
             code = (event.get("error") or {}).get("code", "unknown")
             message = str((event.get("error") or {}).get("message", ""))[:500]
             try:
-                message = message.replace(api_key(), "[redacted]")
+                message = message.replace(self.realtime_key(), "[redacted]")
             except RuntimeError:
                 pass
             self.log("realtime_error", code=code, message=message)
-            if code == "response_not_active" and self.cancel_barrier is not None:
+            inactive_cancel = code in ("response_not_active", "response_cancel_not_active")
+            if inactive_cancel and self.cancel_barrier is not None:
                 future = self.cancel_barrier["future"]
                 if not future.done():
                     future.set_result(None)
-            if code != "response_not_active" and "cancel" not in str(code):
+            if not inactive_cancel and "cancel" not in str(code):
                 for waiter in (self.update_waiter, self.response_waiter):
                     if waiter is not None and not waiter.done():
                         waiter.set_exception(RuntimeError("Realtime request rejected"))
@@ -3215,7 +3221,19 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--realtime-provider", choices=("higgs", "openai"), default=None,
+                        help="Realtime conversation provider (default: existing Higgs configuration)")
+    parser.add_argument("--realtime-model", default=None, help="Override the OpenAI Realtime model")
     args = parser.parse_args()
+    if args.realtime_provider:
+        os.environ["REALTIME_PROVIDER"] = args.realtime_provider
+    if args.realtime_model:
+        if RealtimeConfig.load().provider != "openai":
+            parser.error("--realtime-model requires --realtime-provider openai")
+        os.environ["OPENAI_REALTIME_MODEL"] = args.realtime_model
+    selected_realtime = RealtimeConfig.load()
+    if selected_realtime.provider == "openai":
+        selected_realtime.openai_key()  # Fail before accepting sessions if unconfigured.
     logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(asctime)s %(levelname)s %(message)s")
     # Never enable websocket HTTP/header debug logging: it can expose Authorization.
     logging.getLogger("websockets").setLevel(logging.WARNING)

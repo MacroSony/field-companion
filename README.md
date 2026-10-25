@@ -10,3 +10,4 @@ You talk; it logs. BirdNET listens for birds in the background, BioCLIP identifi
 - Probe scripts: `probes/`. The API key is read from `$BOSON_API_KEY` or `~/.config/boson/api_key`. **Never commit keys.**
 - Local setup and Windows commands: [docs/LOCAL_DEVELOPMENT.md](docs/LOCAL_DEVELOPMENT.md).
 - GPT Naturalist expert path: [docs/EXPERT.md](docs/EXPERT.md).
+- Optional GPT Realtime conversation experiment: [docs/GPT_REALTIME.md](docs/GPT_REALTIME.md).

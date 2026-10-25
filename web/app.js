@@ -1,6 +1,6 @@
 'use strict';
 (() => {
-  const CLIENT_BUILD = '2026-10-24-semantic-routing';
+  const CLIENT_BUILD = '2026-10-24-realtime-provider';
   const $ = id => document.getElementById(id);
   const params = new URLSearchParams(location.search);
   const displayMode = params.get('display') === '1';
