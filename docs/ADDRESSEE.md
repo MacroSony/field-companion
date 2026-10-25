@@ -34,10 +34,15 @@ Gated turns are deleted from the Realtime conversation with
 2. **Level gate.** Near-field owner speech is louder and less reverberant than
    bystanders. Compare each turn's speech level with the owner's running
    level. Cheap first filter. Must not reject the owner speaking softly.
-3. **Speaker verification.** Enrol the owner (10–20 s), compute an embedding
-   per turn on CPU (ECAPA-TDNN or similar) and skip turns that do not match.
-   Threshold errs toward accepting the owner: a missed sighting is worse than
-   a stray answer. Support several enrolled companions.
+3. **Speaker verification — shadow mode implemented.** Optional local CPU
+   ECAPA (`speechbrain/spkrec-ecapa-voxceleb`) scores every delimited audio turn
+   against enrolled profiles, logs cosine scores, and joins opt-in recorder rows.
+   **NEVER blocks or changes routing/echo guard; routing does not await scoring.**
+   Phone Settings offers a named 20 s ring-buffer enrollment; only that explicit
+   read-aloud window suppresses commands (`reason: enrollment`). Multiple profiles
+   append normalized chunk embeddings locally. See [backend setup/API/privacy](../backend/README.md#speaker-verification--shadow-mode-2026-10-24).
+   Evidence: `/data/build/tmp/addressee/spk/REPORT.md`; ≤1.5 s/noisy/distant turns
+   are unreliable. No thresholds or hard speaker gate are implemented.
 4. **Tiered response** (kind C): **implemented (V2, measured on text router)**.
    The router picks one of: speak (clearly addressed), `show_silently` on screen
    (possibly addressed, e.g. a bird question with no addressee), ignore. A false

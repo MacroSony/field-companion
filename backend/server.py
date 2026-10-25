@@ -35,6 +35,8 @@ from tool_feedback import TOOLS as FEEDBACK_TOOLS, recording as feedback_recordi
 from route_safety import route_guard
 from task_status import parse_status_query, explicit_retake, new_subject_request
 from session_data import TurnRecorder, append_jsonl, extract_turn_audio, redact, wall_time
+from speaker_client import speaker_request
+from speaker_service import profile_name
 
 MODEL = "higgs-realtime-1.5-preview"
 SR = 48000
@@ -42,6 +44,7 @@ ROOT = Path(__file__).resolve().parents[1]
 LOG = logging.getLogger("field-companion")
 EVENT_LOG_DIR = ROOT / "logs"
 RECORD_DIR = None  # Explicit opt-in only.
+SPEAKER_SERVICE = None  # Shadow diagnostics only; never a routing signal.
 GROUPS = ["Aves", "Insecta", "Plantae", "Mammalia", "Fungi", "Reptilia", "Amphibia", "Arachnida", "Mollusca", "Actinopterygii"]
 
 
@@ -474,7 +477,11 @@ class Session:
         self.echo_ring = np.zeros(len(self.ring), dtype=bool)
         self.position = 0
         self.next_window = 3 * SR
-        self.recorder = TurnRecorder(RECORD_DIR, self.id, self.extract_turn_audio, SR) if RECORD_DIR is not None else None
+        self.speaker_service = SPEAKER_SERVICE
+        self.speaker_tasks = set()
+        self.enrollment = None
+        self.recorder = TurnRecorder(RECORD_DIR, self.id, self.extract_turn_audio, SR,
+            on_audio=self.score_turn if self.speaker_service else None) if RECORD_DIR is not None or self.speaker_service else None
         self.recording_turns = ()
         self.recording_audio_context = ContextVar("recording_audio_" + self.id, default=())
         self.filter_taps = firwin(63, 10800, fs=SR)
@@ -1167,6 +1174,87 @@ class Session:
         return extract_turn_audio(self.ring, self.position, start_sample, stop_sample,
                                   sample_rate=SR, padding=padding)
 
+    def speaker_background(self, coroutine):
+        task = asyncio.create_task(coroutine)
+        self.speaker_tasks.add(task)
+        task.add_done_callback(self.speaker_tasks.discard)
+        return task
+
+    def score_turn(self, turn_id, samples):
+        # Capture callback never awaits HTTP, resampling or inference. Bounded
+        # diagnostics can be dropped under load; routing does not consult them.
+        if len(self.speaker_tasks) >= 8:
+            self.log("speaker_score_failed", turn_id=turn_id, reason="busy")
+            self.recorder.speaker_done(turn_id, speaker_error="busy")
+            return
+        self.speaker_background(self.score_turn_background(turn_id, samples))
+
+    async def score_turn_background(self, turn_id, samples):
+        try:
+            result = await asyncio.wait_for(asyncio.to_thread(
+                speaker_request, self.speaker_service, "score", samples), 1.6)
+            scores = result["scores"]
+            fields = {"speaker_scores": scores,
+                      "speaker_best_profile": max(scores, key=scores.get) if scores else None,
+                      "speaker_ms": result["ms"]}
+            self.log("speaker_scores", turn_id=turn_id, duration_s=len(samples) / SR, **fields)
+            self.recorder.speaker_done(turn_id, **fields)
+        except Exception as exc:
+            self.log("speaker_score_failed", turn_id=turn_id, error_type=type(exc).__name__)
+            self.recorder.speaker_done(turn_id, speaker_error=type(exc).__name__)
+
+    async def start_enrollment(self, profile):
+        if not self.speaker_service:
+            await self.phone_json({"type": "enrollment", "status": "error", "error": "Speaker service is disabled", "duration_s": 0})
+            return
+        profile = profile_name(profile)
+        if self.enrollment:
+            raise ValueError("Voice enrollment is already running")
+        self.enrollment = {"profile": profile, "start": self.position}
+        # Tag any in-flight VAD occurrence too; delayed finals remain suppressed
+        # after enroll_stop. Scores still run on these ordinary turn boundaries.
+        for record in self.input_audio_turns:
+            if record["stopped"] is None:
+                record["enrollment"] = True
+                if self.recorder:
+                    self.recorder.update(record.get("recording_id"), enrollment=True)
+        self.enrollment["timer"] = asyncio.get_running_loop().call_later(
+            20, lambda: self.speaker_background(self.stop_enrollment()))
+        self.log("enrollment_started", profile=profile)
+        await self.phone_json({"type": "enrollment", "status": "capturing", "profile": profile, "duration_s": 0})
+
+    def cancel_enrollment(self):
+        if self.enrollment:
+            self.enrollment["timer"].cancel()
+            self.enrollment = None
+
+    async def stop_enrollment(self):
+        window = self.enrollment
+        if not window:
+            return
+        self.cancel_enrollment()
+        stop = min(self.position, window["start"] + 20 * SR)
+        samples, bounds = self.extract_turn_audio(window["start"], stop, padding=0)
+        duration = len(samples) / SR
+        await self.phone_json({"type": "enrollment", "status": "processing", "duration_s": duration})
+        # Extraction is synchronous and precedes scheduling, so a reset/rollover
+        # cannot change the selected sample span while HTTP is in progress.
+        self.speaker_background(self.enroll_background(window["profile"], samples, bounds))
+
+    async def enroll_background(self, profile, samples, bounds):
+        duration = len(samples) / SR
+        try:
+            result = await asyncio.wait_for(asyncio.to_thread(
+                speaker_request, self.speaker_service, "enroll", samples, profile), 1.6)
+            if result.get("ok") is not True:
+                raise ValueError("Enrollment was not accepted")
+            event = {"type": "enrollment", "status": "ok", "profile": profile, "duration_s": duration}
+        except Exception as exc:
+            event = {"type": "enrollment", "status": "error", "duration_s": duration,
+                     "error": "Voice enrollment failed (" + type(exc).__name__ + ")"}
+        self.log("enrollment_result", **event, **bounds)
+        await self.phone_json(event)
+
     def record_route(self, name, arguments):
         if self.recorder:
             try:
@@ -1340,11 +1428,17 @@ class Session:
         # Clear completed/failed audio without erasing a newer accepted turn.
         if not newer_input:
             await self.rt_send({"type": "input_audio_buffer.clear"})
-        if blocked:
+        recording = self.recorder.pending.get(recording_id) if self.recorder else None
+        enrolling = bool((record and record.get("enrollment")) or
+                         (recording and recording["row"].get("enrollment")))
+        if enrolling or blocked:
             if self.recorder:
-                self.recorder.settle(recording_id, outcome="guarded_during_playback", reason="playback")
-            self.log("input_audio_guarded", event_type=event.get("type"),
-                     item_id=event.get("item_id"), reason="playback_turn" if record and record["blocked"] else "playback")
+                if enrolling:
+                    self.recorder.settle(recording_id, outcome="input_ignored", reason="enrollment")
+                else:
+                    self.recorder.settle(recording_id, outcome="guarded_during_playback", reason="playback")
+            self.log("input_ignored" if enrolling else "input_audio_guarded", event_type=event.get("type"),
+                     item_id=event.get("item_id"), reason="enrollment" if enrolling else "playback_turn" if record and record["blocked"] else "playback")
             if event.get("item_id"):
                 reused = any(r["id"] == event["item_id"] for r in self.input_audio_turns)
                 reused |= (self.current_input_audio_turn is not None
@@ -2223,14 +2317,18 @@ class Session:
                 await self.error("Realtime request failed (" + str(code)[:100] + ").")
         elif ty == "input_audio_buffer.speech_started":
             record = {"id": event.get("item_id"), "blocked": self.echo_blocked(),
-                      "at": time.monotonic(), "stopped": None}
+                      "at": time.monotonic(), "stopped": None, "enrollment": self.enrollment is not None}
             if self.recorder:
                 record["recording_id"] = self.recorder.start(record["id"], self.position, record["at"],
                     {"mode": "speaker" if self.speaker_mode else "earphones", "echo_guard": self.echo_guard})
                 if record["blocked"]:
                     self.recorder.update(record["recording_id"], outcome="guarded_during_playback", reason="playback")
+                if record["enrollment"]:
+                    self.recorder.update(record["recording_id"], enrollment=True)
             self.input_audio_turns.append(record)
             self.prune_input_audio_turns()
+            if record["enrollment"]:
+                return  # Read-aloud capture is not a command or an interruption.
             if record["blocked"]:
                 self.log("input_audio_guarded", event_type=ty, item_id=record["id"], reason="playback")
                 return
@@ -2251,9 +2349,12 @@ class Session:
             record = self.match_input_audio_turn(event)
             if record is not None:
                 record["stopped"] = time.monotonic()
+                record["enrollment"] = record.get("enrollment", False) or self.enrollment is not None
             if self.recorder:
                 recording_id = record.get("recording_id") if record else self.recorder.find(event.get("item_id"))
                 self.recorder.stop(recording_id, self.position, time.monotonic())
+                if self.enrollment or (record and record.get("enrollment")):
+                    self.recorder.update(recording_id, enrollment=True)
             if (record is not None and record["blocked"]) or self.echo_blocked():
                 return
             if record is self.current_input_audio_turn:
@@ -2803,6 +2904,16 @@ class Session:
     async def handle_phone(self, event, client=None):
         client = client or self.mic or next((c for c in self.clients if c.role == "mic"), None)
         ty = event.get("type")
+        if ty in ("enroll_start", "enroll_stop"):
+            if client is None or client is not self.mic:
+                raise ValueError("Only the current microphone can enroll a voice")
+            if ty == "enroll_start":
+                if not self.mic_on:
+                    raise ValueError("Resume the microphone before enrolling")
+                await self.start_enrollment(event.get("profile", "owner"))
+            else:
+                await self.stop_enrollment()
+            return
         if ty == "answer_note":
             if not isinstance(event.get("id"), str):
                 raise ValueError("answer_note requires a note id")
@@ -3002,6 +3113,7 @@ class Session:
         await self.phone_json(self.investigations.payload())
 
     async def reset(self):
+        self.cancel_enrollment()
         if self.recorder:
             self.recorder.flush("reset", self.position)
         self.epoch += 1
@@ -3094,8 +3206,11 @@ class Session:
                       asyncio.create_task(self.suggestion_loop())]
 
     async def close(self):
+        self.cancel_enrollment()
         if self.recorder:
             self.recorder.flush("session_closed", self.position)
+        while self.speaker_tasks:
+            await asyncio.gather(*list(self.speaker_tasks), return_exceptions=True)
         self.closed = True
         await self.investigations.close()
         tasks = self.tasks + [t for t in (self.bird_task, self.playback_task) if t is not None]
@@ -3141,6 +3256,7 @@ class Client:
         s.clients.add(self)
         if self.role == "mic":
             old = s.mic
+            s.cancel_enrollment()
             await s.cancel_camera_request()
             s.mic = self
             if old is not None:
@@ -3187,6 +3303,7 @@ class Client:
         finally:
             s.clients.discard(self)
             if s.mic is self:
+                s.cancel_enrollment()
                 await s.cancel_camera_request()
                 s.mic = None
             await s.state()
@@ -3342,7 +3459,9 @@ if __name__ == "__main__":
     parser.add_argument("--log-dir", type=Path, default=ROOT / "logs", help="Local daily session JSONL directory")
     parser.add_argument("--no-log-file", action="store_true", help="Disable persistent event JSONL")
     parser.add_argument("--record-dir", type=Path, help="Opt in to local per-turn mic WAVs and turns.jsonl")
+    parser.add_argument("--speaker-service", help="Local speaker HTTP URL; shadow scores only (off by default)")
     args = parser.parse_args()
+    SPEAKER_SERVICE = args.speaker_service
     EVENT_LOG_DIR = None if args.no_log_file else args.log_dir.expanduser()
     RECORD_DIR = args.record_dir
     logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(asctime)s %(levelname)s %(message)s")

@@ -120,6 +120,16 @@
         </div>
         <p id="capture-settings" class="capture-settings">Capture settings appear after Start.</p>
 
+    <section id="voice-enrollment">
+      <h3>Enroll voice</h3>
+      <label for="voice-profile">Profile name</label>
+      <input id="voice-profile" value="owner" maxlength="64" pattern="[A-Za-z0-9_-]+" autocomplete="off">
+      <p class="capture-settings">Voice embeddings are biometric data, stored locally on the server. Shadow mode only: scores never block commands. Read for 20 seconds; reading is not routed as commands.</p>
+      <p>Today I am walking outside and listening to the world around me. A small bird moves between the branches while the leaves turn in the breeze. I pause to notice its colours, its shape, and the sound of its song. I will speak naturally and keep the phone at a comfortable distance.</p>
+      <button id="enroll-voice" class="secondary-button" type="button" disabled>Enroll voice · 20 s</button>
+      <p id="enroll-progress" class="capture-settings" role="status">Start the microphone first. Requires the optional speaker service.</p>
+    </section>
+
     <p class="setting-label">Model <span id="model">Not connected</span></p>
     <label class="headset-setting"><input id="headset-enabled" type="checkbox"> Headset-button push-to-talk</label>
     <p class="capture-settings">Opt in to media controls and silent looping audio while listening.</p>

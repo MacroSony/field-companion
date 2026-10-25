@@ -24,9 +24,18 @@ def wall_time():
 def redact(value):
     """Defense in depth for diagnostics, not a reason to log request headers."""
     if isinstance(value, dict):
-        return {k: ("[redacted]" if re.search(
-            r"key|token|secret|password|authorization|headers|cookie", str(k), re.I)
-            else redact(v)) for k, v in value.items()}
+        result = {}
+        for k, v in value.items():
+            if (k == "speaker_scores" and isinstance(v, dict)
+                    and all(isinstance(score, (int, float)) for score in v.values())):
+                # These keys are profile names, not credential field names (e.g.
+                # a profile named "monkey"). Only validated numeric scores qualify.
+                result[k] = {name: redact(score) for name, score in v.items()}
+            else:
+                result[k] = ("[redacted]" if re.search(
+                    r"key|token|secret|password|authorization|headers|cookie", str(k), re.I)
+                    else redact(v))
+        return result
     if isinstance(value, (list, tuple)):
         return [redact(v) for v in value]
     if isinstance(value, float) and not math.isfinite(value):
@@ -103,10 +112,13 @@ class TurnRecorder:
 
     Save audio as soon as POST_PAD_S of post-padding arrives (500 ms wall timeout).
     Metadata waits for route completion, at most 60 s, or flush on disconnect,
-    reset/close. Unique occurrence IDs, not provider IDs, own queued route results.
+    reset/close. An optional audio callback supports shadow scores without WAVs;
+    only the JSONL row waits for its bounded background completion.
+    Unique occurrence IDs, not provider IDs, own queued route results.
     """
-    def __init__(self, directory, session_id, extract, sample_rate=48000):
-        self.directory = Path(directory).expanduser()
+    def __init__(self, directory, session_id, extract, sample_rate=48000, on_audio=None):
+        self.directory = Path(directory).expanduser() if directory is not None else None
+        self.on_audio = on_audio
         self.session_id = session_id
         self.extract = extract
         self.sample_rate = sample_rate
@@ -209,6 +221,16 @@ class TurnRecorder:
         levels = frame_dbfs(samples, self.sample_rate)
         row["noise_floor_dbfs"] = round(float(np.percentile(levels, 10)), 2) if len(levels) else None
         row["speech_p90_dbfs"] = round(float(np.percentile(levels, 90)), 2) if len(levels) else None
+        if self.on_audio:
+            state["speaker_pending"] = True
+            self.on_audio(turn_id, samples)
+        if self.directory is not None:
+            self._save_wav(row, samples)
+        state["audio_done"] = True
+        state["chunks"].clear()
+        self._write_if_ready(turn_id)
+
+    def _save_wav(self, row, samples):
         filename = row["turn_id"] + ".wav"
         try:
             self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -222,9 +244,13 @@ class TurnRecorder:
         except OSError:
             row["recording_error"] = "wav_write_failed"
             LOG.warning("Local turn WAV write failed")
-        state["audio_done"] = True
-        state["chunks"].clear()
-        self._write_if_ready(turn_id)
+
+    def speaker_done(self, turn_id, **fields):
+        state = self.pending.get(turn_id)
+        if state:
+            state["row"].update(fields)
+            state["speaker_pending"] = False
+            self._write_if_ready(turn_id)
 
     def settle(self, turn_id, **fields):
         state = self.pending.get(turn_id)
@@ -235,8 +261,9 @@ class TurnRecorder:
 
     def _write_if_ready(self, turn_id):
         state = self.pending.get(turn_id)
-        if state and state["audio_done"] and state["settled"]:
-            append_jsonl(self.directory / "turns.jsonl", state["row"])
+        if state and state["audio_done"] and state["settled"] and not state.get("speaker_pending"):
+            if self.directory is not None:
+                append_jsonl(self.directory / "turns.jsonl", state["row"])
             state["expiry"].cancel()
             self.pending.pop(turn_id)
 

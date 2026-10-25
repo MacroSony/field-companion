@@ -1,6 +1,6 @@
 'use strict';
 (() => {
-  const CLIENT_BUILD = '2026-10-24-addressee-v2';
+  const CLIENT_BUILD = '2026-10-24-speaker-shadow';
   const $ = id => document.getElementById(id);
   const params = new URLSearchParams(location.search);
   const displayMode = params.get('display') === '1';
@@ -22,6 +22,8 @@
     if (typeof saved?.deviceId === 'string' && typeof saved?.label === 'string') selectedMic = saved;
   } catch (_) { /* Storage is optional. */ }
   let micSwitching = false, micRevision = 0, deviceRevision = 0;
+  let enrollmentTimer = null, enrollmentBusy = false;
+  $('voice-enrollment').hidden = displayMode;
   let silentAudio, silentURL, toastTimer;
   const headsetActions = ['play', 'pause', 'nexttrack', 'previoustrack'];
   let playbackReported = false, headsetEnabled = false, replaced = false;
@@ -49,6 +51,8 @@
   }
   function updateControls() {
     camera.updateConnection();
+    $('enroll-voice').disabled = displayMode || !state.connected || !stream || state.paused || enrollmentBusy;
+    $('voice-profile').disabled = enrollmentBusy;
     if ($('audio-mode')) {
       $('audio-mode').textContent = earphones ? 'Earphones · voice interruption on' : 'Speaker · tap to interrupt';
       $('audio-mode').setAttribute('aria-pressed', String(earphones));
@@ -409,6 +413,7 @@
     ws.onclose = event => {
       if (socket !== ws) return;
       if (isReplacement(event.reason)) { phoneReplaced(); return; }
+      enrollmentStatus({status: 'error', error: 'Disconnected; capture cancelled.'});
       state.connected = false; state.listening = false; flush(); updateControls();
       if (state.running) scheduleReconnect();
     };
@@ -431,6 +436,7 @@
     updateControls();
   }
   function clearSessionUI() {
+    enrollmentStatus({status: 'error', error: 'Session reset; capture cancelled.'});
     for (const card of $('silent-notes').children) clearTimeout(card.expiryTimer);
     $('silent-notes').replaceChildren();
     flush(); camera.reset(); state.items = []; state.heard = []; state.investigations = [];
@@ -447,6 +453,27 @@
     if (!state.connected || !confirm('Clear checklist, suggestions, heard history, investigations and conversation?')) return;
     send({type: 'reset'}); clearSessionUI();
   }
+  function enrollmentStatus(message) {
+    clearInterval(enrollmentTimer); enrollmentTimer = null;
+    enrollmentBusy = ['capturing', 'processing'].includes(message.status);
+    const seconds = Number(message.duration_s || 0).toFixed(1);
+    $('enroll-progress').textContent = message.status === 'capturing' ? 'Read aloud: 0 / 20 s'
+      : message.status === 'processing' ? `${seconds} s captured. Processing…`
+      : message.status === 'ok' ? `${seconds} s captured. Voice enrolled.`
+      : `${seconds} s captured. ${message.error || 'Enrollment cancelled.'}`;
+    if (message.status === 'capturing') {
+      const started = Date.now();
+      enrollmentTimer = setInterval(() => {
+        const elapsed = Math.min(20, (Date.now() - started) / 1000);
+        $('enroll-progress').textContent = `Read aloud: ${elapsed.toFixed(0)} / 20 s`;
+        if (elapsed >= 20) {
+          clearInterval(enrollmentTimer); enrollmentTimer = null;
+          send({type: 'enroll_stop'}); // Server also auto-stops; duplicate stop is harmless.
+        }
+      }, 250);
+    }
+    updateControls();
+  }
   function handleMessage(message) {
     if (['state', 'error'].includes(message.type) && (message.replaced === true ||
         [message.message, message.reason, message.status, message.code].some(isReplacement))) { phoneReplaced(); return; }
@@ -457,6 +484,7 @@
       case 'audio_end':
         if (audioEnabled && message.id === playbackId) { playbackComplete = true; reportPlayback(playbackReported); }
         break;
+      case 'enrollment': if (!displayMode) enrollmentStatus(message); break;
       case 'capture': camera.requestCapture(message); break;
       case 'camera_prepare': camera.prepare(message); break;
       case 'camera_cancelled': camera.cancelled(message); break;
@@ -777,6 +805,7 @@
     captureSettings(); requestWakeLock(); updateControls(); connect();
   }
   async function stop() {
+    enrollmentStatus({status: 'error', error: 'Session ended; capture cancelled.'});
     camera.close();
     state.running = false; state.connected = false; state.listening = false;
     if (locationWatch !== null) navigator.geolocation?.clearWatch(locationWatch);
@@ -830,6 +859,15 @@
     downloadCSV(rows, 'all-taxa');
   }
   $('client-build').textContent = CLIENT_BUILD;
+  $('enroll-voice').addEventListener('click', () => {
+    const profile = $('voice-profile').value.trim() || 'owner';
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(profile)) {
+      $('enroll-progress').textContent = 'Use letters, digits, underscores or hyphens for the profile.'; return;
+    }
+    if (send({type: 'enroll_start', profile})) {
+      enrollmentBusy = true; $('enroll-progress').textContent = 'Waiting for capture…'; updateControls();
+    }
+  });
   $('settings-open').addEventListener('click', () => $('settings-dialog').showModal());
   $('reset').addEventListener('click', resetSession);
   $('reset-display').addEventListener('click', resetSession);
