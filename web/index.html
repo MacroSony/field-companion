@@ -17,6 +17,8 @@
   <script src="camera.js" defer></script>
   <script src="audio-diagnostics.js" defer></script>
   <script src="webrtc-audio.js" defer></script>
+  <script src="vendor/livekit/livekit-client.umd.js" defer></script>
+  <script src="livekit-audio.js" defer></script>
   <script src="app.js" defer></script>
 </head>
 <body>
@@ -130,7 +132,7 @@
     <button id="reset" class="secondary-button reset-button" type="button">Reset session</button>
     <p class="capture-settings">Build <span id="client-build"></span></p>
     <details class="mic-settings"><summary>Audio experiments and diagnostics</summary>
-      <p class="capture-settings"><a id="webrtc-link" href="?transport=webrtc">Try WebRTC voice</a> · <a id="stable-audio-link" href="?">Use standard audio</a></p>
+      <p class="capture-settings"><a id="livekit-link" href="?transport=livekit" hidden>Use LiveKit voice</a> · <a id="webrtc-link" href="?transport=webrtc">Try direct WebRTC</a> · <a id="stable-audio-link" href="?">Use standard audio</a></p>
       <p id="audio-transport-note" class="capture-settings">Standard audio</p>
       <p id="environment-status" class="capture-settings" hidden></p>
       <p class="capture-settings">Optional local recording includes your voice, assistant playback reference and captions. Keeps the latest 60 seconds in memory; this recorder never uploads a file. Clear it when finished.</p>

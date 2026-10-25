@@ -1461,7 +1461,8 @@ class Session:
                 "speaking": time.monotonic() < self.play_until,
                 "model": self.realtime.model, "provider": self.realtime.provider,
                 "transport": self.transport,
-                "features": {"audio_diagnostics": True, "webrtc": bool(getattr(app.state, "enable_webrtc", False))},
+                "features": {"audio_diagnostics": True, "webrtc": bool(getattr(app.state, "enable_webrtc", False)),
+                             "livekit": bool(getattr(app.state, "enable_livekit", False))},
                 "connected": self.connected, "echo_guard": self.echo_guard,
                 "session": self.id, "server_build": SERVER_BUILD}
 
@@ -3127,12 +3128,16 @@ async def phone_socket(ws: WebSocket):
     session_id = ws.query_params.get("session", "demo")
     transport = ws.query_params.get("transport", "websocket")
     if (role not in ("mic", "display") or not session_id or len(session_id) > 128
-            or transport not in ("websocket", "webrtc")):
+            or transport not in ("websocket", "webrtc", "livekit")):
         await ws.close(code=1008)
         return
     if transport == "webrtc" and (not getattr(app.state, "enable_webrtc", False)
             or (role == "display" and ws.query_params.get("audio") == "1")):
         await ws.close(code=1008, reason="WebRTC experiment unavailable or display audio unsupported")
+        return
+    if transport == "livekit" and (not getattr(app.state, "enable_livekit", False)
+            or (role == "display" and ws.query_params.get("audio") == "1")):
+        await ws.close(code=1008, reason="LiveKit unavailable or display audio unsupported")
         return
     session = SESSIONS.get(session_id)
     if session is not None and session.transport != transport:
@@ -3142,6 +3147,9 @@ async def phone_socket(ws: WebSocket):
     if session is None:
         if transport == "webrtc":
             from realtime_webrtc import make_session
+            session = make_session(Session, session_id)
+        elif transport == "livekit":
+            from realtime_livekit import make_session
             session = make_session(Session, session_id)
         else:
             session = Session(session_id)
@@ -3173,6 +3181,23 @@ async def webrtc_offer(request: Request, session: str):
     except Exception as exc:
         current.log("webrtc_offer_failed", error_type=type(exc).__name__)
         raise HTTPException(502, "Voice setup failed; end the session and try again") from None
+
+
+@app.post('/api/livekit/connect')
+async def livekit_connect(request: Request, session: str):
+    current = SESSIONS.get(session)
+    if not getattr(app.state, 'enable_livekit', False) or current is None or current.transport != 'livekit':
+        raise HTTPException(404, 'LiveKit voice is not enabled')
+    try:
+        result = await current.offer(request.headers.get('x-field-rtc', ''))
+        return Response(json.dumps(result), media_type='application/json', headers={'Cache-Control': 'no-store'})
+    except PermissionError:
+        raise HTTPException(403, 'Reconnect the phone before starting LiveKit') from None
+    except ValueError as exc:
+        raise HTTPException(503, str(exc)) from None
+    except Exception as exc:
+        current.log('livekit_offer_failed', error_type=type(exc).__name__)
+        raise HTTPException(502, 'LiveKit voice setup failed; check local project configuration') from None
 
 
 @app.post("/api/frame")
@@ -3306,6 +3331,7 @@ if __name__ == "__main__":
                         help="Realtime conversation provider (default: existing Higgs configuration)")
     parser.add_argument("--realtime-model", default=None, help="Override the OpenAI Realtime model")
     parser.add_argument("--enable-webrtc", action="store_true", help="Enable the opt-in OpenAI browser media experiment")
+    parser.add_argument('--enable-livekit', action='store_true', help='Enable LiveKit-managed GPT voice (use .venv-livekit)')
     args = parser.parse_args()
     if args.realtime_provider:
         os.environ["REALTIME_PROVIDER"] = args.realtime_provider
@@ -3315,6 +3341,13 @@ if __name__ == "__main__":
         os.environ["OPENAI_REALTIME_MODEL"] = args.realtime_model
     selected_realtime = RealtimeConfig.load()
     app.state.enable_webrtc = args.enable_webrtc
+    app.state.enable_livekit = args.enable_livekit
+    if args.enable_livekit:
+        from livekit_settings import LiveKitSettings
+        from livekit_setup import install_setup
+        install_setup(app, lambda: any(s.transport == 'livekit' and s.voice for s in SESSIONS.values()))
+        from realtime_webrtc import openai_config
+        openai_config().openai_key()
     if args.enable_webrtc:
         from realtime_webrtc import openai_config
         openai_config().openai_key()

@@ -1,0 +1,23 @@
+{
+  "date": "2026-10-25",
+  "livekit_agents_version": "1.8.9",
+  "passed": true,
+  "physical_phone": false,
+  "acoustic_echo_test": false,
+  "adaptive_cloud_inference_test": false,
+  "sdk_runtime_errors": 0,
+  "checks": [
+    {
+      "case": "LiveKit VAD commits synthetic speech for real GPT transcription",
+      "passed": true
+    },
+    {
+      "case": "Application hook prevents duplicate or unauthorized automatic speech",
+      "passed": true
+    },
+    {
+      "case": "Approved reply uses real GPT audio and LiveKit playback",
+      "passed": true
+    }
+  ]
+}

@@ -26,6 +26,8 @@ out/
 *.src
 .env
 .env.local
+.env.livekit.local
+.env.livekit.local.tmp
 *.key
 node_modules/
 backend/*.log

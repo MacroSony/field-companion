@@ -1,0 +1,5 @@
+# Install in .venv-livekit, separately from TensorFlow/BirdNET's .venv.
+-r requirements.txt
+livekit-agents[openai,silero]==1.8.9
+livekit==1.1.21
+livekit-api==1.2.2

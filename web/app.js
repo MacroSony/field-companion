@@ -1,14 +1,16 @@
 'use strict';
 (() => {
-  const CLIENT_BUILD = '2026-10-24-audio-lab';
+  const CLIENT_BUILD = '2026-10-25-livekit';
   const $ = id => document.getElementById(id);
   const params = new URLSearchParams(location.search);
   const displayMode = params.get('display') === '1';
   const webrtcMode = params.get('transport') === 'webrtc';
+  const livekitMode = params.get('transport') === 'livekit';
+  const managedAudio = webrtcMode || livekitMode;
   let webrtcDuplex = params.get('duplex') !== '0', rtc = null, diagnosticBusy = false;
   const diagnostic = new FieldAudioDiagnostics();
   const audioEnabled = !displayMode || params.get('audio') === '1';
-  const session = params.get('session') || (webrtcMode ? 'webrtc-experiment' : 'demo');
+  const session = params.get('session') || (livekitMode ? 'livekit-experiment' : webrtcMode ? 'webrtc-experiment' : 'demo');
   document.body.classList.toggle('display-mode', displayMode);
   const state = {
     running: false, starting: false, connected: false, paused: false, quiet: false,
@@ -53,7 +55,8 @@
   function updateControls() {
     camera.updateConnection();
     if ($('audio-mode')) {
-      $('audio-mode').textContent = webrtcMode ? (webrtcDuplex ? 'WebRTC · voice interruption on (experimental)' : 'WebRTC · tap to interrupt')
+      $('audio-mode').disabled = livekitMode;
+      $('audio-mode').textContent = livekitMode ? 'LiveKit · voice interruption' : webrtcMode ? (webrtcDuplex ? 'WebRTC · voice interruption on (experimental)' : 'WebRTC · tap to interrupt')
         : earphones ? 'Earphones · voice interruption on' : 'Speaker · tap to interrupt';
       $('audio-mode').setAttribute('aria-pressed', String(webrtcMode ? webrtcDuplex : earphones));
     }
@@ -61,13 +64,13 @@
       $('assistant-mute').disabled = !audioEnabled;
       $('assistant-mute').setAttribute('aria-pressed', String(assistantMuted));
     }
-    if ($('interrupt-hint')) $('interrupt-hint').textContent = (webrtcMode ? webrtcDuplex : earphones) ? 'Say something to interrupt' : 'Tap to interrupt; speak after the reply';
+    if ($('interrupt-hint')) $('interrupt-hint').textContent = (livekitMode || (webrtcMode ? webrtcDuplex : earphones)) ? 'Say something to interrupt' : 'Tap to interrupt; speak after the reply';
     if ($('earphone-tip')) $('earphone-tip').hidden = false;
     $('tap').disabled = $('send').disabled = !state.connected;
     $('reconnect').hidden = !replaced;
     $('reset').disabled = $('reset-display').disabled = !state.connected;
     $('mic').disabled = !stream || !state.running;
-    if ($('mic-device')) $('mic-device').disabled = webrtcMode || !capture || micSwitching || state.starting;
+    if ($('mic-device')) $('mic-device').disabled = managedAudio || !capture || micSwitching || state.starting;
     if ($('diagnostics-record')) {
       $('diagnostics-record').disabled = !state.running || !micSource || !state.diagnosticsSupported || diagnosticBusy;
       $('diagnostics-record').textContent = diagnostic.active ? 'Stop recording' : 'Record audio diagnostic';
@@ -117,8 +120,8 @@
     line.textContent = `${track.label || 'Microphone'} · sampleRate: ${value('sampleRate')} Hz · channelCount: ${value('channelCount')} · echoCancellation: ${value('echoCancellation')} · noiseSuppression: ${value('noiseSuppression')} · autoGainControl: ${value('autoGainControl')} · deviceId: ${value('deviceId')} · AudioContext: ${rate} Hz`;
   }
   async function requestMic(deviceId) {
-    const audio = {echoCancellation: webrtcMode ? {exact: true} : true,
-      noiseSuppression: webrtcMode, autoGainControl: webrtcMode, channelCount: 1, sampleRate: 48000};
+    const audio = {echoCancellation: managedAudio ? {exact: true} : true,
+      noiseSuppression: managedAudio, autoGainControl: managedAudio, channelCount: 1, sampleRate: 48000};
     try {
       return {input: await navigator.mediaDevices.getUserMedia({audio: {...audio, ...(deviceId ? {deviceId: {exact: deviceId}} : {})}}), deviceId};
     } catch (error) {
@@ -198,6 +201,7 @@
   }
   function talk() {
     if (context && context.state !== 'running') context.resume().catch(() => {});
+    if (livekitMode) rtc?.resumeOutput().catch(() => notice('Tap again to enable voice audio.'));
     flush(); send({type: 'tap'});
   }
   function startHeadsetSession() {
@@ -284,13 +288,14 @@
       lastMeterAt = now;
     }
     if (!state.running || state.paused || !state.connected) return;
-    if (webrtcMode) return; // Voice travels over the peer; never duplicate it as PCM.
+    if (managedAudio) return; // Voice travels over RTP; never duplicate it as PCM.
     // Drop rather than buffer stale microphone audio on a slow tunnel.
     if (socket.bufferedAmount > 192000) return;
     const outgoing = resampler ? resampler.process(samples) : samples;
     if (outgoing.length) socket.send(pcmLittleEndian(outgoing));
   }
   function reportPlayback(active, force = false) {
+    if (livekitMode) return; // RoomIO is the authoritative playout owner.
     const report = {type: 'playback', active, response_id: playbackId, drained: playbackComplete && !playback.size && !rtc?.playing};
     const encoded = JSON.stringify(report);
     if (!force && playbackReport === encoded) return;
@@ -388,11 +393,11 @@
     url.searchParams.set('role', displayMode ? 'display' : 'mic');
     url.searchParams.set('session', session);
     if (displayMode) url.searchParams.set('audio', audioEnabled ? '1' : '0');
-    if (webrtcMode) url.searchParams.set('transport', 'webrtc');
+    if (managedAudio) url.searchParams.set('transport', livekitMode ? 'livekit' : 'webrtc');
     return url.href;
   }
   function helloMessage() {
-    return {type: 'hello', client_build: CLIENT_BUILD, lang: 'en', playback_protocol: 1,
+    return {type: 'hello', client_build: CLIENT_BUILD, lang: 'en', playback_protocol: livekitMode ? 0 : 1,
       ...(!displayMode ? {earphones, ...(webrtcMode ? {duplex: webrtcDuplex} : {})} : {}), ...(state.coords || {})};
   }
   function connect() {
@@ -421,7 +426,7 @@
     };
     ws.onmessage = event => {
       if (socket !== ws || !state.running) return;
-      if (event.data instanceof ArrayBuffer) { playPCM(event.data); return; }
+      if (event.data instanceof ArrayBuffer) { if (!livekitMode) playPCM(event.data); return; }
       try { handleMessage(JSON.parse(event.data)); } catch (error) { console.warn('Ignored malformed server message', error); }
     };
     ws.onerror = () => { if (socket === ws) notice('Connection unavailable. Retrying automatically.'); };
@@ -429,7 +434,7 @@
       if (socket !== ws) return;
       if (isReplacement(event.reason)) { phoneReplaced(); return; }
       state.connected = false; state.listening = false; flush(); updateControls();
-      if (webrtcMode) {
+      if (managedAudio) {
         rtc?.close(); rtc = null;
         if (state.running) notice(event.reason || 'Voice disconnected. End and restart the session.');
         return;
@@ -487,6 +492,14 @@
           });
         }
         break;
+      case 'livekit_ready':
+        if (livekitMode && !displayMode && rtc) {
+          const active = rtc;
+          active.connect(message.token).catch(error => {
+            if (rtc === active && state.running) { stop(); notice(error.message); }
+          });
+        }
+        break;
       case 'audio_start':
         if (audioEnabled) { playbackId = message.id; playbackComplete = false; reportPlayback(playbackReported); }
         break;
@@ -521,12 +534,14 @@
       }
       case 'candidates': if (Array.isArray(message.items)) renderCandidates(message.items); break;
       case 'state':
-        if (webrtcMode && rtc) {
-          if (message.connected) rtc.controlConnected = true;
+        if (managedAudio && rtc) {
+          if (livekitMode ? message.media_connected : message.connected) rtc.controlConnected = true;
           else if (rtc.controlConnected) { stop(); notice('Voice control disconnected. Start a new session to reconnect.'); return; }
         }
         state.diagnosticsSupported = !!message.features?.audio_diagnostics;
         if ($('webrtc-link')) $('webrtc-link').hidden = !message.features?.webrtc;
+        if ($('livekit-link')) $('livekit-link').hidden = !message.features?.livekit;
+        if (livekitMode) rtc?.handleState(message);
         if (typeof message.server_build === 'string') $('version-banner').hidden = message.server_build === CLIENT_BUILD;
         state.listening = !!message.listening; state.speaking = !!message.speaking;
         if (typeof message.model === 'string') state.model = message.model;
@@ -781,10 +796,11 @@
       resampler = context.sampleRate === 48000 ? null : new LinearResampler(context.sampleRate);
       capture.port.onmessage = onCapture;
       micSource.connect(capture).connect(context.destination);
-      if (webrtcMode) {
+      if (managedAudio) {
         const endpoint = new URL(websocketURL()); endpoint.protocol = endpoint.protocol === 'wss:' ? 'https:' : 'http:';
-        endpoint.pathname = '/api/realtime/webrtc'; endpoint.search = ''; endpoint.searchParams.set('session', session);
-        rtc = new FieldWebRTCAudio({context, stream, output: assistantOutput(), endpoint: endpoint.href,
+        endpoint.pathname = livekitMode ? '/api/livekit/connect' : '/api/realtime/webrtc'; endpoint.search = ''; endpoint.searchParams.set('session', session);
+        const AudioTransport = livekitMode ? FieldLiveKitAudio : FieldWebRTCAudio;
+        rtc = new AudioTransport({context, stream, output: assistantOutput(), endpoint: endpoint.href,
           onEvent: (event, fields) => diagnostic.record(event, fields),
           onPlayback: (active, id) => { playbackId = id; playbackComplete = !active; reportPlayback(active, true); updateControls(); },
           onAmbient: samples => {
@@ -794,14 +810,15 @@
           },
           onStatus: text => { $('environment-status').textContent = text; $('environment-status').hidden = false; captureSettings(); },
           onFailure: text => { stop(); notice(text); }});
-        rtc.setDuplex(webrtcDuplex);
+        if (webrtcMode) rtc.setDuplex(webrtcDuplex);
+        if (livekitMode) rtc.setMuted(assistantMuted);
       }
       notice(context.sampleRate === 48000 ? '' : `Audio ${context.sampleRate} Hz → 48000 Hz · Linear resampling enabled`);
     } catch (error) {
       console.warn('Microphone setup:', error);
       stream?.getTracks().forEach(track => track.stop()); stream = null;
       capture?.disconnect(); micSource?.disconnect(); capture = micSource = null;
-      if (webrtcMode) { state.starting = false; await stop(); notice(`${error.message}. Use the standard voice mode on this device.`); return; }
+      if (managedAudio) { state.starting = false; await stop(); notice(`${error.message}. Use the standard voice mode on this device.`); return; }
       notice(`${error.message}. You can still type observations.`);
     }
     state.running = true; state.starting = false; state.paused = false;
@@ -874,6 +891,7 @@
     else stopHeadsetSession();
   });
   $('audio-mode')?.addEventListener('click', () => {
+    if (livekitMode) return;
     if (webrtcMode) {
       webrtcDuplex = !webrtcDuplex; rtc?.setDuplex(webrtcDuplex);
       if (state.connected) send({type: 'duplex', duplex: webrtcDuplex});
@@ -889,6 +907,7 @@
     // Keep microphone capture, captions and the playback clock unchanged.
     // Muting the shared output also silences sources already queued or playing.
     if (assistantGain && context) assistantGain.gain.setValueAtTime(assistantMuted ? 0 : 1, context.currentTime);
+    if (livekitMode) rtc?.setMuted(assistantMuted);
     if (state.connected) send({type: 'output_mute', muted: assistantMuted});
     updateControls();
   });
@@ -915,7 +934,7 @@
         diagnostic.stop(); send({type: 'diagnostics', enabled: false});
         $('diagnostics-status').textContent = 'Recording stopped. Save or clear the local recording.';
       } else if (context && micSource && state.running) {
-        await diagnostic.start(context, micSource, assistantOutput(), {transport: webrtcMode ? 'webrtc' : 'websocket',
+        await diagnostic.start(context, micSource, rtc?.diagnosticOutput || assistantOutput(), {transport: livekitMode ? 'livekit' : webrtcMode ? 'webrtc' : 'websocket',
           model: state.model, voice: stream.getAudioTracks()[0].getSettings(), environment: rtc?.settings().environment || {}});
         if (!state.running) { diagnostic.stop(); return; }
         send({type: 'diagnostics', enabled: true});
@@ -940,10 +959,15 @@
     stableURL.searchParams.delete('transport'); stableURL.searchParams.delete('duplex');
     stableURL.searchParams.set('session', params.get('baseline') || 'demo'); stableURL.searchParams.delete('baseline');
     $('webrtc-link').href = experimentalURL.href; $('stable-audio-link').href = stableURL.href;
-    $('audio-transport-note').textContent = webrtcMode
+    const livekitURL = new URL(experimentalURL.href);
+    livekitURL.searchParams.set('transport', 'livekit');
+    livekitURL.searchParams.set('session', session.slice(0, 90) + '-lk-' + Math.random().toString(36).slice(2, 10));
+    if ($('livekit-link')) $('livekit-link').href = livekitURL.href;
+    $('audio-transport-note').textContent = livekitMode ? 'LiveKit manages speech playback, interruption and recovery. Bird input is separate.' : webrtcMode
       ? 'Experimental WebRTC voice. Use the mode button to turn voice interruption off. Bird input is verified separately.'
       : 'Standard audio. Each voice experiment uses a separate checklist.';
     if (webrtcMode) $('earphone-tip').textContent = 'Experimental speaker interruption. Switch to Tap to interrupt if echo appears.';
+    if (livekitMode) $('earphone-tip').textContent = 'Speech interruption is managed by LiveKit. Tap to talk also interrupts manually.';
   }
   $('tap').addEventListener('click', talk);
   $('mic-device')?.addEventListener('change', event => switchMic(event.target.value));
