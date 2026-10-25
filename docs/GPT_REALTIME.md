@@ -109,6 +109,49 @@ audio input and transcription. The report labels fixtures and real services.
 Reports are ignored under `out/gpt-realtime/`. These checks do not establish
 comparative model quality, physical-phone echo handling or real photo recognition.
 
+### Paired regression benchmark
+
+See [the measured comparison](REALTIME_COMPARISON.md) for the initial paired text
+and synthetic-audio results, failure examples and remaining shared limitations.
+
+The opt-in benchmark in `backend/realtime_eval.py` compares both configured
+providers using 56 frozen synthetic scenarios. It tests tool selection and
+meaningful arguments separately from obeying the text-free routing protocol.
+It does not execute checklist writes, investigations or recognition services,
+and does not connect to or reset the running phone sessions.
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -B backend/realtime_eval.py --rounds 2 --report out/realtime-eval/text.json
+.\.venv\Scripts\python.exe -X utf8 -B backend/realtime_eval_report.py out/realtime-eval/text.json --output out/realtime-eval/text.md
+```
+
+Inputs cover named sightings, total-count corrections, pronoun confirmation,
+new organisms versus old photo evidence, nonbird categories, progress versus
+restarts, task IDs, accepting/rejecting result offers, BirdNET confirmation,
+mixed English/Chinese, and companion chatter. Each sample starts a fresh
+conversation. Expected answers never enter model prompts. Both sides receive
+identical semantic history; their assistant-message encodings differ according
+to their API schemas (`text` for Higgs, `output_text` for OpenAI).
+
+For identical synthetic microphone input, generate local Windows speech first:
+
+```powershell
+.\backend\make_realtime_eval_audio.ps1
+.\.venv\Scripts\python.exe -X utf8 -B backend/realtime_eval.py --rounds 1 --audio-dir out/realtime-eval/audio --report out/realtime-eval/audio.json
+.\.venv\Scripts\python.exe -X utf8 -B backend/realtime_eval_report.py out/realtime-eval/audio.json --output out/realtime-eval/audio.md
+```
+
+These are real, billable API calls using the existing project keys. Run the text
+and audio benchmarks sequentially. `--cases log-two photo-progress` limits a run;
+`--providers higgs` or `--providers openai` supports diagnosis. Raw reports and
+WAVs are ignored under `out/`; only synthetic scripts and reviewed findings
+should be committed. The report includes API failures, retries, latency, raw
+calls, guard audits and paired prompt/input hashes. A passing routing score
+does not establish spoken-answer quality or field accuracy. Physical-phone
+tests remain necessary for echo, interruptions, birdsong and camera recognition.
+Start/Identify confirmation is handled by shared deterministic backend code and
+the existing smoke test; it is not counted as a model-intelligence comparison.
+
 ## Official protocol references
 
 - [Realtime conversations](https://developers.openai.com/api/docs/guides/realtime-conversations)
