@@ -396,6 +396,8 @@ class TurnText(str):
 
 
 class Session:
+    transport = "websocket"
+
     def __init__(self, session_id, realtime=None):
         self.id = session_id
         self.realtime = realtime or RealtimeConfig.load()
@@ -485,6 +487,7 @@ class Session:
         self.analyzer = None
         self.bird_task = None
         self.tasks = []
+        self.diagnostic_tasks = set()
         self.transcripts = {}
         self.total_audio_in = 0
         self.total_audio_out = 0
@@ -1159,6 +1162,37 @@ class Session:
 
     def log(self, event, **fields):
         LOG.info("%s", json.dumps({"connection": self.id, "event": event, **fields}, ensure_ascii=False))
+        client = self.mic
+        if client is not None and getattr(client, "diagnostics", False) and len(self.diagnostic_tasks) < 100:
+            # No text, SDP, credentials, tool arguments, GPS or provider errors.
+            allowed = {"response_id", "item_id", "phase", "reason", "confirmation", "hold_ms",
+                       "active", "role", "kind", "status", "name", "ok", "transport", "enabled"}
+            safe = {k: v for k, v in fields.items() if k in allowed and isinstance(v, (str, bool, int, float, type(None)))}
+            async def deliver():
+                try:
+                    await client.send_json({"type": "diagnostic", "event": event,
+                        "server_monotonic": time.monotonic(), "fields": safe})
+                except Exception:
+                    pass  # Recording must never break conversation/playback.
+            task = asyncio.create_task(deliver())
+            self.diagnostic_tasks.add(task)
+            task.add_done_callback(self.diagnostic_tasks.discard)
+
+    async def mic_attached(self, client):
+        pass
+
+    async def mic_detached(self, client):
+        pass
+
+    def environment_contaminated(self):
+        return self.speaker_mode and self.echo_blocked()
+
+    async def voice_started(self, record):
+        if self.echo_guard:
+            self.log("barge_in_candidate", confirmation="transcript")
+        else:
+            await self.cancel_speech()
+            self.log("barge_in", confirmation="vad")
 
     async def phone_json(self, event):
         await asyncio.gather(*(c.send_json(event) for c in list(self.clients)), return_exceptions=True)
@@ -1426,6 +1460,8 @@ class Session:
         return {"type": "state", "listening": self.mic_on,
                 "speaking": time.monotonic() < self.play_until,
                 "model": self.realtime.model, "provider": self.realtime.provider,
+                "transport": self.transport,
+                "features": {"audio_diagnostics": True, "webrtc": bool(getattr(app.state, "enable_webrtc", False))},
                 "connected": self.connected, "echo_guard": self.echo_guard,
                 "session": self.id, "server_build": SERVER_BUILD}
 
@@ -2180,6 +2216,7 @@ class Session:
                         waiter.set_exception(RuntimeError("Realtime request rejected"))
                 await self.error("Realtime request failed (" + str(code)[:100] + ").")
         elif ty == "input_audio_buffer.speech_started":
+            self.log("input_vad_start", item_id=event.get("item_id"))
             record = {"id": event.get("item_id"), "blocked": self.echo_blocked(),
                       "at": time.monotonic(), "stopped": None}
             self.input_audio_turns.append(record)
@@ -2192,15 +2229,10 @@ class Session:
             self.user_speaking = True
             self.awaiting_transcript = True
             if self.assistant_audio_pending():
-                if self.echo_guard:
-                    # Speaker leakage can trigger VAD. Keep listening and only
-                    # cancel when STT confirms speech that is not our own echo.
-                    self.log("barge_in_candidate", confirmation="transcript")
-                else:
-                    await self.cancel_speech()
-                    self.log("barge_in", confirmation="vad")
+                await self.voice_started(record)
             await self.state()
         elif ty == "input_audio_buffer.speech_stopped":
+            self.log("input_vad_stop", item_id=event.get("item_id"))
             record = self.match_input_audio_turn(event)
             if record is not None:
                 record["stopped"] = time.monotonic()
@@ -2649,7 +2681,7 @@ class Session:
         n = len(frame)
         pos = self.position % len(self.ring)
         first = min(n, len(self.ring) - pos)
-        contaminated = self.speaker_mode and self.echo_blocked()
+        contaminated = self.environment_contaminated()
         self.echo_ring[pos:pos + first] = contaminated
         self.ring[pos:pos + first] = frame[:first]
         if first < n:
@@ -2661,7 +2693,7 @@ class Session:
         filtered, self.filter_state = lfilter(self.filter_taps, [1.0], frame, zi=self.filter_state)
         pcm = (np.clip(filtered[self.decimation_phase::2], -1, 1) * 32767).astype("<i2").tobytes()
         self.decimation_phase = (self.decimation_phase - n) % 2
-        if self.connected and not self.echo_blocked():
+        if self.transport == "websocket" and self.connected and not self.echo_blocked():
             if self.audio_queue.full():
                 self.audio_queue.get_nowait()  # bounded latency rather than stale audio after a network stall
                 self.log("audio_queue_drop")
@@ -2699,6 +2731,12 @@ class Session:
     async def handle_phone(self, event, client=None):
         client = client or self.mic or next((c for c in self.clients if c.role == "mic"), None)
         ty = event.get("type")
+        if ty == "diagnostics":
+            if client is not self.mic or not isinstance(event.get("enabled"), bool):
+                raise ValueError("Only the current phone controls diagnostics")
+            client.diagnostics = event["enabled"]
+            self.log("diagnostics", enabled=client.diagnostics, transport=self.transport)
+            return
         if ty == "audio_mode" or (ty == "hello" and "earphones" in event):
             if not isinstance(event.get("earphones"), bool):
                 raise ValueError("earphones must be boolean")
@@ -2980,7 +3018,7 @@ class Session:
     async def close(self):
         self.closed = True
         await self.investigations.close()
-        tasks = self.tasks + [t for t in (self.bird_task, self.playback_task) if t is not None]
+        tasks = self.tasks + list(self.diagnostic_tasks) + [t for t in (self.bird_task, self.playback_task) if t is not None]
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -3003,6 +3041,7 @@ class Client:
         self.playback_pending = False
         self.playback_id = None
         self.playback_end = 0.0
+        self.diagnostics = False
 
     async def send_json(self, event):
         async with self.lock:
@@ -3032,6 +3071,8 @@ class Client:
                 except (RuntimeError, WebSocketDisconnect):
                     pass
         try:
+            if self.role == "mic" and s.mic is self:
+                await s.mic_attached(self)
             await s.state()
             await self.send_json({"type": "checklist", "items": [dict(r) for r in s.items]})
             for obs in list(s.observations.values()):
@@ -3071,6 +3112,7 @@ class Client:
             if s.mic is self:
                 await s.cancel_camera_request()
                 s.mic = None
+                await s.mic_detached(self)
             await s.state()
             if not s.clients:
                 s.expiry_task = asyncio.create_task(s.expire())
@@ -3083,15 +3125,54 @@ app = FastAPI(title="Field Companion v0.2")
 async def phone_socket(ws: WebSocket):
     role = ws.query_params.get("role", "mic")
     session_id = ws.query_params.get("session", "demo")
-    if role not in ("mic", "display") or not session_id or len(session_id) > 128:
+    transport = ws.query_params.get("transport", "websocket")
+    if (role not in ("mic", "display") or not session_id or len(session_id) > 128
+            or transport not in ("websocket", "webrtc")):
         await ws.close(code=1008)
         return
-    await ws.accept()
+    if transport == "webrtc" and (not getattr(app.state, "enable_webrtc", False)
+            or (role == "display" and ws.query_params.get("audio") == "1")):
+        await ws.close(code=1008, reason="WebRTC experiment unavailable or display audio unsupported")
+        return
     session = SESSIONS.get(session_id)
+    if session is not None and session.transport != transport:
+        await ws.close(code=1008, reason="Use a separate session for each audio transport")
+        return
+    await ws.accept()
     if session is None:
-        session = SESSIONS[session_id] = Session(session_id)
+        if transport == "webrtc":
+            from realtime_webrtc import make_session
+            session = make_session(Session, session_id)
+        else:
+            session = Session(session_id)
+        SESSIONS[session_id] = session
         session.start()
     await Client(ws, session, role, ws.query_params.get("audio") == "1").run()
+
+
+@app.post("/api/realtime/webrtc")
+async def webrtc_offer(request: Request, session: str):
+    current = SESSIONS.get(session)
+    if not getattr(app.state, "enable_webrtc", False) or current is None or current.transport != "webrtc":
+        raise HTTPException(404, "WebRTC experiment is not enabled")
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > 65536:
+            raise HTTPException(413, "SDP offer too large")
+    try:
+        sdp = body.decode("utf-8")
+        if not sdp.startswith("v=0") or "m=audio" not in sdp or "a=fingerprint:" not in sdp:
+            raise ValueError("Invalid audio offer")
+        answer = await current.offer(request.headers.get("x-field-rtc", ""), sdp)
+        return Response(answer, media_type="application/sdp", headers={"Cache-Control": "no-store"})
+    except PermissionError:
+        raise HTTPException(403, "Reconnect the phone before starting WebRTC") from None
+    except (ValueError, UnicodeError):
+        raise HTTPException(400, "Invalid or duplicate audio offer") from None
+    except Exception as exc:
+        current.log("webrtc_offer_failed", error_type=type(exc).__name__)
+        raise HTTPException(502, "Voice setup failed; end the session and try again") from None
 
 
 @app.post("/api/frame")
@@ -3224,6 +3305,7 @@ if __name__ == "__main__":
     parser.add_argument("--realtime-provider", choices=("higgs", "openai"), default=None,
                         help="Realtime conversation provider (default: existing Higgs configuration)")
     parser.add_argument("--realtime-model", default=None, help="Override the OpenAI Realtime model")
+    parser.add_argument("--enable-webrtc", action="store_true", help="Enable the opt-in OpenAI browser media experiment")
     args = parser.parse_args()
     if args.realtime_provider:
         os.environ["REALTIME_PROVIDER"] = args.realtime_provider
@@ -3232,6 +3314,10 @@ if __name__ == "__main__":
             parser.error("--realtime-model requires --realtime-provider openai")
         os.environ["OPENAI_REALTIME_MODEL"] = args.realtime_model
     selected_realtime = RealtimeConfig.load()
+    app.state.enable_webrtc = args.enable_webrtc
+    if args.enable_webrtc:
+        from realtime_webrtc import openai_config
+        openai_config().openai_key()
     if selected_realtime.provider == "openai":
         selected_realtime.openai_key()  # Fail before accepting sessions if unconfigured.
     logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(asctime)s %(levelname)s %(message)s")

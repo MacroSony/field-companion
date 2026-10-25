@@ -154,6 +154,9 @@ the existing smoke test; it is not counted as a model-intelligence comparison.
 
 ## Official protocol references
 
+For the optional browser WebRTC transport, aligned microphone/playback
+diagnostics and physical-phone echo test plan, see [Audio lab](AUDIO_LAB.md).
+
 - [Realtime conversations](https://developers.openai.com/api/docs/guides/realtime-conversations)
 - [Realtime client events](https://developers.openai.com/api/reference/resources/realtime/client-events)
 - [GPT-Realtime-2.1](https://developers.openai.com/api/docs/models/gpt-realtime-2.1)

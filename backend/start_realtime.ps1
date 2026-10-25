@@ -1,7 +1,8 @@
 param(
     [ValidateSet('openai', 'higgs')][string]$Provider = 'openai',
     [ValidateRange(1, 65535)][int]$Port = 8800,
-    [switch]$Background
+    [switch]$Background,
+    [switch]$WebRTC
 )
 $ErrorActionPreference = 'Stop'
 $realtimeRepoDirectory = Split-Path -Parent $PSScriptRoot
@@ -15,13 +16,15 @@ if ($realtimeListener) {
 }
 $realtimeArguments = @('-X', 'utf8', '-B', 'backend/server.py', '--host', '127.0.0.1', '--port', $Port,
                        '--realtime-provider', $Provider)
+if ($WebRTC) { $realtimeArguments += '--enable-webrtc' }
+$realtimeTransportQuery = if ($WebRTC) { '&transport=webrtc' } else { '' }
 if ($Background) {
     $realtimeLogDirectory = Join-Path $realtimeRepoDirectory "out\realtime-$Provider-$Port"
     New-Item -ItemType Directory -Force -Path $realtimeLogDirectory | Out-Null
     $realtimeProcess = Start-Process -FilePath $realtimePythonPath -ArgumentList $realtimeArguments -WorkingDirectory $realtimeRepoDirectory -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $realtimeLogDirectory 'stdout.log') -RedirectStandardError (Join-Path $realtimeLogDirectory 'stderr.log')
     @{ launcher_pid = $realtimeProcess.Id; port = $Port; provider = $Provider;
-       url = "http://localhost:$Port/?session=$Provider-experiment" } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $realtimeLogDirectory 'process.json') -Encoding utf8
-    Write-Output "Starting $Provider Realtime on http://localhost:$Port/?session=$Provider-experiment"
+       url = "http://localhost:$Port/?session=$Provider-experiment$realtimeTransportQuery" } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $realtimeLogDirectory 'process.json') -Encoding utf8
+    Write-Output "Starting $Provider Realtime on http://localhost:$Port/?session=$Provider-experiment$realtimeTransportQuery"
     Write-Output "Logs: $realtimeLogDirectory"
 } else {
     Push-Location -LiteralPath $realtimeRepoDirectory

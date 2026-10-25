@@ -1,0 +1,46 @@
+{
+  "passed": true,
+  "fixtures": [
+    "synthetic microphone",
+    "taxonomy",
+    "BirdNET disabled",
+    "research runner"
+  ],
+  "physical_phone": false,
+  "acoustic_echo_test": false,
+  "checks": [
+    {
+      "case": "real WebRTC microphone, transcription and server-controlled voice reply",
+      "passed": true,
+      "user": "Can you hear me?",
+      "assistant": "Yes,"
+    },
+    {
+      "case": "natural spoken question interrupts and clears current WebRTC playback",
+      "passed": true
+    },
+    {
+      "case": "existing checklist tools controlled from sideband",
+      "passed": true
+    },
+    {
+      "case": "background investigation scheduled over the existing app path",
+      "passed": true
+    },
+    {
+      "case": "immediate follow-up survives cancellation and investigation still completes",
+      "passed": true
+    },
+    {
+      "case": "both captured microphone and playback reference have nonzero audio",
+      "passed": true
+    },
+    {
+      "case": "local stereo recording and event replay export",
+      "passed": true
+    }
+  ],
+  "browser_errors": [],
+  "capture": "Fake Default Audio Input · sampleRate: 48000 Hz · channelCount: 1 · echoCancellation: true · noiseSuppression: true · autoGainControl: true · deviceId: default · AudioContext: 48000 Hz",
+  "environment": "Bird input opened; browser reports processing off. Bird listening pauses during assistant speech."
+}

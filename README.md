@@ -11,3 +11,4 @@ You talk; it logs. BirdNET listens for birds in the background, BioCLIP identifi
 - Local setup and Windows commands: [docs/LOCAL_DEVELOPMENT.md](docs/LOCAL_DEVELOPMENT.md).
 - GPT Naturalist expert path: [docs/EXPERT.md](docs/EXPERT.md).
 - Optional GPT Realtime conversation experiment: [docs/GPT_REALTIME.md](docs/GPT_REALTIME.md).
+- Speaker echo diagnostics and optional WebRTC voice: [docs/AUDIO_LAB.md](docs/AUDIO_LAB.md).

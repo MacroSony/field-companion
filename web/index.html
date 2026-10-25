@@ -15,6 +15,8 @@
   <link rel="stylesheet" href="style.css">
   <script src="vendor/leaflet/leaflet.js" defer></script>
   <script src="camera.js" defer></script>
+  <script src="audio-diagnostics.js" defer></script>
+  <script src="webrtc-audio.js" defer></script>
   <script src="app.js" defer></script>
 </head>
 <body>
@@ -127,6 +129,16 @@
     <button id="export" class="secondary-button" type="button" aria-haspopup="dialog">Export CSV</button>
     <button id="reset" class="secondary-button reset-button" type="button">Reset session</button>
     <p class="capture-settings">Build <span id="client-build"></span></p>
+    <details class="mic-settings"><summary>Audio experiments and diagnostics</summary>
+      <p class="capture-settings"><a id="webrtc-link" href="?transport=webrtc">Try WebRTC voice</a> · <a id="stable-audio-link" href="?">Use standard audio</a></p>
+      <p id="audio-transport-note" class="capture-settings">Standard audio</p>
+      <p id="environment-status" class="capture-settings" hidden></p>
+      <p class="capture-settings">Optional local recording includes your voice, assistant playback reference and captions. Keeps the latest 60 seconds in memory; this recorder never uploads a file. Clear it when finished.</p>
+      <button id="diagnostics-record" class="secondary-button" type="button" disabled>Record audio diagnostic</button>
+      <button id="diagnostics-save" class="secondary-button" type="button" disabled>Save diagnostic replay</button>
+      <button id="diagnostics-clear" class="secondary-button" type="button" disabled>Clear recording</button>
+      <p id="diagnostics-status" class="capture-settings" role="status">Recording off</p>
+    </details>
   </dialog>
   <div id="audio-overlay" class="audio-overlay" hidden><div><p class="eyebrow">PROJECTOR AUDIO</p><h2>Let the field speak.</h2><p>Click to enable assistant audio. This screen never uses a microphone.</p><p class="echo-note">While this screen speaks, use Tap to talk on the phone to interrupt.</p><button id="enable-audio" class="start-button" type="button">Start display audio <span>↗</span></button><a id="silent-display" href="?display=1">Continue without audio</a></div></div>
   <dialog id="export-dialog" aria-labelledby="export-heading"><form method="dialog"><button class="dialog-close" aria-label="Close" value="cancel">×</button></form><p class="eyebrow">TAKE YOUR FIELD NOTES HOME</p><h2 id="export-heading">Export observations</h2><p id="export-summary"></p><label>Location name<input id="location-name" placeholder="e.g. High Park"></label><div class="export-location"><label>State / province<input id="export-state" placeholder="e.g. ON"></label><label>Country<input id="export-country" placeholder="e.g. CA"></label></div><p class="export-note">eBird includes birds only, without headers. Incidental protocol: this version does not collect complete survey effort.<br>Generic CSV includes all taxa and column headers.</p><button id="export-ebird" class="start-button" type="button">Download eBird CSV <span>↓</span></button><button id="export-all" class="secondary-button" type="button">All taxa · Generic CSV ↓</button></dialog>
