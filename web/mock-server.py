@@ -23,7 +23,7 @@ from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Response
 
 ROOT = Path(__file__).resolve().parent
-CLIENT_BUILD = '2026-10-24-camera-intent'
+CLIENT_BUILD = '2026-10-24-addressee-v2'
 PHOTOS = {}
 SESSIONS = {}
 SPECIES = [
@@ -97,6 +97,7 @@ class Session:
         self.task = None
         self.quiet = False
         self.speaking_until = 0
+        self.silent_notes = {}
 
     async def emit(self, message_type, **fields):
         data = json.dumps(dict(type=message_type, **fields))
@@ -146,6 +147,8 @@ class Session:
             taxon(4, source='photo', why='Blue back and a warm orange breast.'),
             taxon(5, source='photo', why='Orange eyebrow and a bold dark breast band.'),
         ])
+        self.silent_notes['note-demo'] = ('Is that a hawk?', time.monotonic() + 30)
+        await self.emit('silent_note', id='note-demo', question='Is that a hawk?', note='Possibly a question for me.')
         if not self.quiet:
             await self.tone()
 
@@ -206,6 +209,7 @@ async def handler(ws):
                 session.history = []
                 session.suggestions = []
                 session.speaking_until = 0
+                session.silent_notes.clear()
                 await session.emit('reset')
                 await session.emit('flush')
                 await session.checklist()
@@ -248,6 +252,12 @@ async def handler(ws):
                 await session.emit('flush')
                 await session.emit('transcript', role='assistant', text='I am here. That was a Northern Cardinal.', final=True)
                 await session.tone()
+            elif kind == 'answer_note':
+                note = session.silent_notes.pop(message.get('id'), None)
+                if note and note[1] > time.monotonic():
+                    await session.emit('silent_note_removed', id=message['id'])
+                    await session.emit('transcript', role='user', text='[TAP] ' + note[0], final=True)
+                    await session.emit('transcript', role='assistant', text='Demo: that question is now addressed to me.', final=True)
             elif kind == 'text':
                 await session.emit('transcript', role='user', text=str(message.get('text', '')), final=True)
                 await session.emit('transcript', role='assistant', text='Demo mode: one mallard added. The live backend handles identification.', final=True)

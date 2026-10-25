@@ -36,6 +36,8 @@ def route_guard(name, args, text, *, suggestions=False, log_offer=False, explana
     fillers = {"ah", "uh", "um", "oh", "mm", "mm hmm", "hmm", "嗯"}
     if normalized in fillers:
         return "ignore", "filler"
+    if name in ("ignore", "show_silently"):
+        return "allow", "silent"  # No write permission or spoken continuation.
     if name == "speak":
         reason = str(args.get("reason", "")).lower()
         # The observed failure explicitly said "ignore per routing rules" but

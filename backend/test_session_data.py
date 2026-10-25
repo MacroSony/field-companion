@@ -210,6 +210,22 @@ class SessionDataTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(row["assistant_audio"])
         self.assertEqual(row["audio_mode"], {"mode": "speaker", "echo_guard": True})
 
+    async def test_show_silently_records_routed_without_assistant_audio(self):
+        self.c.generate = AsyncMock(return_value={"status": "completed", "output": [
+            {"type": "function_call", "name": "show_silently", "call_id": "silent",
+             "arguments": '{"text":"A possibly addressed nature question"}'}]})
+        await self.turn("Is that a hawk?")
+        await self.run_worker()
+        row, = self.rows()
+        self.assertEqual((row["transcript"], row["outcome"], row["routed_tool"]),
+                         ("Is that a hawk?", "routed", "show_silently"))
+        self.assertFalse(row["assistant_audio"])
+        self.assertEqual(row["routed_arguments"], {"text": "A possibly addressed nature question"})
+        self.assertEqual([e["type"] for e in self.phone.events if e["type"] != "state"],
+                         ["transcript", "silent_note"])
+        self.c.generate.assert_awaited_once_with("route")
+        self.assertFalse(self.phone.audio)
+
     async def test_reused_item_id_and_merged_turns_keep_distinct_rows(self):
         await self.turn("Can you hear me?", "reused")
         await self.turn("Is this thing working?", "reused")

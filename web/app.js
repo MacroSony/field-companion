@@ -1,6 +1,6 @@
 'use strict';
 (() => {
-  const CLIENT_BUILD = '2026-10-24-camera-intent';
+  const CLIENT_BUILD = '2026-10-24-addressee-v2';
   const $ = id => document.getElementById(id);
   const params = new URLSearchParams(location.search);
   const displayMode = params.get('display') === '1';
@@ -89,7 +89,7 @@
       const status = {running: 'investigating', queued: 'queued', completed: 'ready', cancelled: 'cancelled', failed: 'failed', timed_out: 'time limit'};
       $('display-status').textContent = `${state.connected ? '● Live' : '○ Connecting'} · ${playing ? 'Assistant speaking' : 'Session ' + session}${job ? ` · ${job.id} ${status[job.status] || ''}` : ''}`;
     }
-    document.querySelectorAll('.counter button, .delete-button, .investigation-actions button').forEach(button => { button.disabled = !state.connected; });
+    document.querySelectorAll('.counter button, .delete-button, .investigation-actions button, .silent-note-answer').forEach(button => { button.disabled = !state.connected; });
   }
 
   function saveMic(deviceId, label) {
@@ -431,6 +431,8 @@
     updateControls();
   }
   function clearSessionUI() {
+    for (const card of $('silent-notes').children) clearTimeout(card.expiryTimer);
+    $('silent-notes').replaceChildren();
     flush(); camera.reset(); state.items = []; state.heard = []; state.investigations = [];
     renderChecklist(); renderSuggestions([]); renderCandidates([]); renderInvestigations(); updateMap();
     $('heard').replaceChildren(element('p', 'empty-inline', 'Listening for the next discovery.'));
@@ -473,6 +475,8 @@
       case 'investigations':
         if (Array.isArray(message.items)) { state.investigations = message.items; renderInvestigations(); updateControls(); }
         break;
+      case 'silent_note': showSilentNote(message); break;
+      case 'silent_note_removed': removeSilentNote(message.id); break;
       case 'transcript': {
         const target = message.role === 'user' ? $('user-caption') : message.role === 'assistant' ? $('assistant-caption') : null;
         if (target && typeof message.text === 'string') {
@@ -497,6 +501,31 @@
     if (className) node.className = className;
     if (text !== undefined) node.textContent = text;
     return node;
+  }
+  function removeSilentNote(id) {
+    const card = [...$('silent-notes').children].find(node => node.dataset.id === id);
+    if (card) { clearTimeout(card.expiryTimer); card.remove(); }
+  }
+  function showSilentNote(message) {
+    if (typeof message.id !== 'string' || typeof message.question !== 'string') return;
+    removeSilentNote(message.id);
+    const list = $('silent-notes');
+    while (list.children.length >= 3) removeSilentNote(list.firstElementChild.dataset.id);
+    const card = element('div', 'silent-note');
+    card.dataset.id = message.id;
+    // textContent, never HTML: the original transcript may contain arbitrary text.
+    card.append(element('p', '', `Not sure that was for me: “${message.question}”`));
+    if (typeof message.note === 'string' && message.note) card.title = message.note;
+    const answer = element('button', 'silent-note-answer', 'Answer');
+    answer.type = 'button'; answer.disabled = !state.connected;
+    answer.addEventListener('click', () => {
+      if (send({type: 'answer_note', id: message.id})) removeSilentNote(message.id);
+    });
+    const dismiss = element('button', 'silent-note-dismiss', '×');
+    dismiss.type = 'button'; dismiss.setAttribute('aria-label', 'Dismiss note');
+    dismiss.addEventListener('click', () => removeSilentNote(message.id));
+    card.append(answer, dismiss); list.append(card);
+    card.expiryTimer = setTimeout(() => removeSilentNote(message.id), 30000);
   }
   function renderInvestigations() {
     const list = $('investigations'), section = $('investigations-section');

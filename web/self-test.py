@@ -7,18 +7,22 @@ import base64
 import csv
 import io
 import json
+import os
 from pathlib import Path
 from urllib.request import urlopen
 from websockets.asyncio.client import connect
 
 ROOT = Path(__file__).resolve().parent
+OUT = Path(os.environ.get("FIELD_WEB_TEST_OUT", ROOT))
+OUT.mkdir(parents=True, exist_ok=True)
 
 
 async def main():
     targets = json.load(urlopen('http://localhost:9223/json/list'))
     target = next(t for t in targets if t['type'] == 'page')
     pending, events, sequence = {}, [], 0
-    async with connect(target['webSocketDebuggerUrl'], max_size=16 * 1024 * 1024) as ws:
+    # Avoid optional compression on the local CDP test transport.
+    async with connect(target['webSocketDebuggerUrl'], max_size=16 * 1024 * 1024, compression=None) as ws:
         async def reader():
             async for raw in ws:
                 message = json.loads(raw)
@@ -42,6 +46,33 @@ async def main():
             if result.get('exceptionDetails'):
                 raise RuntimeError(result['exceptionDetails'])
             return result.get('result', {}).get('value')
+        async def check_silent_notes():
+            assert await evaluate("document.querySelector('.silent-note').textContent.includes('Is that a hawk?')")
+            # Real mock Answer uses its stored original, not client/model prose.
+            await evaluate("document.querySelector('.silent-note-answer').click()")
+            await asyncio.sleep(.15)
+            assert await evaluate("!document.querySelector('.silent-note') && document.getElementById('user-caption').textContent === '[TAP] Is that a hawk?'")
+            assert any(json.loads(e['params']['response']['payloadData']) == {'type': 'answer_note', 'id': 'note-demo'}
+                       for e in events if e.get('method') == 'Network.webSocketFrameSent' and e['params']['response']['opcode'] == 1)
+            # Inject only a note: no earcon, audio context, source, or HTML execution.
+            result = await evaluate("""(() => {
+              const ws=window.__sockets[0], contexts=window.__contexts.length, starts=window.__starts.length;
+              const inject = id => ws.dispatchEvent(new MessageEvent('message', {data:JSON.stringify({
+                type:'silent_note',id,question:'Is that <img src=x onerror=alert(1)> a hawk?',note:'Short model note'})}));
+              const originalTimeout=window.setTimeout; let expire;
+              window.setTimeout=(fn,ms,...args) => { if(ms===30000) expire=fn; return originalTimeout(fn,ms,...args); };
+              try { inject('expiry-test'); } finally { window.setTimeout=originalTimeout; }
+              const card=document.querySelector('.silent-note');
+              const safe=card.textContent.includes('<img') && !card.querySelector('img');
+              const visible=card.getBoundingClientRect().width > 0;
+              expire(); const expired=!document.querySelector('.silent-note');
+              inject('dismiss-test'); document.querySelector('.silent-note-dismiss').click();
+              return {safe,visible,expired,dismissed:!document.querySelector('.silent-note'),
+                silent:window.__contexts.length===contexts && window.__starts.length===starts};
+            })()""")
+            assert all(result.values()), result
+            return result
+
         await call('Page.enable')
         await call('Runtime.enable')
         await call('Network.enable')
@@ -105,6 +136,7 @@ async def main():
           serviceWorker: !!navigator.serviceWorker.controller
         })''')
         assert results['items'] == 4 and results['heard'] == 2 and results['candidates'] == 3, results
+        results['phoneSilentNotes'] = await check_silent_notes()
         assert results['sampleRate'] == 48000 and results['flushStoppedSources'] > 0 and not results['overflow'], results
         assert await evaluate("window.__contexts[0] && document.getElementById('capture-settings').textContent.includes('echoCancellation: true')")
         assert await evaluate("document.getElementById('interrupt-hint').textContent.includes('Tap to interrupt') && document.getElementById('audio-mode').textContent.includes('tap to interrupt')")
@@ -204,7 +236,7 @@ async def main():
         results['longSpeechQueueNoOverlap'] = burst
         await evaluate("window.__sockets[0].dispatchEvent(new MessageEvent('message', {data:JSON.stringify({type:'suggestions',items:[]})}))")
         shot = await call('Page.captureScreenshot', format='png', captureBeyondViewport=False)
-        (ROOT / 'screenshot.png').write_bytes(base64.b64decode(shot['data']))
+        (OUT / 'screenshot.png').write_bytes(base64.b64decode(shot['data']))
         results['phoneSessionURL'] = await evaluate("window.__sockets[0].url")
         assert 'role=mic' in results['phoneSessionURL'] and 'session=phone-test' in results['phoneSessionURL']
         await evaluate("document.getElementById('map-card').open = true")
@@ -307,12 +339,13 @@ async def main():
           mapLeft: document.getElementById('map-card').getBoundingClientRect().left,
           mapHeight: document.getElementById('map').getBoundingClientRect().height
         })""")
+        results['displaySilentNotes'] = await check_silent_notes()
         d = results['display']
         assert d['items'] == 4 and d['heard'] == 2 and d['markers'] == 4 and not d['overflow'], d
         assert d['micRequests'] == 0 and d['audioContexts'] == 0 and 'role=display' in d['socketURL'] and 'audio=0' in d['socketURL'], d
         assert d['checklistRight'] < d['mapLeft'] and d['mapHeight'] > 100, d
         shot = await call('Page.captureScreenshot', format='png', captureBeyondViewport=False)
-        (ROOT / 'screenshot-display.png').write_bytes(base64.b64decode(shot['data']))
+        (OUT / 'screenshot-display.png').write_bytes(base64.b64decode(shot['data']))
         # Shared session edits reach a second display socket and highlight the updated card.
         await evaluate("""window.__peer = new WebSocket('ws://localhost:8877/ws?role=display&session=display-test');
           window.__peer.onopen = () => { window.__peer.send(JSON.stringify({type:'hello',lang:'en'})); setTimeout(() => window.__peer.send(JSON.stringify({type:'edit',id:'o1',count:9})), 100); };""")
@@ -354,7 +387,7 @@ async def main():
         results['displayMicrophoneBinaryFrames'] = 0
         results['displayRuntimeExceptions'] = [e['params'] for e in events if e.get('method') == 'Runtime.exceptionThrown']
         assert not results['displayRuntimeExceptions'], results['displayRuntimeExceptions']
-        (ROOT / 'self-test-results.json').write_text(json.dumps(results, ensure_ascii=False, indent=2) + '\n')
+        (OUT / 'self-test-results.json').write_text(json.dumps(results, ensure_ascii=False, indent=2) + '\n')
         print(json.dumps(results, ensure_ascii=False, indent=2))
         reading.cancel()
 

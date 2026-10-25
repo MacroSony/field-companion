@@ -260,6 +260,7 @@ TOOLS = [
                 {"group": {"type": "string", "enum": GROUPS}}, ("group",)),
     tool_schema("speak", "Request speech for general questions, greetings, or mic checks ('Can you hear me?'); not for questions needing checklist or recent-sound data. No answer during routing. Never for lone fillers/acknowledgements (Ah/Okay/Uh/Oh/Mm/Mm-hmm): ignore those.", {"reason": NAME}, ("reason",)),
     tool_schema("ignore", 'Silently ignore chatter, unintelligible fragments, incomplete commands, and lone fillers/acknowledgements (Ah, Okay, Uh, Oh, Mm, Mm-hmm). With pending BirdNET suggestions or an unfinished prior request, never accept or dismiss on them. Exception: Okay/好的 accepts the latest investigation explanation offer via get_investigations(explain=true).'),
+    {'type': 'function', 'name': 'show_silently', 'description': "Possibly addressed nature question with no clear addressee (e.g. 'Is that a hawk?'): put a short note on screen without speaking.", 'parameters': {'type': 'object', 'properties': {'text': {'type': 'string'}}, 'required': ['text']}},
 ]
 INSTRUCTIONS = """You are a concise hands-free birding/naturalist companion with an open microphone.
 Reply in English by default; the user may speak Chinese: answer in the language of the question.
@@ -331,6 +332,10 @@ Earlier tool outputs are already handled. Do not invent sightings from questions
 [TAP] means the next utterance is addressed to you.
 """
 ROUTING = 'HIGHEST-PRIORITY ROUTING RULE: If the latest assistant question is an investigation explanation offer, Okay/好的 explicitly accepts that offer: use get_investigations(explain=true), never accept_suggestions. Otherwise a turn consisting only of ah, okay, uh, oh, mm, or mm-hmm is ignore, even immediately after a pending-suggestion question or an unfinished earlier request. These fillers are NOT approval or dismissal. Yes/yeah/sure or an intelligible add command can approve BirdNET suggestions. Apply this before choosing any other tool.' + "\n" + ROUTING
+# Keep the measured override last, including after dynamic context in config().
+ROUTING_BASE = ROUTING
+ADDRESSEE_RULE = "ADDRESSEE RULE (overrides any earlier rule about general questions): The microphone hears the user's companions and strangers. Speak only when the latest turn is clearly addressed to you: it names you or the companion app, asks about the checklist, recent sounds, identification or the camera, is a mic check, directly answers your latest question, or follows [TAP]. Turns that could be meant for a person (plans, food, weather, time, personal questions, requests like 'can you pass me...', opinions like 'do you think...', anything said to a named person) are ignore. A sighting reported by someone else or as an opinion ('I think it's a red-tailed') is not a confirmed user sighting: ignore. When unsure whether a nature question is for you, use show_silently; for non-nature chatter, ignore."
+ROUTING += "\n\n" + ADDRESSEE_RULE
 ANSWER = INSTRUCTIONS + """
 ANSWER PHASE: answer ONLY the latest addressed question in ONE short sentence. No tools.
 Use supplied tool results and checklist. Never acknowledge any earlier log or chatter;
@@ -420,6 +425,7 @@ class Session:
         self.speech_stopped_at = None
         self.turn_stopped_at = None
         self.turn_question = ""
+        self.silent_notes = {}  # id -> (original server transcript, expiry); ephemeral, bounded
         self.input_acknowledged = False
         self.turn_context = None
         self.turn_revision = None
@@ -1497,7 +1503,7 @@ class Session:
                 "Speak only this text, with no additions, hints, translation or explanation. "
                 "Text to read: " + json.dumps(self.expert_readout, ensure_ascii=False))
         return {"output_modalities": ["text" if phase == "route" else "audio"],
-                "instructions": (ROUTING + "\nFresh state snapshot (context only; sounds are unconfirmed): "
+                "instructions": (ROUTING_BASE + "\nFresh state snapshot (context only; sounds are unconfirmed): "
                                  + json.dumps(self.route_snapshot())
                                  + "\nCurrent pending BirdNET suggestions (unconfirmed; latest turn only): "
                                  + json.dumps([r["en"] for r in self.suggestions.values()])
@@ -1513,6 +1519,7 @@ class Session:
                                  + json.dumps([{**{k: row[k] for k in ("id", "species", "status", "stage")},
                                                 "question": row["question"][:200]}
                                                for row in self.investigations.payload()["items"][-8:]])
+                                 + "\n\n" + ADDRESSEE_RULE
                                  if phase == "route" else answer_instructions),
                 "tools": TOOLS if phase == "route" else [],
                 "tool_choice": "required" if phase == "route" else "none"}
@@ -1944,7 +1951,9 @@ class Session:
         selector = self.status_selector(self.turn_question)
         words = " ".join(self.normalized_words(str(self.turn_question)))
         idle_start = (not self.camera_request and words in ("start", "start please", "开 始", "开 始 吧"))
-        if idle_start:
+        if name == "show_silently":
+            pass  # Never promote a silent card to camera/status speech or feedback.
+        elif idle_start:
             self.log("camera_guard", requested_tool=name, reason="no_pending_capture")
             self.queue_feedback("clarify")
             call = {**call, "name": "ignore", "arguments": "{}"}
@@ -1985,8 +1994,8 @@ class Session:
                 raise ValueError("Unknown routed tool")
             if "group" in args and args["group"] not in GROUPS:
                 raise ValueError("invalid iconic group")
-            if name == "describe" and not isinstance(args.get("text"), str):
-                raise ValueError("describe requires text")
+            if name in ("describe", "show_silently") and not isinstance(args.get("text"), str):
+                raise ValueError(name + " requires text")
             if name == "recent_sounds" and not np.isfinite(float(args.get("seconds", 15))):
                 raise ValueError("seconds must be finite")
             self.record_route(name, call.get("arguments"))
@@ -2007,11 +2016,18 @@ class Session:
                     "type": "function_call_output", "call_id": call["call_id"],
                     "output": json.dumps(result)}})
                 return
-            await self.acknowledge_tool(name)
+            # Silent routes must never enter receipt/audio or checklist execution.
+            if name not in ("ignore", "show_silently"):
+                await self.acknowledge_tool(name)
             self.tools_executed = True
-            result = {"ok": True} if name == "ignore" else (
-                {"ready_to_answer": True, "reason": args.get("reason")} if name == "speak"
-                else await self.tool(name, args))
+            if name == "show_silently":
+                result = await self.show_silent_note(args["text"])
+            elif name == "ignore":
+                result = {"ok": True}
+            elif name == "speak":
+                result = {"ready_to_answer": True, "reason": args.get("reason")}
+            else:
+                result = await self.tool(name, args)
             if name == "get_observation" and result.get("analysis_status") in ("awaiting_confirmation", "capturing", "analyzing", "failed"):
                 status = result["analysis_status"]
                 ready = self.camera_request and self.camera_request["phase"] == "ready"
@@ -2768,9 +2784,38 @@ class Session:
             finally:
                 self.audio_queue.task_done()
 
+    def prune_silent_notes(self):
+        now = time.monotonic()
+        self.silent_notes = {key: value for key, value in self.silent_notes.items() if value[1] > now}
+
+    async def show_silent_note(self, text):
+        self.prune_silent_notes()
+        while len(self.silent_notes) >= 20:
+            del self.silent_notes[next(iter(self.silent_notes))]
+        note_id = uuid.uuid4().hex
+        question = str(self.turn_question)
+        self.silent_notes[note_id] = (question, time.monotonic() + 30)
+        event = {"type": "silent_note", "id": note_id, "question": question, "note": text[:120]}
+        self.log("silent_note", id=note_id, question=question, note=event["note"])
+        await self.phone_json(event)
+        return {"ok": True, "suppress_answer": True}
+
     async def handle_phone(self, event, client=None):
         client = client or self.mic or next((c for c in self.clients if c.role == "mic"), None)
         ty = event.get("type")
+        if ty == "answer_note":
+            if not isinstance(event.get("id"), str):
+                raise ValueError("answer_note requires a note id")
+            self.prune_silent_notes()
+            note = self.silent_notes.pop(event.get("id"), None)
+            if note is None:
+                return  # Expired, reset or already answered on another client.
+            self.tap_at = time.monotonic()  # Also enables this answer in Quiet mode.
+            await self.phone_json({"type": "silent_note_removed", "id": event["id"]})
+            self.log("answer_note", id=event["id"])
+            # Reuse the ordinary queued text-turn path; never trust client/model question text.
+            event = {"type": "text", "text": "[TAP] " + note[0]}
+            ty = "text"
         if ty == "audio_mode" or (ty == "hello" and "earphones" in event):
             if not isinstance(event.get("earphones"), bool):
                 raise ValueError("earphones must be boolean")
@@ -2982,7 +3027,7 @@ class Session:
         self.connected = False
         await self.clear_outing()
         for rows in (self.history, self.windows, self.seen, self.notified, self.pending,
-                     self.spoken, self.transcripts, self.conversation_ids):
+                     self.spoken, self.transcripts, self.conversation_ids, self.silent_notes):
             rows.clear()
         self.last_proactive = float("-inf")
         self.user_speaking = self.awaiting_transcript = self.active = False

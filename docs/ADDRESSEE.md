@@ -38,10 +38,17 @@ Gated turns are deleted from the Realtime conversation with
    per turn on CPU (ECAPA-TDNN or similar) and skip turns that do not match.
    Threshold errs toward accepting the owner: a missed sighting is worse than
    a stray answer. Support several enrolled companions.
-4. **Tiered response** (kind C). The router picks one of: speak (clearly
-   addressed), show silently on screen (possibly addressed, e.g. a bird
-   question with no addressee), ignore. A false activation then costs a card,
-   not a sentence. Logging keeps its earcon.
+4. **Tiered response** (kind C): **implemented (V2, measured on text router)**.
+   The router picks one of: speak (clearly addressed), `show_silently` on screen
+   (possibly addressed, e.g. a bird question with no addressee), ignore. A false
+   activation then costs a card, not a sentence. Logging keeps its earcon.
+   Silent cards use the original server transcript, expire after about 30 s,
+   and have Answer/dismiss controls on phone and display. Answer sends the note
+   id; the server queues its original question prefixed `[TAP]` through the
+   existing text router, with the ordinary tap allowance in Quiet mode.
+   No checklist write, earcon, feedback clip or answer request accompanies a card.
+   V2 and the tool schema match the measured literals verbatim; the override is
+   last, after dynamic routing context, matching the harness.
 5. **Context window.** After the assistant asks a question ("add it?"), a
    short reply within a few seconds is addressed to it. Otherwise the default
    for ambiguous speech is not to speak.
@@ -62,3 +69,17 @@ Gated turns are deleted from the Realtime conversation with
 
 Metrics: false speak rate on not-addressed turns, missed command rate on
 addressed turns (sightings and questions), added latency.
+
+### V2 text-router result and implementation
+
+`/data/build/tmp/addressee/router/REPORT.md`: appending V2 reduced false speech
+on not-addressed chatter from **58% to 10%**, with **no missed commands**.
+The frozen literals are `prompts.json` keys `V2` and `show_silently`; the harness
+appended the override after the state snapshot and all dynamic context.
+This does not establish real audio/field reliability; those evaluations remain.
+
+Offline regressions cover literal prompt/schema parity, routing silence,
+original-transcript fan-out, Answer `[TAP]` re-routing, bounded/expired/reset
+notes, and recorder outcome `routed` / routed_tool `show_silently` with no audio.
+The extended offline web mock/self-test covers phone/display cards, Answer,
+dismiss/expiry, literal transcript rendering, and absence of new audio sources.

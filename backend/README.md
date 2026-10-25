@@ -395,10 +395,16 @@ futures. Routing/answer updates wait for their echoes and validate modality,
 tool choice and instructions before sending `response.create`. Higgs initializes
 only after the first update; its initial `session.created` is accepted for setup.
 
-1. Route with text-only output, required tool choice, ignore/add/set/remove/speak
+1. Route with text-only output, required tool choice, ignore/show_silently/add/set/remove/speak
    and read tools (`get_checklist`, `recent_sounds`, `nearby_species`). Route audio
    and captions are discarded defensively, never buffered for later playback.
 2. Ignore returns only a function output upstream, with no UI action or answer.
+   `show_silently(text)` sends a `silent_note` card to phones and displays: server
+   id, original server transcript as `question`, model `text` as `note` (120 chars).
+   It is routing-only: no answer request, checklist write, earcon or feedback clip,
+   and no promotion to camera/status speech. Both silent routes pass the read-only
+   safety guard, while filler/consent guards still apply. The recorder's existing
+   `record_route` records outcome `routed`, routed_tool `show_silently`, no audio.
    Successful mutations immediately broadcast checklist + logged earcon, return
    function output, and do not create a spoken continuation.
 3. Speak/read results switch the session to audio, tool choice none, no tools;
@@ -410,6 +416,22 @@ only after the first update; its initial `session.created` is accepted for setup
    turns take priority over deferred notifications.
 5. Quiet mode keeps logging but suppresses spoken routes unless a tap occurred
    within the last ten seconds. Tap does not permanently enable speech.
+
+The **V2 addressee rule** and `show_silently` schema are verbatim from the measured
+text router (`/data/build/tmp/addressee/router/prompts.json`). V2 is the final
+`ROUTING` block. `config("route")` places that same block once **after all dynamic
+context**, just as `run_router.py:config` did; appending it before the snapshot
+would not match the measurement. No addressee block or tools enter answer mode.
+The measured false-speech rate on not-addressed chatter fell from 58% to 10%,
+with no missed commands; this is text-router evidence, not field/audio validation.
+
+Cards expire after about 30 seconds or can be dismissed locally, without sound.
+**Answer** sends `{"type":"answer_note","id":...}` from either phone or display.
+The server consumes its stored original question (ignoring any client question),
+prefixes `[TAP] `, sets the existing ten-second tap/Quiet-mode allowance, and
+queues the ordinary text routing turn. Answered cards disappear on all clients;
+expired, duplicate and reset ids are ignored. Notes are ephemeral, not replayed
+on reconnect, and bounded to 20 server-side / three visible per client.
 
 Instructions request English by default, the question's language for answers
 (including Chinese), no unsupported claims of logging, and no delayed “I've
