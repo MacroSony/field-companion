@@ -88,3 +88,31 @@ original-transcript fan-out, Answer `[TAP]` re-routing, bounded/expired/reset
 notes, and recorder outcome `routed` / routed_tool `show_silently` with no audio.
 The extended offline web mock/self-test covers phone/display cards, Answer,
 dismiss/expiry, literal transcript rendering, and absence of new audio sources.
+
+## Results so far (text router, higgs-realtime-1.5-preview)
+
+| Test set | Variant | Spoke on not-addressed turns | Missed speak | Missed log |
+|---|---|---|---|---|
+| Mika's set (34 turns × 2) | main | 29/50 (58%) | 0/10 | 0/8 |
+| Mika's set | V2 | 5/50 (10%) | 0/10 | 0/8 |
+| Held-out set (108 turns × 2) | main | 41/92 (45%) | 0/73 | 0/50 |
+| Held-out set | V2 | 30/83 (36%) | 0/66 | 0/47 |
+
+The held-out set was written by a separate agent that never saw the rule
+(`/data/build/tmp/addressee/heldout/`). The large gain on Mika's set was mostly
+overfitting: the rule lists the same examples. On held-out turns V2 fixes
+plain social chatter ("Did you bring the flask?") and costs no missed commands,
+but **bird talk between people still triggers the assistant** ("What do you
+reckon, a nuthatch?", "There, it did it again.", "嘘，先听一下。"): look,
+ask_expert, recent_sounds and get_checklist on turns meant for a friend.
+Text alone cannot separate these; friend and bystander lines (12 of the 30)
+are the speaker gate's job.
+
+Held-out V2 had 4 upstream error turns and 16 turns not run after session
+failures, hence the smaller denominators. Scoring: recomputed from raw.jsonl
+with remove_observation/discard_observation counted as log and describe as
+speech (`/data/build/tmp/addressee/heldout_run/`).
+
+Next idea (V3): every routing call carries `addressed: explicit | implicit`.
+Implicit speech-class routes (look, ask_expert, recent_sounds, reads) become a
+silent card offering that action instead of speaking; explicit ones run as now.
