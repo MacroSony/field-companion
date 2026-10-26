@@ -1,4 +1,4 @@
-"""LiveKit owns all speech playout, VAD, adaptive interruption and resumption.
+"""LiveKit owns speech playout/VAD; accepted addressing authorizes interruption.
 
 The existing text-only router continues to own app tools. This avoids two
 independent tool loops and preserves route safety, silent logging and jobs.
@@ -27,11 +27,12 @@ class RoutedVoiceAgent(Agent):
         raise StopResponse()
 
 
-def create_session(config, *, adaptive=True, model=None, vad=None):
+def create_session(config, *, adaptive=True, model=None, vad=None, wake_required=False):
     realtime = model or openai.realtime.RealtimeModel(
         api_key=config.openai_key(), model=config.model, voice=config.voice,
         turn_detection=None, modalities=['audio'], reasoning=RealtimeReasoning(effort='low'),
-        input_audio_transcription=AudioTranscription(model=config.transcription_model),
+        input_audio_transcription=AudioTranscription(model=config.transcription_model,
+            prompt='The birdwatching assistant is named Scout. Users may address it as Scout.'),
         input_audio_noise_reduction=None)
     if model is None:
         realtime.update_options(max_response_output_tokens=1024)
@@ -41,7 +42,9 @@ def create_session(config, *, adaptive=True, model=None, vad=None):
         turn_handling={
             'turn_detection': 'vad',
             'endpointing': {'min_delay': .5, 'max_delay': 3.0},
-            'interruption': {'mode': 'adaptive' if adaptive else 'vad',
+            'interruption': {'enabled': not wake_required,
+                             'discard_audio_if_uninterruptible': not wake_required,
+                             'mode': 'adaptive' if adaptive else 'vad',
                              'min_duration': .5, 'false_interruption_timeout': 2.0,
                              'resume_false_interruption': True},
             'preemptive_generation': {'enabled': False}},
@@ -60,6 +63,7 @@ class LiveKitVoice:
         self.handle = None
         self.stop_event = asyncio.Event()
         self.runner = None
+        self.answer_epoch = None
 
     def task(self, coroutine):
         if self.closed:
@@ -111,7 +115,7 @@ class LiveKitVoice:
                                         can_publish=True, can_subscribe=True,
                                         can_publish_data=True, can_update_own_metadata=False)).to_jwt())
         await self.room.connect(self.settings.url, token)
-        self.session = create_session(self.config, adaptive=self.adaptive)
+        self.session = create_session(self.config, adaptive=self.adaptive, wake_required=True)
         self.bind_session_events()
 
         self.agent = RoutedVoiceAgent()
@@ -128,12 +132,15 @@ class LiveKitVoice:
         def transcription(event):
             if event.is_final:
                 self.task(self.owner.voice_input(event.transcript))
+            elif hasattr(self.owner, 'voice_partial'):
+                self.task(self.owner.voice_partial(event.transcript))
 
         @self.session.on('conversation_item_added')
         def conversation(event):
             if isinstance(event.item, llm.ChatMessage) and event.item.role == 'assistant' and event.item.text_content:
                 self.owner.log('livekit_assistant_turn', interrupted=event.item.interrupted)
-                self.task(self.owner.voice_answer(event.item.text_content))
+                self.task(self.owner.voice_answer(event.item.text_content, interrupted=event.item.interrupted,
+                    epoch=self.answer_epoch))
 
         @self.session.on('agent_state_changed')
         def state(event):
@@ -162,6 +169,11 @@ class LiveKitVoice:
     async def reply(self, instructions, context):
         if not self.ready or self.closed:
             raise ConnectionError('LiveKit voice is not connected')
+        # Raw ASR includes ignored bystander speech. Rebuild from application
+        # memory before every approved answer, so both GPT connections see the
+        # same accepted conversation rather than separate hidden histories.
+        await self.agent.update_chat_ctx(llm.ChatContext.empty())
+        self.answer_epoch = getattr(self.owner, 'epoch', None)
         self.handle = self.context.run(self.session.generate_reply, user_input=context,
             instructions=instructions, tool_choice='none')
         handle = self.handle

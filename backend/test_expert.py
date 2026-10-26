@@ -233,7 +233,7 @@ class ExpertSessionTests(unittest.IsolatedAsyncioTestCase):
         self.c = s.Session("expert-test")
         self.c.allowed_species = lambda: set()
         self.c.rt_send = AsyncMock()
-        self.c.generate = AsyncMock()
+        self.c.generate = AsyncMock(return_value={'status':'completed','output':[]})
         self.c.phone_json = AsyncMock()
         self.c.expert = SimpleNamespace(available=True, answer=AsyncMock(return_value={
             "ok": True, "status": "completed", **decision()}))
@@ -350,7 +350,9 @@ class ExpertSessionTests(unittest.IsolatedAsyncioTestCase):
         self.c.expert.available = False
         await self.c.answer_vision(self.obs.id)
         self.assertIn("[VISION]", self.c.rt_send.call_args.args[0]["item"]["content"][0]["text"])
-        self.c.generate.assert_awaited_once_with("answer")
+        self.c.generate.assert_awaited_once()
+        self.assertEqual(self.c.generate.await_args.args, ('answer',))
+        self.assertTrue(self.c.generate.await_args.kwargs['guard']())
         self.assertEqual(self.c.investigations.jobs, {})
 
     async def test_full_research_queue_keeps_basic_visual_answer(self):

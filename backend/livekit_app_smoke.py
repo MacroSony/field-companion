@@ -29,7 +29,7 @@ async def until(predicate,seconds=30):
 
 async def cases(owner,voice,phone,client,report,events):
     voice.context=contextvars.copy_context()
-    voice.session=create_session(owner.realtime,adaptive=False)
+    voice.session=create_session(owner.realtime,adaptive=False,wake_required=True)
     voice.bind_session_events()
     sink=MemorySink();voice.session.output.audio=sink
     voice.agent=RoutedVoiceAgent()
@@ -41,21 +41,54 @@ async def cases(owner,voice,phone,client,report,events):
     await until(lambda:owner.connected)
     fixture={'sci':'Anas platyrhynchos','en':'Mallard','zh':'绿头鸭','photo':'','group':'Aves'}
     with patch('server.resolve',return_value=fixture):
-        await owner.voice_input('Two mallards on the pond.')
+        await owner.voice_input('Scout, two mallards on the pond.')
         await until(lambda:bool(owner.items) and not owner.turn_in_progress)
     assert owner.items[0]['count']==2
     assert sink.frames==0, 'Logging unexpectedly spoke'
     assert any(event.get('type')=='earcon' for event in phone.events)
     report['checks'].append({'case':'Real GPT route logs two mallards silently with an earcon','passed':True})
 
-    await owner.voice_input('How many mallards have I logged?')
+    await owner.voice_input('Scout, how many mallards have I logged?')
     await until(lambda:sink.frames>0 and not owner.turn_in_progress,45)
     await until(lambda:bool(owner.last_assistant_text))
     assert any(word in owner.last_assistant_text.lower() for word in ('two','2'))
     assert not phone.audio, 'Old WebSocket PCM leaked alongside LiveKit'
     report['checks'].append({'case':'Real tool results produce a grounded GPT answer through LiveKit only','passed':True})
 
-    await owner.voice_input('What is that animal? Please open the camera.')
+    memory_before=owner.dialogue.snapshot()
+    await owner.voice_input('Did you bring the snacks?')
+    assert owner.dialogue.snapshot()==memory_before, 'Bystander speech entered shared memory'
+    assert not owner.pending
+    report['checks'].append({'case':'Unaddressed question does not reach routing or accepted memory','passed':True})
+
+    previous=owner.last_assistant_text
+    await owner.voice_input('Scout.')
+    await until(lambda:owner.last_assistant_text!=previous and not owner.turn_in_progress,45)
+    assert owner.wake.current(owner.reply_binding()), 'Unclear named request did not ask a question'
+    assert not owner.camera_request and len(owner.items)==1
+    await owner.voice_input('Tell me how many mallards are on the list.')
+    await until(lambda:not owner.turn_in_progress and not owner.pending,45)
+    assert any(word in owner.last_assistant_text.lower() for word in ('two','2')), 'Clarification reply did not reach a checklist answer'
+    report['checks'].append({'case':'Calling Scout without intent asks for clarification and accepts a relevant name-free reply','passed':True})
+
+    # Synthetic accepted-history fixture, avoiding 30 extra billed spoken turns.
+    # Both real GPT connections must use the same compacted application memory.
+    owner.dialogue.add('user', 'I call the duck beside the east pond Willow.')
+    owner.dialogue.add('assistant', 'I will remember that nickname.')
+    for number in range(15):
+        owner.dialogue.add('user', f'I am passing trail marker {number}.')
+        owner.dialogue.add('assistant', f'Understood, trail marker {number}.')
+        await asyncio.sleep(0)
+    if owner.dialogue.task:
+        await owner.dialogue.task
+    assert owner.dialogue.summary and 'Willow' in owner.dialogue.summary
+    previous=owner.last_assistant_text
+    await owner.voice_input('Scout, what nickname did I give the duck beside the east pond?')
+    await until(lambda:owner.last_assistant_text!=previous and not owner.turn_in_progress,45)
+    assert 'willow' in owner.last_assistant_text.lower(), 'Realtime answer did not recall compacted older dialogue'
+    report['checks'].append({'case':'Real Realtime router and voice recall an early nickname after 30 newer accepted-history fixture messages','passed':True})
+
+    await owner.voice_input('Scout, what is that animal? Please open the camera.')
     await until(lambda:owner.camera_request and not owner.turn_in_progress)
     request=owner.camera_request
     assert request['phase']=='opening'
@@ -70,7 +103,7 @@ async def cases(owner,voice,phone,client,report,events):
     # application retry resolver and LiveKit cue playback together.
     await owner.photo_failed(owner.observations[request['obs']],request)
     captures=sum(event.get('type')=='capture' for event in phone.events)
-    await owner.voice_input('Okay, I want to retry.')
+    await owner.voice_input('Scout, okay, I want to retry.')
     await until(lambda:owner.camera_request and owner.camera_request['id']!=request['id'] and not owner.turn_in_progress)
     retry_request=owner.camera_request
     assert retry_request['obs']==request['obs'] and retry_request['phase']=='opening'
@@ -108,6 +141,12 @@ async def main():
             report['passed']=True
         except Exception as error:
             report['error_type']=type(error).__name__
+            if isinstance(error,AssertionError):
+                report['assertion']=str(error)
+            report['last_assistant']=owner.last_assistant_text
+            report['recent_routes']=[event for event in events if event['event'] in ('route_done','tool','assistant_transcript')][-8:]
+            report['reply_events']=[event for event in events if event['event'] in ('input_ignored','reply_addressing_unavailable','reply_addressing')]
+            report['pending_reply']=owner.wake.pending.question if owner.wake.pending else None
             report['failed_events']=[event['event'] for event in events if 'failed' in event['event'] or 'error' in event['event']]
         finally:
             await owner.close()

@@ -14,6 +14,16 @@ try {
         [Globalization.CultureInfo]::GetCultureInfo('en-US'))
     foreach ($labCase in @(
         @{name='microphone-check'; text='Can you hear me?'},
+        @{name='scout-check'; text='Scout, can you hear me?'},
+        @{name='scout-greeting'; text='Scout, are you there?'},
+        @{name='scout-invitation'; text='Scout, ask me what I need help with.'},
+        @{name='scout-animal'; text='Scout, I saw an animal. Help me identify the species.'},
+        @{name='answer-animal'; text='I saw an animal. Help me identify the species.'},
+        @{name='camera-start'; text='Start.'},
+        @{name='scout-photo-status'; text='Scout, how is the identification process?'},
+        @{name='scout-photo-result'; text='Scout, show me the result.'},
+        @{name='scout-barge'; text='Scout, wait, how many birds are on my checklist?'},
+        @{name='bystander'; text='Did you bring the snacks?'},
         @{name='barge'; text='Wait, how many birds are on my checklist?'})) {
         $labSpeech.SetOutputToWaveFile((Join-Path $labOutput ($labCase.name + '.wav')), $labFormat)
         $labSpeech.Speak($labCase.text)

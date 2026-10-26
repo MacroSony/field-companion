@@ -61,8 +61,10 @@ There are two GPT Realtime connections per active call:
 
 1. LiveKit's OpenAI plugin receives the processed microphone track and plays
    approved speech through one native WebRTC audio track. The browser requests
-   acoustic echo cancellation. LiveKit uses Silero VAD, adaptive interruption,
-   and resumption after false interruptions. GPT server turn detection is off,
+   acoustic echo cancellation. LiveKit uses Silero VAD and retains incoming
+   audio while speaking, with automatic interruption disabled. The application
+   authorizes a framework interruption only after addressing is accepted.
+   GPT server turn detection is off,
    so a second system cannot independently cancel or start a spoken answer.
 2. The existing text-only router receives accepted transcripts and runs the
    existing tools. It receives no voice PCM and produces no audible answer.
@@ -84,6 +86,52 @@ BirdNET attempts a separate unprocessed 48 kHz microphone capture. If the
 browser cannot verify that separate raw input, the UI reports BirdNET as
 unavailable rather than feeding it the processed voice channel. Assistant
 playback and a short tail are excluded from BirdNET input.
+
+## Scout addressing and shared memory
+
+Start each new spoken request with **Scout**, for example "Scout, what is that?"
+or "Hey Scout, how is the identification going?". Merely mentioning Scout in a
+sentence does not count. A named request with unclear intent gets one clarifying
+question. Deliberate text inputs and buttons remain direct controls.
+
+After a completed assistant question, a relevant answer may omit the name for
+40 seconds. This permission is bound to the current camera/focus, suggestions
+and task IDs, consumed by one accepted reply, and revoked by a later assistant
+statement or state change. Camera ready explicitly invites **Start**, which
+works without another model call. Other paraphrases and question replies use a
+small read-only semantic classifier; unrelated chatter stays silent and leaves
+the question open. Classification has a shared six-second deadline. If the
+service fails or times out, the phone shows a retry notice and the question is
+retained; no action or interruption is authorized. This is logged as a service
+failure, not unrelated chatter. Say Scout to make a fresh request if needed.
+This is relevance classification, not a
+runtime list of approved task phrasings.
+
+Unaddressed speech does not interrupt playout. A recognized partial Scout prefix
+can interrupt earlier; otherwise interruption waits for transcription and,
+for a name-free reply, its relevance check. Manual interruption remains
+available. This trades some barge-in latency for explicit addressing.
+
+Both GPT connections receive the same application-owned memory: up to 24 recent
+accepted messages (12,000 characters), plus a rolling summary of older dialogue
+(4,000 characters). Older originals stay available while compaction runs. The
+summary preserves preferences, referents, corrections and unresolved questions;
+fresh backend state remains authoritative for checklist entries, photo evidence
+and investigation progress. Ignored speech is excluded. The voice model's raw
+transcript history is cleared before each approved answer and rebuilt using
+this shared memory, so bystander transcripts cannot become hidden voice context.
+
+Compaction is asynchronous and does not block the voice or investigations. If
+the API fails, older originals are retained within a 16,000-character buffer;
+forced eviction is explicitly marked as incomplete history. Reconnecting voice
+within the same server session retains memory. Reset, session expiry (ten
+minutes with no clients), or backend restart clears it. This is session memory,
+not cross-day storage. Memory and name-free reply checks use the configured
+OpenAI key with gpt-5.4-mini; neither can run application tools.
+
+The mic still sends audio for transcription and BirdNET. Scout is an application
+addressing rule, not a local hardware wake-word detector. Browser AEC and physical
+phone testing remain necessary; a wake rule cannot prove acoustic echo is gone.
 
 ## Validation
 
@@ -122,10 +170,10 @@ passed all four checks with no SDK runtime errors; see the
 
 After saving Cloud credentials and starting the application, run
 `backend/livekit_cloud_smoke.py --port 8805` in `.venv-livekit` to test the real
-room transport. It uses the generated microphone-check and barge WAV fixtures,
+room transport. It uses the generated scout-check, scout-barge and bystander WAV fixtures,
 publishes a synthetic microphone through the RTC SDK and receives real agent
 audio. It creates an isolated temporary app session and closes it afterward.
-This also makes billed API calls. The initial run passed signaling, spoken
+This also makes billed API calls. The earlier pre-Scout run passed signaling, spoken
 question/answer and a spoken follow-up during a reply. The server log showed
 adaptive initialization, an interrupted reply, and no fallback to VAD. See the
 [Cloud smoke report](benchmarks/livekit_cloud_smoke.json). Its follow-up was
@@ -134,10 +182,8 @@ of perfect segmentation. The test does not evaluate browser AEC or phone echo.
 
 ## Limits and rollback
 
-Adaptive interruption requires LiveKit Cloud credentials and service access.
-The SDK can fall back to VAD interruption when its adaptive service fails; check
-the agent log for that message. Adaptive interruption filters conversational
-backchannels; it is not itself acoustic echo cancellation. Actual speaker echo
+Automatic adaptive/VAD interruption is disabled in Scout mode. Accepted requests
+use the SDK's forced interruption API. Actual speaker echo
 still depends on the phone/browser's audio processing and output route.
 Separate raw and processed captures also need validation on the target phone.
 Local and synthetic tests cannot establish that the physical echo bug is fixed.
@@ -146,6 +192,71 @@ The router and voice model use two API connections, with corresponding latency
 and usage. This is an integration of the mature media stack while retaining the
 current routing behavior; it does not yet consolidate both models into one
 tool-calling agent. Browser captions currently show final accepted transcripts.
+
+`backend/conversation_eval.py` makes opt-in billed calls to check semantically
+different replies, unrelated chatter, and recall after older dialogue is
+summarized. Offline addressing/memory tests live in `test_conversation_state.py`
+and `test_livekit.py`. Synthetic Cloud audio tests do not evaluate physical echo.
+
+The Scout revision passed [19 reply/memory API checks](benchmarks/scout_conversation_eval.json),
+[seven real routing/playback checks](benchmarks/scout_livekit_app_smoke.json),
+and [four Cloud transport/addressing checks](benchmarks/scout_livekit_cloud_smoke.json).
+The application recall check supplies synthetic accepted-history messages to
+exercise compaction, then asks the real Realtime router and voice for an early
+nickname. These finite checks do not establish perfect intent recognition or
+physical echo cancellation.
+
+### Regression coverage after phone feedback
+
+The initial test count was mostly offline state/protocol coverage. The seven
+application smoke checks stopped the camera flow at capture, then forced a
+failure; they never exercised a successful upload followed by automatic result
+speech. The reply-only API eval also used a 12-second timeout while production
+used three seconds. These were test design gaps, not evidence of reliable field
+behavior. The new `test_livekit_regressions.py` exposed four failures in the old
+code before the fixes were applied.
+
+Routing and speech now have separate instructions. A successful photo result
+is rendered from its grounded names/uncertainty as an approved backend readout,
+without reclassifying the prior user turn. New visual observations default to
+`Any` when their category is unspecified; generic animal is not Mammalia. Exact
+image taxa are resolved without the guessed group, failed name lookups are
+retried, and the resolved category is retained with the observation.
+
+The revised checks include:
+
+- delayed/failed reply classification, retry recovery, superseded requests and
+  the old three-second boundary;
+- successful automatic photo readout with no new user turn, canceled readouts,
+  guessed-group correction and repair of a prior failed name lookup;
+- three samples of each of 18 real API reply cases, using production's exact
+  deadline wrapper, plus older-dialogue recall;
+- real Cloud RTC microphone -> transcription -> route -> photo upload ->
+  BioCLIP -> iNaturalist -> automatic spoken result -> progress -> result replay;
+- received non-silent audio measured within the result's own speech window.
+  Earlier acknowledgement audio cannot make a silent result pass.
+
+Run the opt-in real camera replay in `.venv-livekit` with a local JPEG fixture:
+
+```powershell
+powershell -File backend/make_audio_lab_fixtures.ps1
+.\.venv-livekit\Scripts\python.exe backend/livekit_camera_replay.py --photo path/to/fixture.jpg --repeats 3
+.\.venv-livekit\Scripts\python.exe backend/livekit_camera_replay.py --photo path/to/fixture.jpg --repeats 1 --invite --report-prefix camera-replay-invited
+.\.venv-livekit\Scripts\python.exe backend/conversation_eval.py --repeats 3
+```
+
+Each replay creates an isolated temporary app session. It uses real APIs and
+recognition services; the phone/microphone and camera submission are synthetic.
+It validates returned evidence and delivered audio, not recognition ground truth,
+physical loudspeaker audibility, browser permissions or acoustic echo cancellation.
+The fixed local fixture came from the iNaturalist taxon photo, with source and
+attribution kept under ignored `out/livekit/regression-photo-source.json`.
+
+The [reviewed phone-regression report](benchmarks/scout_phone_regressions.json)
+records four pre-fix failures, the corrected offline regressions, 55 repeated
+reply/memory checks, 18 repeated photo routes, three complete camera replays,
+and an additional invited-reply replay with per-answer received-audio checks.
+One valid classifier reply took 3.5 seconds, exceeding the old production limit.
 
 To return to standard audio, use the settings link **Use standard audio**, or
 remove `transport=livekit` from the URL and use a separate session ID. Existing

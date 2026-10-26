@@ -21,6 +21,7 @@ import requests
 from livekit_settings import LiveKitSettings
 from realtime_webrtc import openai_config
 from tool_feedback import recording
+from conversation_state import ScoutGate, SharedDialogue, ConversationServices, MEMORY_RULE
 
 
 def browser_token(settings, room_name, identity):
@@ -65,17 +66,58 @@ class LiveKitSessionMixin:
         self.voice_context = deque(maxlen=8)
         self.routing_task = None
         self.transcript_guard_task = None
+        self.wake = ScoutGate()
+        self.conversation_services = ConversationServices(self.realtime)
+        self.dialogue = SharedDialogue(self.conversation_services.summarize)
+        self.voice_input_lock = asyncio.Lock()
 
     @property
     def echo_guard(self):
-        return False  # LiveKit owns validated interruption; no 180 ms app gate.
+        return False  # Browser AEC + addressed SDK interruption; no 180 ms app gate.
 
     def state_payload(self):
         result = super().state_payload()
+        pending_reply = self.wake.current(self.reply_binding())
         return {**result, 'connected': bool(self.connected and self.voice and self.voice.ready),
                 'media_connected': bool(self.voice and self.voice.ready),
                 'speaking': self.voice_speaking, 'transport': 'livekit',
-                'interruption_owner': 'livekit', 'interruption_mode': 'adaptive'}
+                'interruption_owner': 'livekit', 'interruption_mode': 'addressed',
+                'wake_name': self.wake.name, 'wake_required': True,
+                'reply_without_name': bool(pending_reply),
+                'reply_without_name_for': max(0, pending_reply.expires - self.wake.clock()) if pending_reply else 0,
+                'memory_recent_messages': len(self.dialogue.recent),
+                'memory_has_summary': bool(self.dialogue.summary)}
+
+    def reply_binding(self):
+        request = self.camera_request
+        return json.dumps({'focus': self.focus,
+            'camera': [request['id'], request['phase']] if request else None,
+            'suggestions': sorted(self.suggestions),
+            'investigations': list(self.investigations.jobs)}, sort_keys=True)
+
+    def heard_assistant(self, text, *, interrupted=False, kind='question'):
+        self.dialogue.add('assistant', text, interrupted=interrupted)
+        if kind == 'question' and any(self.consent_context().values()):
+            kind = 'confirmation'
+        self.wake.offer(text, self.reply_binding(), kind=kind, interrupted=interrupted)
+
+    def config(self, phase):
+        config = super().config(phase)
+        config['instructions'] += '\n' + MEMORY_RULE
+        if phase == 'answer' and self.expert_readout is None:
+            config['instructions'] += ('\nYour name is Scout. Do not begin spoken replies with your own '
+                'wake name. When clarification is needed, ask one specific question ending in a question mark.')
+        if phase == 'route':
+            config['instructions'] += json.dumps(self.dialogue.snapshot(), ensure_ascii=False)
+            config['instructions'] += (
+                '\nAddressing override: this latest request has ALREADY been accepted by '
+                'the application as addressed to Scout (named request, current-question '
+                'reply, or deliberate text input). Do not ignore it as chatter. If intent '
+                'or target is unclear, call clarify_request with one concise question in '
+                'the user\'s language. Never guess an old species or action. Historical '
+                'dialogue is not a new request. Latest question being answered, if any: '
+                + json.dumps(getattr(self.turn_question, 'reply_to', None), ensure_ascii=False))
+        return config
 
     def assistant_audio_pending(self):
         return self.voice_speaking or super().assistant_audio_pending()
@@ -127,7 +169,7 @@ class LiveKitSessionMixin:
             self.voice_task = asyncio.create_task(self.open_voice(voice, room_name, identity, owner))
             # Return the phone token before waiting for RoomIO to attach to it.
             return {'url': settings.url, 'token': browser_token(settings, room_name, identity),
-                    'room': room_name, 'identity': identity, 'interruption_mode': 'adaptive'}
+                    'room': room_name, 'identity': identity, 'interruption_mode': 'addressed'}
 
     async def open_voice(self, voice, room_name, identity, owner):
         try:
@@ -149,28 +191,114 @@ class LiveKitSessionMixin:
             await self.error('LiveKit voice could not connect. End and restart after checking project setup.')
             await self.state()
 
+    async def voice_partial(self, text):
+        # The media framework still owns playout. Only a recognized vocative can
+        # force interruption before the final transcript/relevance check.
+        if (self.mic and self.mic_on and self.voice and self.voice.ready
+                and self.voice_speaking and self.wake.addressed(text) is not None):
+            await self.voice.interrupt()
+
     async def voice_input(self, text):
+        async with self.voice_input_lock:
+            await self.accept_voice_input(text)
+
+    async def accept_voice_input(self, text):
         if not self.mic or self.closed or not self.voice or not self.voice.ready:
             return
         self.awaiting_transcript = False
         if self.transcript_guard_task:
             self.transcript_guard_task.cancel()
             self.transcript_guard_task = None
-        ignored = self.ignored_input_reason(text) if text.strip() else 'empty'
-        if ignored:
-            self.log('input_ignored', reason=ignored)
+        if not self.mic_on or not text.strip():
+            self.log('input_ignored', reason='mic_off_or_empty')
             await self.flush_pending()
             return
+        accepted = self.wake.addressed(text)
+        reply_to = None
+        reply_lease = None
+        camera_action = 'none'
+        if accepted is None:
+            prompt = self.wake.current(self.reply_binding())
+            if not prompt:
+                self.log('input_ignored', reason='wake_name_required')
+                await self.flush_pending()
+                return
+            # The exact explicitly invited camera keyword needs no model call.
+            keyword = text.strip(' \t\n.,!！。？?').lower()
+            if prompt.kind == 'camera' and keyword in ('start', '开始'):
+                decision = {'kind': 'answer', 'camera_action': 'start'}
+            else:
+                binding = self.reply_binding()
+                revision = self.input_revision
+                started = time.monotonic()
+                self.awaiting_transcript = True
+                try:
+                    decision = await self.conversation_services.classify_reply_with_deadline(prompt, text)
+                except Exception as exc:
+                    self.log('reply_addressing_unavailable', error_type=type(exc).__name__,
+                        text=text[:1000], elapsed_ms=round((time.monotonic() - started) * 1000))
+                    # Service failure is not a semantic rejection. Retain the
+                    # question, avoid actions/interruption, and provide recovery.
+                    if (not self.closed and self.input_revision == revision
+                            and self.wake.current(self.reply_binding()) is prompt):
+                        await self.phone_json({'type': 'reply_retry', 'message':
+                            'I could not check that reply. Say “Scout” and repeat it.'})
+                    self.awaiting_transcript = False
+                    await self.flush_pending()
+                    return
+                finally:
+                    self.awaiting_transcript = False
+                self.log('reply_addressing', kind=decision['kind'], camera_action=decision['camera_action'],
+                         elapsed_ms=round((time.monotonic() - started) * 1000))
+                # A delayed classification cannot answer an expired or replaced question.
+                if (self.closed or self.input_revision != revision or self.reply_binding() != binding
+                        or self.wake.current(binding) is not prompt):
+                    return
+            if decision['kind'] != 'answer':
+                self.log('input_ignored', reason='not_answer_to_pending_question')
+                await self.flush_pending()
+                return
+            accepted, reply_to = text, prompt.question
+            reply_lease = (prompt.binding, self.input_revision, prompt.expires)
+            if prompt.kind == 'camera':
+                camera_action = decision['camera_action']
+        self.wake.clear()
+        # Empty/partial named requests are still addressed: ask, rather than
+        # silently discarding them as fillers or treating an old task as intent.
+        accepted = accepted or '(Scout was called without a request.)'
         self.log('user_transcript', text=text, transport='livekit')
         self.user_speaking = self.awaiting_transcript = False
         self.speech_stopped_at = time.monotonic()
         await self.phone_json({'type': 'transcript', 'role': 'user', 'text': text, 'final': True})
-        await self.handle_phone({'type': 'text', 'text': text}, self.mic)
+        if self.assistant_audio_pending():
+            await self.cancel_speech()
+        if reply_lease and (self.reply_binding() != reply_lease[0]
+                or self.input_revision != reply_lease[1] or self.wake.clock() >= reply_lease[2]):
+            self.log('input_ignored', reason='reply_context_changed')
+            await self.flush_pending()
+            return
+        if camera_action in ('start', 'cancel'):
+            self.dialogue.add('user', accepted)
+            self.input_revision += 1
+            self.auto_speech_paused = False
+            await self.camera_confirmation('start' if camera_action == 'start' else 'cancel')
+            await self.flush_pending()
+        else:
+            await self.handle_phone({'type': 'text', 'text': accepted,
+                '_addressed': True, '_reply_to': reply_to}, self.mic)
 
-    async def voice_answer(self, text):
-        if self.closed:
+    async def handle_phone(self, event, client=None):
+        if event.get('type') == 'text' and isinstance(event.get('text'), str) and 0 < len(event['text'].strip()) <= 8000:
+            self.wake.clear()
+            self.dialogue.add('user', event['text'])
+            event = {**event, '_addressed': True}
+        return await super().handle_phone(event, client)
+
+    async def voice_answer(self, text, *, interrupted=False, epoch=None):
+        if self.closed or (epoch is not None and epoch != self.epoch):
             return
         self.last_assistant_text = text
+        self.heard_assistant(text, interrupted=interrupted)
         self.log('assistant_transcript', text=text, transport='livekit')
         await self.phone_json({'type': 'transcript', 'role': 'assistant', 'text': text, 'final': True})
         if self.connected and self.rt is not None:
@@ -179,6 +307,7 @@ class LiveKitSessionMixin:
             await super().rt_send({'type': 'conversation.item.create', 'item': {
                 'id': item_id, 'type': 'message', 'role': 'assistant',
                 'content': [{'type': 'output_text', 'text': text}]}})
+        await self.state()
 
     async def voice_state(self, state):
         was_speaking = self.voice_speaking
@@ -193,7 +322,7 @@ class LiveKitSessionMixin:
     async def voice_user_state(self, state):
         self.user_speaking = state == 'speaking'
         if self.user_speaking:
-            # Notification coordination only; LiveKit decides interruption.
+            # Notification coordination only; addressing decides interruption.
             self.awaiting_transcript = True
             if self.transcript_guard_task:
                 self.transcript_guard_task.cancel()
@@ -248,6 +377,7 @@ class LiveKitSessionMixin:
             raise ConnectionError('LiveKit voice is not ready')
         self.phase = 'answer'
         context = json.dumps({'user_request': str(self.turn_question),
+            'shared_dialogue': self.dialogue.snapshot(),
             'authoritative_backend_results': list(self.voice_context)}, ensure_ascii=False)
         return await self.voice.reply(self.config('answer')['instructions'], context)
 
@@ -258,10 +388,16 @@ class LiveKitSessionMixin:
         language = language or ('zh' if self.chinese(self.turn_question) or self.lang.startswith('zh') else 'en')
         text, pcm = recording(kind, language)
         played = await self.voice.say(text, pcm)
-        if played:
+        if played and (guard is None or guard()):
             self.last_assistant_text = text
+            if kind != 'received':
+                self.heard_assistant(text, kind='camera' if kind == 'camera-ready' else 'question')
+                # The cached clarification explicitly invites another utterance.
+                if kind == 'clarify':
+                    self.wake.offer(text + '?', self.reply_binding())
             await self.phone_json({'type': 'transcript', 'role': 'assistant', 'text': text, 'final': True})
             self.log('feedback_played', kind=kind, transport='livekit')
+            await self.state()
         return played
 
     async def phone_audio(self, pcm, *, guard=None):
@@ -289,6 +425,7 @@ class LiveKitSessionMixin:
                       asyncio.create_task(self.focus_watch()), asyncio.create_task(self.suggestion_loop())]
 
     async def reset(self):
+        self.wake.clear()
         if self.voice:
             await self.voice.interrupt()
             # Recreate the voice model to discard its audio/transcript context too.
@@ -297,8 +434,12 @@ class LiveKitSessionMixin:
                 await self.voice.agent.update_chat_ctx(llm.ChatContext.empty())
         self.voice_context.clear()
         await super().reset()
+        self.wake.clear()
+        await self.dialogue.reset()
+        await self.state()
 
     async def close_voice(self):
+        self.wake.clear()
         if self.transcript_guard_task:
             self.transcript_guard_task.cancel()
             await asyncio.gather(self.transcript_guard_task, return_exceptions=True)
@@ -330,6 +471,8 @@ class LiveKitSessionMixin:
 
     async def close(self):
         await self.close_voice()
+        await self.dialogue.close()
+        await self.conversation_services.close()
         await super().close()
 
 

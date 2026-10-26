@@ -130,8 +130,135 @@ class LiveKitControllerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_accepted_speech_uses_existing_camera_confirmation(self):
         self.session.handle_phone = AsyncMock()
+        await self.session.voice_input('Scout, start.')
+        self.session.handle_phone.assert_awaited_once_with(
+            {'type':'text','text':'start.', '_addressed':True, '_reply_to':None},self.client)
+
+    async def test_bystander_question_does_not_interrupt_or_enter_either_context(self):
+        self.session.voice_speaking = True
+        self.session.handle_phone = AsyncMock()
+        await self.session.voice_input('Did you bring the snacks?')
+        await self.session.voice_partial('I wonder what Scout would say.')
+        self.voice.interrupt.assert_not_awaited()
+        self.session.handle_phone.assert_not_awaited()
+        self.assertFalse(self.session.dialogue.recent)
+        self.assertFalse(self.phone.events)
+
+    async def test_named_partial_can_interrupt_but_final_is_still_required_to_route(self):
+        self.session.voice_speaking = True
+        self.session.handle_phone = AsyncMock()
+        await self.session.voice_partial('Scout, wait')
+        self.voice.interrupt.assert_awaited_once()
+        self.session.handle_phone.assert_not_awaited()
+
+    async def test_unclear_named_request_is_not_dropped_as_filler(self):
+        await self.session.voice_input('Scout, um.')
+        value = self.session.pending[-1][1]
+        self.assertTrue(value.addressed)
+        self.session.turn_question = value
+        self.session.generate = AsyncMock(return_value={'status':'completed'})
+        await self.session.finish_route({'status':'completed','output':[
+            {'type':'function_call','name':'ignore','call_id':'unclear','arguments':'{}'}]})
+        self.session.generate.assert_awaited_once_with('answer')
+        outputs = [json.loads(call.args[0]) for call in self.session.rt.send.await_args_list]
+        self.assertTrue(any('What would you like me to do?' in json.dumps(row) for row in outputs))
+
+    async def test_semantic_reply_to_clarification_uses_current_question_without_name(self):
+        await self.session.voice_answer('Would you like a photo or a checklist update?')
+        self.session.conversation_services.classify_reply = AsyncMock(return_value={'kind':'answer','camera_action':'none'})
+        await self.session.voice_input('A picture of the flower, please.')
+        value = self.session.pending[-1][1]
+        self.assertEqual(value.reply_to, 'Would you like a photo or a checklist update?')
+        self.assertIn('picture of the flower', str(value))
+        self.assertIsNone(self.session.wake.pending)
+
+    async def test_superseded_unclear_request_cannot_ask_a_delayed_question(self):
+        self.session.turn_question = core.TurnText('um', addressed=True)
+        self.session.turn_revision, self.session.input_revision = 1, 2
+        self.session.generate = AsyncMock()
+        for name in ('ignore', 'clarify_request'):
+            await self.session.finish_route({'status':'completed','output':[
+                {'type':'function_call','name':name,'call_id':'stale', 'arguments':'{"question":"Which animal?"}'}]})
+        self.session.generate.assert_not_awaited()
+
+    async def test_unrelated_reply_keeps_question_open_and_does_not_interrupt(self):
+        await self.session.voice_answer('Would you like me to explain R1?')
+        self.session.voice_speaking = True
+        self.session.conversation_services.classify_reply = AsyncMock(return_value={'kind':'unrelated','camera_action':'none'})
+        await self.session.voice_input('Can you pass the snacks?')
+        self.voice.interrupt.assert_not_awaited()
+        self.assertIsNotNone(self.session.wake.pending)
+        self.assertEqual(len(self.session.dialogue.recent), 1)
+
+    async def test_log_offer_uses_a_decision_contract_instead_of_any_related_comment(self):
+        await self.session.voice_answer('Should I add the cardinal and robin?')
+        self.assertEqual(self.session.wake.pending.kind, 'confirmation')
+
+    async def test_delayed_reply_cannot_answer_replaced_question(self):
+        await self.session.voice_answer('Which task should I explain?')
+        async def replaced(*args):
+            self.session.wake.offer('Which photo?', self.session.reply_binding())
+            return {'kind':'answer','camera_action':'none'}
+        self.session.conversation_services.classify_reply = replaced
+        self.session.handle_phone = AsyncMock()
+        await self.session.voice_input('The first one.')
+        self.session.handle_phone.assert_not_awaited()
+
+    async def test_camera_invitation_accepts_start_once_and_never_before_ready(self):
+        await self.session.request_look()
+        request = self.session.camera_request
         await self.session.voice_input('Start.')
-        self.session.handle_phone.assert_awaited_once_with({'type':'text','text':'Start.'},self.client)
+        self.assertEqual(request['phase'], 'opening')
+        request['phase'] = 'ready'
+        await self.session.play_feedback('camera-ready')
+        await self.session.voice_input('Start.')
+        self.assertTrue(any(row.get('type')=='capture' for row in self.phone.events))
+        captures = sum(row.get('type')=='capture' for row in self.phone.events)
+        await self.session.voice_input('Start.')
+        self.assertEqual(sum(row.get('type')=='capture' for row in self.phone.events), captures)
+
+    async def test_camera_consent_cannot_cross_a_preview_change_while_sending_caption(self):
+        await self.session.request_look()
+        request = self.session.camera_request
+        request['phase'] = 'ready'
+        await self.session.play_feedback('camera-ready')
+        original = self.session.phone_json
+        async def switch_preview(event):
+            if event.get('role') == 'user':
+                self.session.camera_request = {**request, 'id':'replacement-preview'}
+            await original(event)
+        self.session.phone_json = switch_preview
+        await self.session.voice_input('Start.')
+        self.assertFalse(any(row.get('type')=='capture' for row in self.phone.events))
+        self.assertEqual(self.session.camera_request['id'], 'replacement-preview')
+
+    async def test_router_and_voice_share_memory_and_actual_state_beats_history(self):
+        await self.session.handle_phone({'type':'text','text':'Please use English.'}, self.client)
+        await self.session.voice_answer('I will use English.')
+        self.session.dialogue.summary = 'User prefers concise answers.'
+        snapshot = self.session.dialogue.snapshot()
+        self.assertIn('concise answers', self.session.config('route')['instructions'])
+        await self.session.generate('answer')
+        context = json.loads(self.voice.reply.await_args.args[1])
+        self.assertEqual(context['shared_dialogue'], snapshot)
+        self.assertIn('fresh backend', self.voice.reply.await_args.args[0].lower())
+
+    async def test_interrupted_question_does_not_grant_an_unprefixed_reply(self):
+        await self.session.voice_answer('Would you like me to explain?', interrupted=True)
+        self.assertIsNone(self.session.wake.pending)
+        self.assertTrue(self.session.dialogue.recent[-1]['interrupted'])
+
+    async def test_late_voice_callback_cannot_restore_memory_after_reset(self):
+        self.session.epoch += 1
+        await self.session.voice_answer('Old question?', epoch=self.session.epoch-1)
+        self.assertFalse(self.session.dialogue.recent)
+        self.assertIsNone(self.session.wake.pending)
+
+    async def test_muted_mic_cannot_start_a_task_even_with_name(self):
+        self.session.mic_on = False
+        self.session.handle_phone = AsyncMock()
+        await self.session.voice_input('Scout, take a photo.')
+        self.session.handle_phone.assert_not_awaited()
 
     async def test_framework_playback_blocks_pending_notifications_and_masks_birdnet(self):
         await self.session.voice_state('speaking')

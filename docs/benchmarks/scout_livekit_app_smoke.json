@@ -1,0 +1,38 @@
+{
+  "passed": true,
+  "physical_phone": false,
+  "acoustic_echo_test": false,
+  "adaptive_cloud_inference_test": false,
+  "taxonomy_fixture": true,
+  "checks": [
+    {
+      "case": "Real GPT route logs two mallards silently with an earcon",
+      "passed": true
+    },
+    {
+      "case": "Real tool results produce a grounded GPT answer through LiveKit only",
+      "passed": true
+    },
+    {
+      "case": "Unaddressed question does not reach routing or accepted memory",
+      "passed": true
+    },
+    {
+      "case": "Calling Scout without intent asks for clarification and accepts a relevant name-free reply",
+      "passed": true
+    },
+    {
+      "case": "Real Realtime router and voice recall an early nickname after 30 newer accepted-history fixture messages",
+      "passed": true
+    },
+    {
+      "case": "Camera waits for readiness and explicit Start before sending capture",
+      "passed": true
+    },
+    {
+      "case": "Failed photo retry prepares the same subject and recaptures only after a new Start",
+      "passed": true
+    }
+  ],
+  "sdk_runtime_errors": 0
+}

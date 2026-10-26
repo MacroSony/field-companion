@@ -40,6 +40,7 @@ SR = 48000
 ROOT = Path(__file__).resolve().parents[1]
 LOG = logging.getLogger("field-companion")
 GROUPS = ["Aves", "Insecta", "Plantae", "Mammalia", "Fungi", "Reptilia", "Amphibia", "Arachnida", "Mollusca", "Actinopterygii"]
+PHOTO_GROUPS = ['Any', *GROUPS]
 
 
 def api_key():
@@ -225,9 +226,10 @@ OBSERVATION = {"type": "object", "properties": {
 WRITE_TOOLS = ("add_observation", "add_observations", "accept_suggestions",
                "dismiss_suggestions", "set_count", "remove_observation", "confirm_observation")
 TOOLS = [
-    tool_schema("look", "Prepare a photo: target=new identifies a new unknown organism with independent evidence; target=current takes another photo of the existing organism. Always wait for Start/Identify before capture. Set group for nonbirds. To read an existing result use get_observation; to check progress use get_task_status.",
+    tool_schema("look", "Prepare a photo: target=new identifies a new unknown organism with independent evidence; target=current takes another photo of the existing organism. Always wait for Start/Identify before capture. Use Any/omit when the category is unspecified; a narrower group requires a user-supplied category. To read an existing result use get_observation; to check progress use get_task_status.",
                 {"target": {"type": "string", "enum": ["current", "new"]},
-                 "hint": NAME, "group": {"type": "string", "enum": GROUPS}}, ("target",)),
+                 "hint": NAME, "group": {"type": "string", "enum": PHOTO_GROUPS,
+                    "description": "Use Any or omit when the organism category is unspecified. Generic animal does not mean Mammalia. Use a narrower group only when the user identifies that category."}}, ("target",)),
     tool_schema("get_observation", "Read the existing focus evidence/identification without taking a new photo. For progress use get_task_status; for species facts or comparisons use ask_expert."),
     tool_schema("get_task_status", "Read actual photo identification or expert investigation progress without restarting work or explaining results. Use for identification process, status, progress, is it done; select a task when ambiguous.",
                 {**TASK_SELECTOR, "scope": {"type": "string", "enum": ["auto", "camera", "investigations", "all"]}}),
@@ -237,7 +239,7 @@ TOOLS = [
                  "scope": {"type":"string", "enum":["auto","camera","investigations","all"], "description":"Use camera for an explicit photo request, investigations for an explicit research/investigation request. Use auto ONLY when the user does not specify the task kind."}}),
     tool_schema("confirm_observation", "Add it / log it / two of them: confirm the focus, not a new named sighting. No speech.", {"count": COUNT, "notes": NAME}),
     tool_schema("discard_observation", "Discard the focus; do not log it."),
-    tool_schema("new_observation", "Start identifying a new unknown organism, even when the user does not say new/another. Creates independent evidence and prepares a preview; waits for Start/Identify. Set group for nonbirds. Equivalent to look(target=new).", {"group": {"type": "string", "enum": GROUPS}}),
+    tool_schema("new_observation", "Start identifying a new unknown organism, even when the user does not say new/another. Creates independent evidence and prepares a preview; waits for Start/Identify. Use Any/omit for unspecified organism or generic animal; set a narrower group only when supplied by the user. Equivalent to look(target=new).", {"group": {"type": "string", "enum": PHOTO_GROUPS}}),
     tool_schema("describe", "Attach a user description to the focus; resolve only explicit species names.", {"text": NAME, "name": NAME}, ("text",)),
     tool_schema("ask_expert", "Start a background investigation about the current focus: comparisons, conflicting evidence, diet, habitat or behaviour. Returns immediately; never log.", {"question": NAME}, ("question",)),
     tool_schema("get_investigations", "Read investigations or explain a requested result. Prefer get_task_status for progress. Set explain=true ONLY when the user asks to hear/explain a result or accepts the latest explanation offer. Use id (R1 etc.) or first/latest/all.",
@@ -262,6 +264,7 @@ TOOLS = [
     tool_schema("nearby_species", "List recent iNaturalist species near GPS; narrow down description-based IDs before asking for confirmation.",
                 {"group": {"type": "string", "enum": GROUPS}}, ("group",)),
     tool_schema("speak", "Request speech for general questions, greetings, or mic checks ('Can you hear me?'); not for questions needing checklist or recent-sound data. No answer during routing. Never for lone fillers/acknowledgements (Ah/Okay/Uh/Oh/Mm/Mm-hmm): ignore those.", {"reason": NAME}, ("reason",)),
+    tool_schema("clarify_request", "Ask ONE short specific clarification when an addressed request has an unclear action or referent. Do not perform an action or guess from stale evidence.", {"question": NAME}, ("question",)),
     tool_schema("ignore", 'Silently ignore chatter, unintelligible fragments, incomplete commands, and lone fillers/acknowledgements (Ah, Okay, Uh, Oh, Mm, Mm-hmm). With pending BirdNET suggestions or an unfinished prior request, never accept or dismiss on them. Exception: Okay/好的 accepts the latest investigation explanation offer via get_investigations(explain=true).'),
 ]
 INSTRUCTIONS = """You are a concise hands-free birding/naturalist companion with an open microphone.
@@ -339,6 +342,8 @@ Never invent progress, percentages, results or completion times.
 For a newly encountered organism call new_observation or look(target=new), even if
 an earlier focus exists. This includes ordinary reports with an indefinite noun,
 without the words new/another. Set the appropriate group, such as Plantae for plants.
+For an unspecified organism or generic animal use group=Any or omit group. Do not
+infer Mammalia from animal, or infer a taxonomic category from an older subject.
 "Look again" keeps that focus with look(target=current). Discard unwanted IDs with discard_observation.
 Prepare the preview and wait for Start/Identify before photographing it.
 Never invent sightings or identify from insufficient evidence; request camera evidence with look.
@@ -358,11 +363,19 @@ Earlier tool outputs are already handled. Do not invent sightings from questions
 [TAP] means the next utterance is addressed to you.
 """
 ROUTING = 'HIGHEST-PRIORITY ROUTING RULE: If the latest assistant question is an investigation explanation offer, Okay/好的 explicitly accepts that offer: use get_investigations(explain=true), never accept_suggestions. Otherwise a turn consisting only of ah, okay, uh, oh, mm, or mm-hmm is ignore, even immediately after a pending-suggestion question or an unfinished earlier request. These fillers are NOT approval or dismissal. Yes/yeah/sure or an intelligible add command can approve BirdNET suggestions. Apply this before choosing any other tool.' + "\n" + ROUTING
-ANSWER = INSTRUCTIONS + """
-ANSWER PHASE: answer ONLY the latest addressed question in ONE short sentence. No tools.
+ANSWER = """You are the spoken voice of a cautious field naturalist companion.
+The application has ALREADY approved this speech turn. Render the supplied result,
+event or addressed question; do not classify it again or decide whether to respond.
+No tools, routing decisions or spoken control labels. Backend events are approved
+speech even when there is no new user question. Never say a routing label such as
+ignore, speak, or a tool name as the answer.
+ANSWER PHASE: answer the current question or backend event in ONE short sentence.
 Use supplied tool results and checklist. Never acknowledge any earlier log or chatter;
 no "I've logged X" acknowledgements in answers. Reply in English by default, but in the
-language of the question (including Chinese). [NOTIFY] is an automated, unconfirmed BirdNET
+language of the question (including Chinese). Use only supplied species identifiers,
+evidence and facts. Do not guess a species, task progress, field marks, diet, habitat
+or checklist mutations. Earlier dialogue is history; fresh backend state is authoritative.
+Keep uncertain identifications tentative. [NOTIFY] is an automated, unconfirmed BirdNET
 event: briefly ask whether to add the heard species, in English; NEVER claim it is logged.
 [VISION] contains the current focus top-3 and uncertain flag. If certain say "Looks like a
 <species>"; if uncertain say "Not sure — <top two>; can you zoom in?". Use hint when
@@ -404,11 +417,13 @@ class TurnItems(set):
 
 class TurnText(str):
     """Transcript plus any already-committed audio item (never a newer turn)."""
-    def __new__(cls, text, item_ids=(), acknowledged=False, context=None):
+    def __new__(cls, text, item_ids=(), acknowledged=False, context=None, *, addressed=False, reply_to=None):
         obj = super().__new__(cls, text)
         obj.item_ids = set(item_ids)
         obj.acknowledged = acknowledged
         obj.context = context
+        obj.addressed = addressed
+        obj.reply_to = reply_to
         return obj
 
 
@@ -957,8 +972,22 @@ class Session:
         if (self.focus == obs.id and obs.status == "open" and self.may_speak()
                 and self.input_revision == input_revision):
             await self.inject("[VISION] " + json.dumps({"top3": obs.fused[:3], "uncertain": obs.uncertain, "hint": obs.hint}))
-            response = await self.generate("answer")
-            if response and response.get("status") == "completed" and self.input_revision == input_revision:
+            # A completed photo is a backend event, not another user utterance
+            # to classify. Its readout is grounded before it reaches speech.
+            zh = self.lang.startswith('zh')
+            names = [row.get('en') or row['sci'] for row in obs.fused[:2]]
+            if not names:
+                answer = '暂时无法识别，请拍近一点的照片。' if zh else 'I could not identify it yet; please take a closer photo.'
+            elif obs.uncertain:
+                choices = '或'.join(names) if zh else ' or '.join(names)
+                answer = f'还不确定，可能是 {choices}；请拍近一点的照片。' if zh else f'I am not sure; it may be {choices}. Please take a closer photo.'
+            else:
+                answer = f'看起来是 {names[0]}。' if zh else f'Looks like a {names[0]}.'
+            def current():
+                return (self.focus == obs.id and obs.status == 'open'
+                        and self.input_revision == input_revision and (obs.id, obs.image_revision) == identity)
+            response = await self.speak_expert(answer, guard=current)
+            if response and response.get("status") == "completed" and current():
                 self.vision_answered.add(identity)
 
     @property
@@ -1024,7 +1053,11 @@ class Session:
         return obs
 
     async def refusion(self, obs, touch=True):
-        allowed = await asyncio.get_running_loop().run_in_executor(self.executor, self.allowed_species) if obs.group == "Aves" else None
+        # Image classification already applied its requested candidate scope.
+        # An open-set image may establish a bird outside the local song list;
+        # resolving its group later must not erase that visual evidence.
+        allowed = (await asyncio.get_running_loop().run_in_executor(self.executor, self.allowed_species)
+                   if obs.group == "Aves" and not any(d.kind == 'image' for d in obs.detections) else None)
         if self.observations.get(obs.id) is not obs:
             return  # reset/remove-all while the range lookup was in flight
         priors = getattr(self, "_prior_counts", {})
@@ -1051,7 +1084,7 @@ class Session:
                 pass
 
     async def request_look(self, hint="", group=None, *, confirmed=False, open_id=None):
-        if group is not None and group not in GROUPS:
+        if group is not None and group not in PHOTO_GROUPS:
             raise ValueError("invalid iconic group")
         # A category change is a real evidence boundary, regardless of whether it
         # came from voice, the preview selector or the Identify button.
@@ -1967,7 +2000,7 @@ class Session:
                     if kind == "text":
                         self.turn_question = value
                         await self.inject(value)
-                    if self.filler_only(value):
+                    if self.filler_only(value) and not getattr(value, 'addressed', False):
                         self.log("route_skipped_filler")
                         await self.delete_items(self.turn_items)
                         continue
@@ -2054,7 +2087,7 @@ class Session:
                 raise ValueError("Tool arguments must be an object")
             if name not in {t["name"] for t in TOOLS}:
                 raise ValueError("Unknown routed tool")
-            if "group" in args and args["group"] not in GROUPS:
+            if "group" in args and args["group"] not in (PHOTO_GROUPS if name in ('look','new_observation') else GROUPS):
                 raise ValueError("invalid iconic group")
             if name == "look" and args.get("target") not in ("current", "new"):
                 raise ValueError("look requires target=current or target=new")
@@ -2073,6 +2106,19 @@ class Session:
                 decision, reason = "clarify", "stale_write_context"
             if name in ("look", "new_observation") and not self.camera_route_current(name, args):
                 decision, reason = "ignore", "stale_camera_context"
+            if name == 'clarify_request' and self.turn_revision is not None and self.turn_revision != self.input_revision:
+                decision, reason = 'ignore', 'stale_clarification'
+            if (getattr(self.turn_question, 'addressed', False) and not idle_start
+                    and (self.turn_revision is None or self.turn_revision == self.input_revision)
+                    and (name == 'ignore' or (decision == 'ignore' and reason in (
+                        'unprompted_acknowledgement', 'filler', 'speak_ignore_contradiction')))):
+                # Addressing is already established. Unclear intent needs a
+                # question, not silence. Never override stale action ownership.
+                name, args, decision = 'clarify_request', {'question': (
+                    '你想让我做什么？' if self.chinese(self.turn_question) else 'What would you like me to do?')}, 'allow'
+            if name == 'clarify_request' and (not isinstance(args.get('question'), str)
+                    or not 1 <= len(args['question'].strip()) <= 300):
+                raise ValueError('Clarification requires one short question')
             if decision != "allow":
                 self.log("route_guard", requested_tool=name, decision=decision, reason=reason)
                 result = {"ok": False, "suppress_answer": True, "guard": reason}
@@ -2094,6 +2140,7 @@ class Session:
             self.tools_executed = True
             result = {"ok": True} if name == "ignore" else (
                 {"ready_to_answer": True, "reason": args.get("reason")} if name == "speak"
+                else {"ok": True, "answer": args['question']} if name == 'clarify_request'
                 else await self.tool(name, args))
             if name == "get_observation" and result.get("analysis_status") in ("awaiting_confirmation", "capturing", "analyzing", "failed"):
                 status = result["analysis_status"]
@@ -2130,7 +2177,7 @@ class Session:
         if name == "get_task_status" and not result.get("ok"):
             self.queue_feedback("clarify")
             return
-        if name in ("speak", "get_checklist", "recent_sounds", "nearby_species", "get_observation", "ask_expert", "describe", "get_investigations", "manage_investigation", "get_task_status", "retry_task") and self.may_speak():
+        if name in ("speak", "clarify_request", "get_checklist", "recent_sounds", "nearby_species", "get_observation", "ask_expert", "describe", "get_investigations", "manage_investigation", "get_task_status", "retry_task") and self.may_speak():
             if (getattr(self, "turn_stale", False) or (self.turn_stopped_at is not None
                     and time.monotonic() - self.turn_stopped_at > 12)):
                 self.log("stale_answer_skipped")  # answering a question asked >12 s ago is confusing
@@ -2142,7 +2189,7 @@ class Session:
                 response = await self.speak_expert(result['answer'], guard=lambda: self.input_revision == revision)
                 if self.input_revision == revision and response and response.get('status') == 'completed':
                     self.remember_retry_offer(result)
-            elif name in ("ask_expert", "get_investigations", "manage_investigation") and result.get("answer"):
+            elif name in ("ask_expert", "get_investigations", "manage_investigation", "clarify_request") and result.get("answer"):
                 revision = self.input_revision
                 response = await self.speak_expert(result["answer"])
                 if self.input_revision == revision and response and response.get('status') == 'completed':
@@ -2488,15 +2535,15 @@ class Session:
             if target not in ("current", "new"):
                 raise ValueError("invalid camera target")
             if target == "new":
-                group = args.get("group", "Aves")
-                if group not in GROUPS:
+                group = args.get("group", "Any")
+                if group not in PHOTO_GROUPS:
                     raise ValueError("invalid iconic group")
                 await self.new_focus(group)
                 return await self.request_look(args.get("hint", ""))
             return await self.request_look(args.get("hint", ""), args.get("group"))
         if name == "new_observation":
-            group = args.get("group", "Aves")
-            if group not in GROUPS:
+            group = args.get("group", "Any")
+            if group not in PHOTO_GROUPS:
                 raise ValueError("invalid iconic group")
             await self.new_focus(group)
             return await self.request_look()
@@ -2946,7 +2993,8 @@ class Session:
                 return
             if self.assistant_audio_pending():
                 await self.cancel_speech()
-            self.pending.append(("text", TurnText(text, context=self.input_context()), None))
+            self.pending.append(("text", TurnText(text, context=self.input_context(),
+                addressed=bool(event.get('_addressed')), reply_to=event.get('_reply_to')), None))
             await self.flush_pending()
         elif ty == "look":
             self.input_revision += 1
@@ -3351,17 +3399,27 @@ async def post_frame(request: Request, session: str, obs: str, x: float | None =
     candidates = []
     for candidate in result["candidates"]:
         sci = candidate["sci"]
-        if sci not in s.names:
+        taxon = s.names.get(sci)
+        if not taxon or taxon.get('en') == sci:
             try:
-                taxon = await asyncio.to_thread(resolve, sci, observation.group)
-            except Exception:
+                # BioCLIP supplied an exact taxon. A category inferred from a
+                # user's loose description must not filter out its real name.
+                taxon = await asyncio.to_thread(resolve, sci)
+                if taxon and taxon.get('sci') != sci:
+                    taxon = None  # No fuzzy substitute for an image candidate.
+            except Exception as exc:
+                s.log('species_name_lookup_failed', sci=sci, error_type=type(exc).__name__)
                 taxon = None
-            s.names[sci] = taxon or {"sci": sci, "en": sci}
-        candidates.append({**s.names[sci], "sci": sci, "p": float(candidate["p"])})
+            if taxon:
+                s.names[sci] = taxon
+        candidates.append({**(taxon or {"sci": sci, "en": sci}), "sci": sci, "p": float(candidate["p"])})
     # Vision is slow: discard late frames if focus changed while inference ran.
     await s.expire_focus()
     if observation.status != "open" or s.focus != obs or s.camera_request is not camera:
         raise HTTPException(409, "Observation closed or focus changed during classification")
+    if candidates and candidates[0].get('group') in GROUPS and candidates[0]['group'] != observation.group:
+        s.log('photo_group_resolved', requested_group=observation.group, group=candidates[0]['group'])
+        observation.group = candidates[0]['group']
     detection_id = "d" + uuid.uuid4().hex[:12]
     detection = Detection(detection_id, "image", now_iso(), candidates, thumb="/api/frame/" + detection_id + ".jpg")
     s.frames[detection_id] = thumb.getvalue()

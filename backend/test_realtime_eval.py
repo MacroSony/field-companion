@@ -44,6 +44,13 @@ class GraderTests(unittest.TestCase):
         self.assertFalse(grade(case, response("look", {"target": "new", "group": "Aves"}))["passed"])
         self.assertTrue(grade(case, response("new_observation", {"group": "Plantae"}))["passed"])
 
+    def test_generic_animal_must_not_be_narrowed_to_a_guessed_class(self):
+        for name in ('unknown-animal','new-after-eagle'):
+            case = self.cases[name]
+            self.assertFalse(grade(case,response('look',{'target':'new','group':'Mammalia'}))['passed'])
+            self.assertTrue(grade(case,response('look',{'target':'new','group':'Any'}))['passed'])
+            self.assertTrue(grade(case,response('look',{'target':'new'}))['passed'])
+
     def test_matching_tool_is_insufficient_if_it_speaks_or_emits_multiple_calls(self):
         case = self.cases["mic-check"]
         output = response("speak", {"reason": "mic check"})

@@ -1,0 +1,30 @@
+{
+  "passed": true,
+  "session": "livekit-cloud-smoke-78dcaaf4afda",
+  "physical_phone": false,
+  "browser_aec_test": false,
+  "acoustic_echo_test": false,
+  "cloud_transport_test": true,
+  "checks": [
+    {
+      "case": "Application signaling and both participants connect through LiveKit Cloud",
+      "passed": true
+    },
+    {
+      "case": "Synthetic spoken question is transcribed and answered over real Cloud RTP audio",
+      "passed": true
+    },
+    {
+      "case": "Unaddressed speech during an answer does not enter dialogue or interrupt playout",
+      "passed": true
+    },
+    {
+      "case": "Scout-addressed follow-up during a reply interrupts and reaches checklist routing and a new answer",
+      "passed": true
+    }
+  ],
+  "barge_started_while_speaking": true,
+  "barge_started_at": 503318.187,
+  "received_audio_frames": 3169,
+  "audible_audio_frames": 1366
+}

@@ -1,0 +1,83 @@
+{
+  "passed": true,
+  "previous_test_gaps": [
+    "Application smoke tests ended at photo capture and forced failure; no successful automatic result was exercised.",
+    "Reply API checks allowed 12 seconds while production allowed only 3 seconds.",
+    "Generic-animal routing was graded for tool/target but not its inferred taxonomic group."
+  ],
+  "offline_regression_before_fix": {
+    "tests": 5,
+    "failed": 4
+  },
+  "offline_regression_after_fix": {
+    "tests": 5,
+    "failed": 0
+  },
+  "repeated_reply_evaluation": {
+    "repeats": 3,
+    "checks": 55,
+    "passed": 55,
+    "shared_production_deadline_seconds": 6,
+    "max_observed_ms": 3516
+  },
+  "repeated_photo_routing": {
+    "model": "gpt-realtime-2.1",
+    "samples": 18,
+    "completed": 18,
+    "passed": 18,
+    "tool_correct": 18,
+    "arguments_correct": 18,
+    "schema_errors": 0,
+    "forbidden_attempts": 0,
+    "guard_interceptions": 0,
+    "route_speech": 0,
+    "retries": 0,
+    "route_median_ms": 851.5,
+    "route_p95_ms": 1453.0,
+    "categories": {
+      "camera": {
+        "passed": 18,
+        "total": 18,
+        "action_correct": 18
+      }
+    }
+  },
+  "camera_replay": {
+    "runs": 3,
+    "passed_runs": 3,
+    "checks": 21,
+    "real_stt": true,
+    "real_gpt_routing_and_voice": true,
+    "real_bioclip": true,
+    "real_taxonomy": true,
+    "synthetic_microphone_and_photo_submission": true
+  },
+  "invited_reply_and_per_answer_audio": {
+    "runs": 1,
+    "passed_runs": 1,
+    "checks": 7,
+    "readouts": [
+      {
+        "case": "Successful photo automatically speaks the returned common name without another user turn",
+        "returned_name": "Greylag Goose",
+        "result_audio_frames": 139,
+        "passed": true
+      },
+      {
+        "case": "Spoken show-me-the-result reads existing evidence over RTP audio",
+        "result_audio_frames": 196,
+        "passed": true
+      }
+    ]
+  },
+  "photo_fixture": {
+    "taxon": "Anser anser",
+    "photo_url": "https://inaturalist-open-data.s3.amazonaws.com/photos/61334030/medium.jpg",
+    "attribution": "(c) Frans Vandewalle, some rights reserved (CC BY-NC)",
+    "license_code": "cc-by-nc"
+  },
+  "physical_phone_test": false,
+  "browser_permissions_test": false,
+  "acoustic_echo_test": false,
+  "recognition_ground_truth_benchmark": false
+}

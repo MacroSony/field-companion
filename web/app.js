@@ -1,6 +1,6 @@
 'use strict';
 (() => {
-  const CLIENT_BUILD = '2026-10-25-livekit';
+  const CLIENT_BUILD = '2026-10-25-scout-results';
   const $ = id => document.getElementById(id);
   const params = new URLSearchParams(location.search);
   const displayMode = params.get('display') === '1';
@@ -32,7 +32,7 @@
   let playbackReported = false, headsetEnabled = false, replaced = false;
   let playbackReport = '', playbackId = null, playbackComplete = true, playbackContext = null;
   let locationWatch = null, lastSentCoords = null;
-  let socket, reconnectTimer, context, stream, capture, micSource, wakeLock;
+  let socket, reconnectTimer, context, stream, capture, micSource, wakeLock, replyHintTimer;
   let nextPlaybackTime = 0, lastMeterAt = 0, resampler = null;
   const playback = new Set(), tones = new Set();
   const bars = document.querySelector('.soundscape');
@@ -56,7 +56,7 @@
     camera.updateConnection();
     if ($('audio-mode')) {
       $('audio-mode').disabled = livekitMode;
-      $('audio-mode').textContent = livekitMode ? 'LiveKit · voice interruption' : webrtcMode ? (webrtcDuplex ? 'WebRTC · voice interruption on (experimental)' : 'WebRTC · tap to interrupt')
+      $('audio-mode').textContent = livekitMode ? 'Scout · say name to talk' : webrtcMode ? (webrtcDuplex ? 'WebRTC · voice interruption on (experimental)' : 'WebRTC · tap to interrupt')
         : earphones ? 'Earphones · voice interruption on' : 'Speaker · tap to interrupt';
       $('audio-mode').setAttribute('aria-pressed', String(webrtcMode ? webrtcDuplex : earphones));
     }
@@ -64,7 +64,9 @@
       $('assistant-mute').disabled = !audioEnabled;
       $('assistant-mute').setAttribute('aria-pressed', String(assistantMuted));
     }
-    if ($('interrupt-hint')) $('interrupt-hint').textContent = (livekitMode || (webrtcMode ? webrtcDuplex : earphones)) ? 'Say something to interrupt' : 'Tap to interrupt; speak after the reply';
+    if ($('interrupt-hint')) $('interrupt-hint').textContent = livekitMode
+      ? (state.replyWithoutName && Date.now() < state.replyWithoutNameUntil ? 'You can answer this question without saying Scout' : 'Say “Scout, …” to talk or interrupt')
+      : (webrtcMode ? webrtcDuplex : earphones) ? 'Say something to interrupt' : 'Tap to interrupt; speak after the reply';
     if ($('earphone-tip')) $('earphone-tip').hidden = false;
     $('tap').disabled = $('send').disabled = !state.connected;
     $('reconnect').hidden = !replaced;
@@ -544,6 +546,10 @@
         if (livekitMode) rtc?.handleState(message);
         if (typeof message.server_build === 'string') $('version-banner').hidden = message.server_build === CLIENT_BUILD;
         state.listening = !!message.listening; state.speaking = !!message.speaking;
+        state.replyWithoutName = !!message.reply_without_name;
+        state.replyWithoutNameUntil = Date.now() + Math.min(40, Math.max(0, Number(message.reply_without_name_for) || 0)) * 1000;
+        clearTimeout(replyHintTimer);
+        if (state.replyWithoutName) replyHintTimer = setTimeout(updateControls, Math.max(0, state.replyWithoutNameUntil - Date.now()) + 10);
         if (typeof message.model === 'string') state.model = message.model;
         // Socket transport status remains independent of backend/model connectivity.
         const connectionNotice = livekitMode ? (displayMode ? 'Waiting for the phone voice connection.' : 'Connecting to LiveKit voice…') : 'The server is reconnecting to the voice model.';
@@ -551,6 +557,7 @@
         else if (message.connected && $('notice').textContent === connectionNotice) notice('');
         updateControls(); break;
       case 'error': notice(String(message.message || 'Unknown server error')); earcon('error'); break;
+      case 'reply_retry': notice(String(message.message || 'Please say Scout and repeat that reply.')); break;
     }
   }
   function element(tag, className, text) {
@@ -968,7 +975,7 @@
       ? 'Experimental WebRTC voice. Use the mode button to turn voice interruption off. Bird input is verified separately.'
       : 'Standard audio. Each voice experiment uses a separate checklist.';
     if (webrtcMode) $('earphone-tip').textContent = 'Experimental speaker interruption. Switch to Tap to interrupt if echo appears.';
-    if (livekitMode) $('earphone-tip').textContent = 'Speech interruption is managed by LiveKit. Tap to talk also interrupts manually.';
+    if (livekitMode) $('earphone-tip').textContent = 'Say “Scout” before a new request. You can answer Scout’s current question without the name, including “Start” after Camera ready. Tap also interrupts.';
   }
   $('tap').addEventListener('click', talk);
   $('mic-device')?.addEventListener('change', event => switchMic(event.target.value));

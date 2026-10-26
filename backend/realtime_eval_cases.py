@@ -38,7 +38,7 @@ def log_mallards(n):
 
 
 def new_subject(group=None):
-    args = {"group": group} if group else {}
+    args = {"group": group if group else {"$default": "Any"}}
     return (choice("look", target="new", **args), choice("new_observation", **args))
 
 

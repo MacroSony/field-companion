@@ -77,6 +77,15 @@ class SDKTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(StopResponse):
             await RoutedVoiceAgent().on_user_turn_completed(None,None)
 
+    async def test_wake_mode_preserves_input_but_disables_automatic_interruption(self):
+        config=SimpleNamespace(openai_key=lambda:'offline-test-key',model='gpt-realtime-2.1',voice='marin',transcription_model='gpt-transcribe')
+        session=create_session(config,wake_required=True)
+        self.assertFalse(session.llm.capabilities.turn_detection)
+        options=session.options.turn_handling['interruption']
+        self.assertFalse(options['enabled'])
+        self.assertFalse(options['discard_audio_if_uninterruptible'])
+        await session.aclose()
+
     async def test_phone_jwt_is_short_lived_room_scoped_and_microphone_only(self):
         import jwt
         token=browser_token(LiveKitSettings('wss://example.livekit.cloud','test-key','s'*40),'room-test','phone-test')
