@@ -5,6 +5,7 @@ independent tool loops and preserves route safety, silent logging and jobs.
 """
 import asyncio
 import contextvars
+import numpy as np
 
 from livekit import api, rtc
 from livekit.agents import Agent, AgentSession, StopResponse, llm, room_io, utils
@@ -64,6 +65,8 @@ class LiveKitVoice:
         self.stop_event = asyncio.Event()
         self.runner = None
         self.answer_epoch = None
+        self.capture_track = None
+        self.capture_task = None
 
     def task(self, coroutine):
         if self.closed:
@@ -76,6 +79,7 @@ class LiveKitVoice:
             if not done.cancelled() and done.exception():
                 self.owner.log('livekit_callback_failed', error_type=type(done.exception()).__name__)
         task.add_done_callback(finished)
+        return task
 
     async def start(self, room_name, phone_identity):
         ready = asyncio.get_running_loop().create_future()
@@ -109,6 +113,15 @@ class LiveKitVoice:
     async def connect(self, room_name, phone_identity):
         self.settings.bind_inference_environment()
         self.room = rtc.Room()
+        @self.room.on('track_subscribed')
+        def diagnostic_track(track, publication, participant):
+            if track.kind == rtc.TrackKind.KIND_AUDIO and participant.identity == phone_identity:
+                if track is self.capture_track:
+                    return
+                if self.capture_task:
+                    self.capture_task.cancel()
+                self.capture_track = track
+                self.capture_task = self.task(self.capture_voice(track))
         token = (api.AccessToken(self.settings.api_key, self.settings.api_secret)
             .with_identity('agent-' + room_name).with_name('Field Companion')
             .with_grants(api.VideoGrants(room_join=True, room=room_name,
@@ -131,7 +144,7 @@ class LiveKitVoice:
         @self.session.on('user_input_transcribed')
         def transcription(event):
             if event.is_final:
-                self.task(self.owner.voice_input(event.transcript))
+                self.task(self.owner.voice_input(event.transcript, item_id=event.item_id))
             elif hasattr(self.owner, 'voice_partial'):
                 self.task(self.owner.voice_partial(event.transcript))
 
@@ -182,6 +195,15 @@ class LiveKitVoice:
             raise ConnectionError('LiveKit voice generation failed')
         self.owner.log('livekit_reply_finished', interrupted=handle.interrupted)
         return {'status': 'cancelled' if handle.interrupted else 'completed', 'output': []}
+
+    async def capture_voice(self, track):
+        stream = rtc.AudioStream(track,sample_rate=48000,num_channels=1)
+        try:
+            async for packet in stream:
+                samples = np.frombuffer(packet.frame.data,dtype='<i2').astype(np.float32)/32768
+                self.owner.voice_frame(samples)
+        finally:
+            await stream.aclose()
 
     async def say(self, text, pcm):
         if not self.ready or self.closed:

@@ -3,6 +3,189 @@
 The optional [GPT Naturalist expert path](../docs/EXPERT.md) handles complex
 comparisons and species-fact follow-ups without changing the logging fast path.
 
+## Speaker verification — SHADOW MODE (2026-10-24)
+
+Optional CPU `speechbrain/spkrec-ecapa-voxceleb` runs in a **separate venv and
+process**, like vision. **Scores NEVER block a turn, change routing or echo
+policy, or delay routing waiting for inference.** There is no acceptance
+threshold. Short/noisy/far-field turns are unreliable; the offline evidence is
+`/data/build/tmp/addressee/spk/REPORT.md`, not a validated field identity gate.
+
+```bash
+# From the repository root; Python 3.12, CPU only:
+python3 -m venv .venv-speaker
+.venv-speaker/bin/python -m pip install -r requirements-speaker.txt
+.venv-speaker/bin/python -B backend/speaker_service.py --port 8796 --threads 4
+# In a separate terminal, using the ordinary backend venv (different port):
+python -B backend/server.py --port 8793 --speaker-service http://127.0.0.1:8796
+# Optionally also save per-turn WAVs and score-bearing metadata:
+python -B backend/server.py --port 8793 --speaker-service http://127.0.0.1:8796 --record-dir recordings/trip
+```
+
+The speaker flag is **off by default**. The service binds **only 127.0.0.1** and
+loads the model once (initial startup may download public Hugging Face weights).
+`--model-dir DIR` overrides the downloaded model directory (default
+`out/speaker-model`); `HF_HOME` overrides the HF cache (default `out/hf-cache`).
+`--speakers-dir DIR` overrides the default `<repo>/speakers/`. No real Higgs calls
+are needed to run or test this service. Keep this unauthenticated API local;
+run one process to avoid conflicting profile writes. The stdlib threaded HTTP
+server keeps `/health` responsive while a lock serializes model/profile work.
+
+With the flag on, the recorder's existing VAD receipt/sample alignment and
+incremental extraction run **even without `--record-dir`**; in that case no WAVs
+or turns.jsonl are created. Every delimited audio turn, including ignored/echo/
+guarded/failed-transcription turns, gets a background `/score` request after
+post-padding (or missing-stop flush/timeout). Audio is resampled 48→16 kHz with
+`scipy.signal.resample_poly`, off the event loop along with HTTP. A successful
+`speaker_scores` event logs `turn_id`, `speaker_scores`, `speaker_best_profile`,
+`speaker_ms` and duration. An enabled recorder adds those three speaker fields
+to the **same** `turns.jsonl` row. Only row finalization waits for scoring, not
+routing or playback. There is a 1.5 s HTTP timeout / 1.6 s background deadline;
+failures, too-short clips and queue overload log `speaker_score_failed` and are
+ignored (row gets `speaker_error`). At most eight background speaker jobs per
+session are admitted. Typed turns have no audio and are not scored.
+
+### Phone enrollment and local API
+
+Start the mic, open Settings → **Enroll voice**, choose a name (default `owner`),
+and read the displayed paragraph naturally for **20 seconds**. Progress starts
+on server acknowledgment; the result reports actual seconds captured and ok/error.
+A display (`/?display=1`) hides this control. Only the current mic may send
+`enroll_start {profile}` / `enroll_stop`. The server marks its existing 48 kHz
+ring, stops automatically after 20 s, extracts **exactly that available span,
+without padding**, resamples and posts `/enroll`. The server caps audio at 20 s
+even if a stop message is late; a paused/stalled mic may provide less audio.
+Reset, mic disconnect/replacement and session close cancel unfinished capture.
+An upload already in progress may still complete after timeout/reset/disconnect.
+
+**Enrollment is the sole intentional routing exception:** VAD turns overlapping
+that explicit read-aloud window are dropped/deleted like ignored inputs, with
+`reason: enrollment`, even if their final transcript arrives after stop. These
+turns still receive shadow scores. Ordinary turns after the window route normally,
+regardless of their score. Alignment remains approximate VAD receipt timing, not
+sample-accurate physical speech segmentation; delayed/missing VAD is a limitation.
+
+All audio endpoints accept **little-endian PCM16, 16 kHz mono** (not WAV), at
+most 60 s. JSON uses base64 field `pcm16`; raw audio uses `application/octet-stream`
+and `?profile=owner` for enrollment. Names allow 1–64 ASCII letters/digits/_/-.
+
+- `GET /health` → `{loaded: true, model: "speechbrain/spkrec-ecapa-voxceleb"}`.
+- `POST /enroll` with `{profile, pcm16}` → `{ok, profile, chunks, duration_s, ms}`.
+  Appends unit embeddings of up to five-second chunks to the profile's running
+  mean, then normalizes again. Trailing fragments <0.3 s are not embedded.
+- `POST /score` with `{pcm16}` → `{ok, scores: {profile: cosine}, duration_s, ms}`.
+  No profiles gives empty scores; cosine is **not** an identity probability.
+- Audio shorter than **0.3 s** returns HTTP 200 with `ok: false`,
+  `error: "audio_too_short"`, duration and minimum duration; not an inference error.
+- `DELETE /reset?profile=owner` or `POST /reset` with `{profile: "owner"}` deletes
+  that profile from disk **and** resident memory. Invalid input returns HTTP 422.
+
+```bash
+curl http://127.0.0.1:8796/health
+curl -X POST 'http://127.0.0.1:8796/enroll?profile=owner' -H 'Content-Type: application/octet-stream' --data-binary @voice-16k.pcm
+curl -X DELETE 'http://127.0.0.1:8796/reset?profile=owner'
+```
+
+**Privacy:** voice embeddings are **biometric data**. Obtain every enrolled
+person's consent. Profile JSONs (unit mean, running sum and chunk count) stay
+local, are atomically written with **0600** permissions, and `speakers/` is
+Git-ignored. The speaker service does not persist raw audio; the backend's
+separate opt-in recorder can. Scores/profile names also appear in diagnostic
+logs; no retention cleanup is automatic. Use `/reset` to delete a loaded profile,
+or stop the service and remove its JSON/all of `speakers/`, then restart. Deleting
+only a file while the service runs does not remove its resident copy. Separately
+delete sensitive `logs/` and `recordings/` if desired; protect custom storage paths.
+
+Verification: offline regressions live in `backend/test_speaker.py` (mock HTTP
+client plus a loopback fake-embedding service). Real CLI/HTTP smoke used the
+existing `/data/build/tmp/addressee/spk/venv/`, offline copied model cache, and
+LibriSpeech: enrolled speaker **2035**, three distinct 5 s clips; held-out 3 s
+same-speaker cosine **0.693976** (68.56 ms), different speaker **5895** cosine
+**0.071113** (68.15 ms). Short audio returned `audio_too_short`. Evidence is in
+ignored `out/speaker-smoke/results.json`, `service.log`, and `run.py`. These two
+clean read-speech samples are not field validation or threshold calibration.
+No physical phone enrollment/acoustic test or real Higgs call was run here.
+
+Full offline verification: **277 tests passed** (258 existing + 19 new), using
+`/data/build/birding-demo/.venv/bin/python -B -m unittest discover -s backend -p 'test_*.py'`.
+Evidence: ignored `out/speaker-full-tests.log`; existing expert-test AsyncMock
+warnings also appear in the 258-test baseline (`out/speaker-baseline-tests.log`).
+`node --check web/app.js`, `node --check web/sw.js` and `git diff --check` passed.
+
+## Local session diagnostics and opt-in field recording
+
+Every `Session.log()` event is also appended immediately to
+`logs/session-YYYYMMDD.jsonl` under the repository root (local date, all sessions).
+Each line includes a timezone-aware wall-clock `timestamp` and session
+`connection`. Use `--log-dir DIR` to change the directory or `--no-log-file` to
+keep stdout only. Credentials and authorization/header fields are redacted;
+request headers, API keys, image bytes and PCM are not intentionally logged.
+Transcripts, tool arguments, locations and other diagnostic fields **are sensitive**.
+These are diagnostic files, not restoration of the in-memory outing state.
+
+`--record-dir DIR` separately opts in to mono **48 kHz PCM16 WAVs** plus
+`DIR/turns.jsonl`. It is **off by default**, including when event logging is on;
+`--no-log-file` does not disable an explicitly requested recorder. For example:
+
+```bash
+python -B backend/server.py --port 8796 --log-dir logs --record-dir recordings/field-trip
+# No persistent diagnostics or recordings:
+python -B backend/server.py --port 8796 --no-log-file
+```
+
+**Privacy:** the recorder captures everyone near the microphone, including
+bystanders and assistant playback, not just the owner. Obtain appropriate consent.
+Diagnostic files stay local; there is no uploader for them (the normal live
+Higgs audio/STT path is unchanged). `logs/` and `recordings/` are ignored by Git;
+keep custom directories outside version control too. New files are owner-only.
+There is no retention cleanup or disk quota: protect, review and delete these
+files yourself. Disk-write failures warn without stopping the voice session.
+
+### Turn rows and timing limitations
+
+One final row per VAD occurrence contains a unique `turn_id`, provider `item_id`,
+receipt wall time, transcript, WAV filename/duration, outcome/reason, routed tool
+and full redacted arguments, assistant-audio flag and speaker/earphone/echo-guard
+mode at speech start. Outcomes include `guarded_during_playback`, `echo_dropped`,
+`input_ignored`, `stop`, `camera_confirmation`, `routed` and `no_route`. Reused
+provider IDs keep separate occurrence IDs; merged queued utterances share the
+route result but retain separate audio/transcripts. Audio is saved promptly;
+the row waits for the immediate route/answer, or at most 60 seconds after stop
+(60 seconds after start if stop is missing). Disconnect, reset and close flush
+unfinished rows, so no-route turns are retained. A process crash before row
+finalization can leave an orphan WAV. Later-than-timeout routes and subsequent
+photo/investigation announcements do not revise the row. `assistant_audio`
+means backend reply/feedback PCM was produced, not proof of audible phone playback.
+
+Provider `audio_start_ms`/`audio_end_ms` are **not used**: buffer clears,
+reconnects, queued input and speaker-mode withholding make their origin unsafe
+to map directly onto the unbroken mic ring. Instead, monotonic VAD **receipt**
+timestamps anchor the latest absolute mic sample position. WAVs cover that start
+minus 1 s through that stop plus 300 ms (the start receipt lags the real onset). This is approximate acoustic alignment:
+onset error includes upstream queue/network/VAD delay and up to one mic packet
+(accepted packets are at most one second); stop receipt additionally includes the
+configured **600 ms VAD silence**. Expect hundreds of milliseconds of error even
+without a stall; no measured hardware bound is claimed, and network stalls can
+be worse. The 1 s pre-padding is a margin, not a guarantee of the full physical onset under
+high latency. Level features use 20 ms frame percentiles over the whole clip (noise floor =
+10th percentile, `speech_p90_dbfs` = 90th), because the padding may contain speech onset. Wall time is receipt time, not calibrated microphone capture time.
+
+The existing float mic ring is 48 kHz, circular, with absolute `position` indices.
+The recorder copies incremental slices before its 30-second rollover, preserving
+long turns until the missing-stop timeout. Post-padding waits for mic samples,
+with a 500 ms wall timeout if capture pauses. Bounds and `clipped` expose missing
+padding/audio (including session startup/reset). `Session.extract_turn_audio()`
+and `session_data.extract_turn_audio()` provide reusable padded ring extraction
+for future gates; they clip unavailable samples, never invent silence.
+`speech_rms_dbfs` and `peak_dbfs` use the unpadded receipt interval;
+`noise_floor_dbfs` is only the RMS of the available padding, not a calibrated noise
+estimator. Silence is floored at -120 dBFS; unavailable features are null. VAD
+hangover, alignment error and playback can contaminate these crude features.
+
+Offline regression tests are in `backend/test_session_data.py`; run them with the
+existing `python -B -m unittest discover -s backend -p 'test_*.py'` suite, not the
+live `selftest.py`.
+
 ## Existing task progress and photo reuse
 
 Photo identification and GPT investigations share the read-only `get_task_status`
@@ -321,10 +504,16 @@ futures. Routing/answer updates wait for their echoes and validate modality,
 tool choice and instructions before sending `response.create`. Higgs initializes
 only after the first update; its initial `session.created` is accepted for setup.
 
-1. Route with text-only output, required tool choice, ignore/add/set/remove/speak
+1. Route with text-only output, required tool choice, ignore/show_silently/add/set/remove/speak
    and read tools (`get_checklist`, `recent_sounds`, `nearby_species`). Route audio
    and captions are discarded defensively, never buffered for later playback.
 2. Ignore returns only a function output upstream, with no UI action or answer.
+   `show_silently(text)` sends a `silent_note` card to phones and displays: server
+   id, original server transcript as `question`, model `text` as `note` (120 chars).
+   It is routing-only: no answer request, checklist write, earcon or feedback clip,
+   and no promotion to camera/status speech. Both silent routes pass the read-only
+   safety guard, while filler/consent guards still apply. The recorder's existing
+   `record_route` records outcome `routed`, routed_tool `show_silently`, no audio.
    Successful mutations immediately broadcast checklist + logged earcon, return
    function output, and do not create a spoken continuation.
 3. Speak/read results switch the session to audio, tool choice none, no tools;
@@ -336,6 +525,22 @@ only after the first update; its initial `session.created` is accepted for setup
    turns take priority over deferred notifications.
 5. Quiet mode keeps logging but suppresses spoken routes unless a tap occurred
    within the last ten seconds. Tap does not permanently enable speech.
+
+The **V2 addressee rule** and `show_silently` schema are verbatim from the measured
+text router (`/data/build/tmp/addressee/router/prompts.json`). V2 is the final
+`ROUTING` block. `config("route")` places that same block once **after all dynamic
+context**, just as `run_router.py:config` did; appending it before the snapshot
+would not match the measurement. No addressee block or tools enter answer mode.
+The measured false-speech rate on not-addressed chatter fell from 58% to 10%,
+with no missed commands; this is text-router evidence, not field/audio validation.
+
+Cards expire after about 30 seconds or can be dismissed locally, without sound.
+**Answer** sends `{"type":"answer_note","id":...}` from either phone or display.
+The server consumes its stored original question (ignoring any client question),
+prefixes `[TAP] `, sets the existing ten-second tap/Quiet-mode allowance, and
+queues the ordinary text routing turn. Answered cards disappear on all clients;
+expired, duplicate and reset ids are ignored. Notes are ephemeral, not replayed
+on reconnect, and bounded to 20 server-side / three visible per client.
 
 Instructions request English by default, the question's language for answers
 (including Chinese), no unsupported claims of logging, and no delayed “I've

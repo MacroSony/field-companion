@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Standalone BioCLIP2 probe. Writes artifacts only to --out and report to --report.
-Run with HF_HOME=/data/build/hf-cache TMPDIR=/data/build/tmp supplied venv.
+Run in the vision environment; optionally set HF_HOME and TMPDIR.
 """
 import argparse
 import concurrent.futures as cf
@@ -320,8 +320,8 @@ def analyze(out, report):
 
 def main():
     parser=argparse.ArgumentParser()
-    parser.add_argument('--out',type=Path,default=Path('/data/build/birding-demo/vision-imgs'))
-    parser.add_argument('--report',type=Path,default=Path('/data/build/field-companion/docs/vision-test.md'))
+    parser.add_argument('--out',type=Path,default=Path(__file__).resolve().parents[1] / 'out/vision-imgs')
+    parser.add_argument('--report',type=Path,default=Path(__file__).resolve().parents[1] / 'docs/vision-test.md')
     parser.add_argument('--stage',choices=['prepare','run','analyze','all'],default='all')
     parser.add_argument('--threads',type=int,default=4)
     args=parser.parse_args()

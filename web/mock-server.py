@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Same-port static + session-aware protocol mock, not a real identifier.
-Run: /data/build/birding-demo/.venv/bin/python web/mock-server.py --port 8767
+Run: python web/mock-server.py --port 8767
 """
 import argparse
 import asyncio
@@ -23,7 +23,7 @@ from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Response
 
 ROOT = Path(__file__).resolve().parent
-CLIENT_BUILD = '2026-10-24-camera-intent'
+CLIENT_BUILD = '2026-10-24-addressee-v2'
 PHOTOS = {}
 SESSIONS = {}
 SPECIES = [
@@ -97,6 +97,9 @@ class Session:
         self.task = None
         self.quiet = False
         self.speaking_until = 0
+        self.silent_notes = {}
+        self.addressing_mode = 'ambient'
+        self.recording_enabled = False
 
     async def emit(self, message_type, **fields):
         data = json.dumps(dict(type=message_type, **fields))
@@ -107,7 +110,9 @@ class Session:
                 await ws.send(data)
 
     async def status(self, speaking=False):
-        await self.emit('state', connected=True, listening=True, speaking=speaking, model='higgs-realtime-1.5-preview', server_build=CLIENT_BUILD)
+        await self.emit('state', connected=True, listening=True, speaking=speaking,
+            model='higgs-realtime-1.5-preview', server_build=CLIENT_BUILD,
+            addressing_mode=self.addressing_mode,recording_enabled=self.recording_enabled,speaker_enabled=True)
 
     async def checklist(self):
         await self.emit('checklist', items=self.items)
@@ -146,6 +151,8 @@ class Session:
             taxon(4, source='photo', why='Blue back and a warm orange breast.'),
             taxon(5, source='photo', why='Orange eyebrow and a bold dark breast band.'),
         ])
+        self.silent_notes['note-demo'] = ('Is that a hawk?', time.monotonic() + 30)
+        await self.emit('silent_note', id='note-demo', question='Is that a hawk?', note='Possibly a question for me.')
         if not self.quiet:
             await self.tone()
 
@@ -172,7 +179,7 @@ async def handler(ws):
                 if client['role'] == 'mic':
                     await older.close(1000, 'Replaced by newer microphone')
         session.clients[ws] = dict(role=role, audio=audio)
-        await ws.send(json.dumps(dict(type='state', connected=True, listening=True, speaking=False, model='higgs-realtime-1.5-preview', server_build=CLIENT_BUILD)))
+        await session.status()
         hello = json.loads(first)
         if role == 'mic' and all(isinstance(hello.get(k), (float, int)) for k in ('lat', 'lng')):
             session.coords = {k: hello[k] for k in ('lat', 'lng')}
@@ -206,6 +213,7 @@ async def handler(ws):
                 session.history = []
                 session.suggestions = []
                 session.speaking_until = 0
+                session.silent_notes.clear()
                 await session.emit('reset')
                 await session.emit('flush')
                 await session.checklist()
@@ -242,12 +250,26 @@ async def handler(ws):
                 await session.checklist()
             elif kind == 'mode' and role == 'mic':
                 session.quiet = bool(message.get('quiet'))
+            elif kind == 'addressing_mode' and role == 'mic':
+                session.addressing_mode = message['value']
+                await session.status()
+            elif kind == 'recording' and role == 'mic':
+                session.recording_enabled = message['enabled']
+                await session.status()
+            elif kind == 'enroll_start' and role == 'mic':
+                await session.emit('enrollment',status='ok',duration_s=20,profile=message['profile'])
             elif kind == 'mic' and role == 'mic':
                 await session.emit('state', connected=True, listening=bool(message.get('on')), speaking=False)
             elif kind == 'tap' and role == 'mic':
                 await session.emit('flush')
                 await session.emit('transcript', role='assistant', text='I am here. That was a Northern Cardinal.', final=True)
                 await session.tone()
+            elif kind == 'answer_note':
+                note = session.silent_notes.pop(message.get('id'), None)
+                if note and note[1] > time.monotonic():
+                    await session.emit('silent_note_removed', id=message['id'])
+                    await session.emit('transcript', role='user', text='[TAP] ' + note[0], final=True)
+                    await session.emit('transcript', role='assistant', text='Demo: that question is now addressed to me.', final=True)
             elif kind == 'text':
                 await session.emit('transcript', role='user', text=str(message.get('text', '')), final=True)
                 await session.emit('transcript', role='assistant', text='Demo mode: one mallard added. The live backend handles identification.', final=True)

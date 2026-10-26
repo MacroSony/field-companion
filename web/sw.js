@@ -1,5 +1,5 @@
 'use strict';
-const CACHE = 'field-companion-shell-v26-scout-results';
+const CACHE = 'field-companion-shell-v27-voice-modes';
 const SHELL = ['index.html', 'style.css', 'camera.js', 'app.js', 'audio-worklet.js', 'audio-diagnostics.js', 'webrtc-audio.js', 'livekit-audio.js', 'vendor/livekit/livekit-client.umd.js', 'manifest.json', 'icon.svg', 'vendor/leaflet/leaflet.js', 'vendor/leaflet/leaflet.css', 'vendor/leaflet/images/marker-icon.png', 'vendor/leaflet/images/marker-icon-2x.png', 'vendor/leaflet/images/marker-shadow.png', 'vendor/leaflet/images/layers.png', 'vendor/leaflet/images/layers-2x.png'];
 self.addEventListener('install', event => {
   event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL)).then(() => self.skipWaiting()));

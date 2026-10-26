@@ -19,7 +19,7 @@
   <script src="webrtc-audio.js" defer></script>
   <script src="vendor/livekit/livekit-client.umd.js" defer></script>
   <script src="livekit-audio.js" defer></script>
-  <script src="app.js?v=20261025-scout-results-1" defer></script>
+  <script src="app.js?v=20261025-voice-modes-1" defer></script>
 </head>
 <body>
   <div class="app-shell">
@@ -85,6 +85,7 @@
           <p class="investigations-note">Keep talking while I investigate. I'll ask before reading a result aloud.</p>
           <div id="investigations" class="investigations-list"></div>
         </section>
+        <div id="silent-notes" class="silent-notes" aria-label="Possibly addressed questions"></div>
         <div class="caption-label"><span aria-hidden="true">❝</span> Live captions</div>
         <div class="caption-row"><span class="speaker">You</span><p id="user-caption">Say what you see, or ask about a bird song.</p></div>
         <div class="caption-row assistant"><span class="speaker">Assistant</span><p id="assistant-caption">Ready for your next discovery.</p></div>
@@ -122,6 +123,21 @@
           <select id="mic-device" disabled aria-describedby="capture-settings"><option value="">Default · allow microphone to list devices</option></select>
         </div>
         <p id="capture-settings" class="capture-settings">Capture settings appear after Start.</p>
+
+    <label class="setting-label" for="conversation-mode">Conversation mode</label>
+    <select id="conversation-mode" disabled><option value="scout">Scout · say the name for new requests</option><option value="ambient">Ambient · cards for uncertain questions</option></select>
+    <p id="conversation-mode-help" class="capture-settings">Say Scout before a new request. Replies to the current question can omit the name.</p>
+    <label class="headset-setting"><input id="turn-recording" type="checkbox" disabled> Save input voice recordings</label>
+    <p id="turn-recording-status" class="capture-settings">Off. When enabled, voice clips and transcripts are saved on the computer running the app.</p>
+    <section id="voice-enrollment">
+      <h3>Enroll voice</h3>
+      <label for="voice-profile">Profile name</label>
+      <input id="voice-profile" value="owner" maxlength="64" pattern="[A-Za-z0-9_-]+" autocomplete="off">
+      <p class="capture-settings">Voice embeddings are biometric data, stored locally on the server. Shadow mode only: scores never block commands. Read for 20 seconds; reading is not routed as commands.</p>
+      <p>Today I am walking outside and listening to the world around me. A small bird moves between the branches while the leaves turn in the breeze. I pause to notice its colours, its shape, and the sound of its song. I will speak naturally and keep the phone at a comfortable distance.</p>
+      <button id="enroll-voice" class="secondary-button" type="button" disabled>Enroll voice · 20 s</button>
+      <p id="enroll-progress" class="capture-settings" role="status">Start the microphone first. Requires the optional speaker service.</p>
+    </section>
 
     <p class="setting-label">Model <span id="model">Not connected</span></p>
     <label class="headset-setting"><input id="headset-enabled" type="checkbox"> Headset-button push-to-talk</label>

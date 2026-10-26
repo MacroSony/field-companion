@@ -1,0 +1,17 @@
+# Separate CPU service venv (tested with Python 3.12). Subset of the probe's
+# /data/build/tmp/addressee/spk/requirements.freeze.txt, not the OS package list.
+# The HTTP server is Python stdlib; no FastAPI/uvicorn dependency here.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.5.1+cpu
+torchaudio==2.5.1+cpu
+speechbrain==1.0.3
+huggingface_hub==0.36.2
+HyperPyYAML==1.2.3
+numpy==2.5.4
+scipy==1.18.1
+sentencepiece==0.2.2
+soundfile==0.14.0
+joblib==1.6.0
+tqdm==4.70.1
+PyYAML==6.0.1
+requests==2.31.0

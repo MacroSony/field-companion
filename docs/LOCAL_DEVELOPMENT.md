@@ -167,8 +167,10 @@ The unmodified test copy puts its screenshots and JSON results in ignored
 
 The separate `backend/selftest.py` now includes photo-look/confirmation and optional
 chorus tests. It requires a valid Boson key, network access and the prototype's
-photo/recording fixtures, which currently use `/data/build/birding-demo` paths.
-Those fixture paths need adapting before running that live test on Windows.
+external photo/recording fixtures (not bundled for licensing). Set
+`FIELD_COMPANION_TEST_DATA` or pass `--data-dir` to their directory; the photo
+default is `img/cardinal.jpg`. `--image` and `--chorus-file` override individual
+fixtures. Missing fixtures print a clear skip before starting a server/API call.
 It is not part of the credential-free tests above. Both `--serve` and `--chorus`
 remain available after integration.
 

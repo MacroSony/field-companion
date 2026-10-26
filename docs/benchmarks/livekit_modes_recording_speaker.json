@@ -1,0 +1,81 @@
+{
+  "date": "2026-10-25",
+  "merged_source": "research/addressee@2e824e1",
+  "livekit_features": {
+    "passed": true,
+    "physical_phone": false,
+    "browser_aec_test": false,
+    "acoustic_echo_test": false,
+    "cloud_transport_test": true,
+    "checks": [
+      {
+        "case": "Application signaling and both participants connect through LiveKit Cloud",
+        "passed": true
+      },
+      {
+        "case": "Twenty-second native RTC enrollment succeeds and suppresses reading commands",
+        "duration_s": 20.0,
+        "passed": true
+      },
+      {
+        "case": "Native voice WAV, transcript, actual route and real shadow score share one turn",
+        "score": 0.7482791314273641,
+        "passed": true
+      },
+      {
+        "case": "Recording off stops WAV saving while normal speech continues",
+        "passed": true
+      },
+      {
+        "case": "Ambient uncertain question creates a silent card without audio",
+        "passed": true
+      },
+      {
+        "case": "Answer button promotes the original card question to an explicit request",
+        "passed": true
+      },
+      {
+        "case": "Switching back to Scout restores silent ignoring of unaddressed chatter",
+        "passed": true
+      }
+    ],
+    "synthetic_voice": true,
+    "real_speaker_service": true,
+    "shadow_only": true,
+    "received_audio_frames": 6437,
+    "audible_audio_frames": 927
+  },
+  "speaker_model": {
+    "passed": true,
+    "synthetic_voice": true,
+    "identity_gate": false,
+    "service_health": {
+      "loaded": true,
+      "model": "speechbrain/spkrec-ecapa-voxceleb"
+    },
+    "enrollment_ms": 6219,
+    "enrollment_seconds": 20.0,
+    "score_ms": 1368.33,
+    "same_synthetic_voice_similarity": 0.9648370626618019
+  },
+  "camera_regression": {
+    "passed": true,
+    "runs": 1,
+    "passed_runs": 1,
+    "checks": 7,
+    "physical_phone": false,
+    "acoustic_echo_test": false
+  },
+  "limits": [
+    "Synthetic RTC input; no physical phone or loudspeaker echo measurement.",
+    "Speaker scores are diagnostic only; no human identity-accuracy evaluation."
+  ],
+  "offline_regressions": {
+    "backend_tests": 440,
+    "backend_passed": true,
+    "node_audio_tests": 10,
+    "node_audio_passed": true,
+    "headless_phone_display_ui_passed": true,
+    "merged_mode_recording_enrollment_controls_passed": true
+  }
+}

@@ -1,6 +1,6 @@
 'use strict';
 (() => {
-  const CLIENT_BUILD = '2026-10-25-scout-results';
+  const CLIENT_BUILD = '2026-10-25-voice-modes';
   const $ = id => document.getElementById(id);
   const params = new URLSearchParams(location.search);
   const displayMode = params.get('display') === '1';
@@ -27,6 +27,8 @@
     if (typeof saved?.deviceId === 'string' && typeof saved?.label === 'string') selectedMic = saved;
   } catch (_) { /* Storage is optional. */ }
   let micSwitching = false, micRevision = 0, deviceRevision = 0;
+  let enrollmentTimer = null, enrollmentBusy = false;
+  $('voice-enrollment').hidden = displayMode;
   let silentAudio, silentURL, toastTimer;
   const headsetActions = ['play', 'pause', 'nexttrack', 'previoustrack'];
   let playbackReported = false, headsetEnabled = false, replaced = false;
@@ -54,9 +56,23 @@
   }
   function updateControls() {
     camera.updateConnection();
+    $('enroll-voice').disabled = displayMode || !state.connected || !stream || state.paused || enrollmentBusy || !state.speakerEnabled;
+    $('voice-profile').disabled = enrollmentBusy;
+    $('conversation-mode').disabled = displayMode || !state.connected || !livekitMode;
+    $('conversation-mode').value = state.addressingMode || (livekitMode ? 'scout' : 'ambient');
+    $('conversation-mode-help').textContent = !livekitMode
+      ? 'Standard audio uses ambient routing. Choose LiveKit voice to switch between both conversation modes.'
+      : state.addressingMode === 'ambient'
+      ? 'Natural conversation. Uncertain nature questions become silent cards; tap Answer to continue. Say Scout to make an explicit request or interrupt.'
+      : 'Say Scout before a new request. Replies to the current question can omit the name.';
+    $('turn-recording').disabled = displayMode || !state.connected || !stream;
+    $('turn-recording').checked = !!state.recordingEnabled;
+    $('turn-recording-status').textContent = state.recordingEnabled
+      ? 'Recording voice clips and transcripts on the computer running the app. Turn this off to stop saving.'
+      : 'Off. No input voice files are saved. Voice matching, when enabled, only keeps a short buffer in memory.';
     if ($('audio-mode')) {
       $('audio-mode').disabled = livekitMode;
-      $('audio-mode').textContent = livekitMode ? 'Scout · say name to talk' : webrtcMode ? (webrtcDuplex ? 'WebRTC · voice interruption on (experimental)' : 'WebRTC · tap to interrupt')
+      $('audio-mode').textContent = livekitMode ? (state.addressingMode === 'ambient' ? 'Ambient · silent question cards' : 'Scout · say name to talk') : webrtcMode ? (webrtcDuplex ? 'WebRTC · voice interruption on (experimental)' : 'WebRTC · tap to interrupt')
         : earphones ? 'Earphones · voice interruption on' : 'Speaker · tap to interrupt';
       $('audio-mode').setAttribute('aria-pressed', String(webrtcMode ? webrtcDuplex : earphones));
     }
@@ -65,7 +81,7 @@
       $('assistant-mute').setAttribute('aria-pressed', String(assistantMuted));
     }
     if ($('interrupt-hint')) $('interrupt-hint').textContent = livekitMode
-      ? (state.replyWithoutName && Date.now() < state.replyWithoutNameUntil ? 'You can answer this question without saying Scout' : 'Say “Scout, …” to talk or interrupt')
+      ? (state.replyWithoutName && Date.now() < state.replyWithoutNameUntil ? 'You can answer this question without saying Scout' : state.addressingMode === 'ambient' ? 'Talk naturally; say “Scout, …” to interrupt' : 'Say “Scout, …” to talk or interrupt')
       : (webrtcMode ? webrtcDuplex : earphones) ? 'Say something to interrupt' : 'Tap to interrupt; speak after the reply';
     if ($('earphone-tip')) $('earphone-tip').hidden = false;
     $('tap').disabled = $('send').disabled = !state.connected;
@@ -104,7 +120,7 @@
       const status = {running: 'investigating', queued: 'queued', completed: 'ready', cancelled: 'cancelled', failed: 'failed', timed_out: 'time limit'};
       $('display-status').textContent = `${state.connected ? '● Live' : '○ Connecting'} · ${playing ? 'Assistant speaking' : 'Session ' + session}${job ? ` · ${job.id} ${status[job.status] || ''}` : ''}`;
     }
-    document.querySelectorAll('.counter button, .delete-button, .investigation-actions button').forEach(button => { button.disabled = !state.connected; });
+    document.querySelectorAll('.counter button, .delete-button, .investigation-actions button, .silent-note-answer').forEach(button => { button.disabled = !state.connected; });
   }
 
   function saveMic(deviceId, label) {
@@ -435,6 +451,7 @@
     ws.onclose = event => {
       if (socket !== ws) return;
       if (isReplacement(event.reason)) { phoneReplaced(); return; }
+      enrollmentStatus({status: 'error', error: 'Disconnected; capture cancelled.'});
       state.connected = false; state.listening = false; flush(); updateControls();
       if (managedAudio) {
         rtc?.close(); rtc = null;
@@ -462,6 +479,9 @@
     updateControls();
   }
   function clearSessionUI() {
+    enrollmentStatus({status: 'error', error: 'Session reset; capture cancelled.'});
+    for (const card of $('silent-notes').children) clearTimeout(card.expiryTimer);
+    $('silent-notes').replaceChildren();
     flush(); camera.reset(); state.items = []; state.heard = []; state.investigations = [];
     renderChecklist(); renderSuggestions([]); renderCandidates([]); renderInvestigations(); updateMap();
     $('heard').replaceChildren(element('p', 'empty-inline', 'Listening for the next discovery.'));
@@ -475,6 +495,27 @@
   function resetSession() {
     if (!state.connected || !confirm('Clear checklist, suggestions, heard history, investigations and conversation?')) return;
     send({type: 'reset'}); clearSessionUI();
+  }
+  function enrollmentStatus(message) {
+    clearInterval(enrollmentTimer); enrollmentTimer = null;
+    enrollmentBusy = ['capturing', 'processing'].includes(message.status);
+    const seconds = Number(message.duration_s || 0).toFixed(1);
+    $('enroll-progress').textContent = message.status === 'capturing' ? 'Read aloud: 0 / 20 s'
+      : message.status === 'processing' ? `${seconds} s captured. Processing…`
+      : message.status === 'ok' ? `${seconds} s captured. Voice enrolled.`
+      : `${seconds} s captured. ${message.error || 'Enrollment cancelled.'}`;
+    if (message.status === 'capturing') {
+      const started = Date.now();
+      enrollmentTimer = setInterval(() => {
+        const elapsed = Math.min(20, (Date.now() - started) / 1000);
+        $('enroll-progress').textContent = `Read aloud: ${elapsed.toFixed(0)} / 20 s`;
+        if (elapsed >= 20) {
+          clearInterval(enrollmentTimer); enrollmentTimer = null;
+          send({type: 'enroll_stop'}); // Server also auto-stops; duplicate stop is harmless.
+        }
+      }, 250);
+    }
+    updateControls();
   }
   function handleMessage(message) {
     if (message.type === 'diagnostic') diagnostic.record(message.event, message);
@@ -508,6 +549,7 @@
       case 'audio_end':
         if (audioEnabled && message.id === playbackId) { playbackComplete = true; reportPlayback(playbackReported); }
         break;
+      case 'enrollment': if (!displayMode) enrollmentStatus(message); break;
       case 'capture': camera.requestCapture(message); break;
       case 'camera_prepare': camera.prepare(message); break;
       case 'camera_cancelled': camera.cancelled(message); break;
@@ -526,6 +568,8 @@
       case 'investigations':
         if (Array.isArray(message.items)) { state.investigations = message.items; renderInvestigations(); updateControls(); }
         break;
+      case 'silent_note': showSilentNote(message); break;
+      case 'silent_note_removed': removeSilentNote(message.id); break;
       case 'transcript': {
         const target = message.role === 'user' ? $('user-caption') : message.role === 'assistant' ? $('assistant-caption') : null;
         if (target && typeof message.text === 'string') {
@@ -546,6 +590,9 @@
         if (livekitMode) rtc?.handleState(message);
         if (typeof message.server_build === 'string') $('version-banner').hidden = message.server_build === CLIENT_BUILD;
         state.listening = !!message.listening; state.speaking = !!message.speaking;
+        state.addressingMode = message.addressing_mode || (livekitMode ? 'scout' : 'ambient');
+        state.recordingEnabled = !!message.recording_enabled;
+        state.speakerEnabled = !!message.speaker_enabled;
         state.replyWithoutName = !!message.reply_without_name;
         state.replyWithoutNameUntil = Date.now() + Math.min(40, Math.max(0, Number(message.reply_without_name_for) || 0)) * 1000;
         clearTimeout(replyHintTimer);
@@ -565,6 +612,31 @@
     if (className) node.className = className;
     if (text !== undefined) node.textContent = text;
     return node;
+  }
+  function removeSilentNote(id) {
+    const card = [...$('silent-notes').children].find(node => node.dataset.id === id);
+    if (card) { clearTimeout(card.expiryTimer); card.remove(); }
+  }
+  function showSilentNote(message) {
+    if (typeof message.id !== 'string' || typeof message.question !== 'string') return;
+    removeSilentNote(message.id);
+    const list = $('silent-notes');
+    while (list.children.length >= 3) removeSilentNote(list.firstElementChild.dataset.id);
+    const card = element('div', 'silent-note');
+    card.dataset.id = message.id;
+    // textContent, never HTML: the original transcript may contain arbitrary text.
+    card.append(element('p', '', `Not sure that was for me: “${message.question}”`));
+    if (typeof message.note === 'string' && message.note) card.title = message.note;
+    const answer = element('button', 'silent-note-answer', 'Answer');
+    answer.type = 'button'; answer.disabled = !state.connected;
+    answer.addEventListener('click', () => {
+      if (send({type: 'answer_note', id: message.id})) removeSilentNote(message.id);
+    });
+    const dismiss = element('button', 'silent-note-dismiss', '×');
+    dismiss.type = 'button'; dismiss.setAttribute('aria-label', 'Dismiss note');
+    dismiss.addEventListener('click', () => removeSilentNote(message.id));
+    card.append(answer, dismiss); list.append(card);
+    card.expiryTimer = setTimeout(() => removeSilentNote(message.id), 30000);
   }
   function renderInvestigations() {
     const list = $('investigations'), section = $('investigations-section');
@@ -834,6 +906,7 @@
     captureSettings(); requestWakeLock(); updateControls(); connect();
   }
   async function stop() {
+    enrollmentStatus({status: 'error', error: 'Session ended; capture cancelled.'});
     camera.close();
     state.running = false; state.connected = false; state.listening = false;
     diagnostic.stop(); rtc?.close(); rtc = null;
@@ -888,6 +961,17 @@
     downloadCSV(rows, 'all-taxa');
   }
   $('client-build').textContent = CLIENT_BUILD;
+  $('conversation-mode').addEventListener('change', () => send({type:'addressing_mode',value:$('conversation-mode').value}));
+  $('turn-recording').addEventListener('change', () => send({type:'recording',enabled:$('turn-recording').checked}));
+  $('enroll-voice').addEventListener('click', () => {
+    const profile = $('voice-profile').value.trim() || 'owner';
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(profile)) {
+      $('enroll-progress').textContent = 'Use letters, digits, underscores or hyphens for the profile.'; return;
+    }
+    if (send({type: 'enroll_start', profile})) {
+      enrollmentBusy = true; $('enroll-progress').textContent = 'Waiting for capture…'; updateControls();
+    }
+  });
   $('settings-open').addEventListener('click', () => $('settings-dialog').showModal());
   $('reset').addEventListener('click', resetSession);
   $('reset-display').addEventListener('click', resetSession);

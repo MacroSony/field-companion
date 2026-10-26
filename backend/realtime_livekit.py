@@ -22,6 +22,7 @@ from livekit_settings import LiveKitSettings
 from realtime_webrtc import openai_config
 from tool_feedback import recording
 from conversation_state import ScoutGate, SharedDialogue, ConversationServices, MEMORY_RULE
+from livekit_diagnostics import VoiceCapture
 
 
 def browser_token(settings, room_name, identity):
@@ -70,6 +71,8 @@ class LiveKitSessionMixin:
         self.conversation_services = ConversationServices(self.realtime)
         self.dialogue = SharedDialogue(self.conversation_services.summarize)
         self.voice_input_lock = asyncio.Lock()
+        self.addressing_mode = 'scout'
+        self.voice_capture = VoiceCapture(self)
 
     @property
     def echo_guard(self):
@@ -82,7 +85,7 @@ class LiveKitSessionMixin:
                 'media_connected': bool(self.voice and self.voice.ready),
                 'speaking': self.voice_speaking, 'transport': 'livekit',
                 'interruption_owner': 'livekit', 'interruption_mode': 'addressed',
-                'wake_name': self.wake.name, 'wake_required': True,
+                'wake_name': self.wake.name, 'wake_required': self.addressing_mode == 'scout',
                 'reply_without_name': bool(pending_reply),
                 'reply_without_name_for': max(0, pending_reply.expires - self.wake.clock()) if pending_reply else 0,
                 'memory_recent_messages': len(self.dialogue.recent),
@@ -109,15 +112,46 @@ class LiveKitSessionMixin:
                 'wake name. When clarification is needed, ask one specific question ending in a question mark.')
         if phase == 'route':
             config['instructions'] += json.dumps(self.dialogue.snapshot(), ensure_ascii=False)
-            config['instructions'] += (
+            if self.addressing_mode == 'ambient' and not getattr(self.turn_question,'addressed',False):
+                config['instructions'] += (
+                    '\nThis unprefixed turn has not been accepted as a reply to an active question. '
+                    'Do not recreate an invitation from historical dialogue. Apply the ambient '
+                    'addressing rule: clearly directed commands may run; uncertain nature '
+                    'questions use show_silently and other chatter uses ignore.')
+            if self.addressing_mode == 'scout' or getattr(self.turn_question, 'addressed', False):
+                config['instructions'] += (
                 '\nAddressing override: this latest request has ALREADY been accepted by '
                 'the application as addressed to Scout (named request, current-question '
                 'reply, or deliberate text input). Do not ignore it as chatter. If intent '
                 'or target is unclear, call clarify_request with one concise question in '
                 'the user\'s language. Never guess an old species or action. Historical '
                 'dialogue is not a new request. Latest question being answered, if any: '
-                + json.dumps(getattr(self.turn_question, 'reply_to', None), ensure_ascii=False))
+                    + json.dumps(getattr(self.turn_question, 'reply_to', None), ensure_ascii=False))
         return config
+
+    @property
+    def recording_position(self):
+        return self.voice_capture.position if hasattr(self,'voice_capture') else 0
+
+    def extract_turn_audio(self, start_sample, stop_sample, padding=.3):
+        return self.voice_capture.extract(start_sample,stop_sample,padding)
+
+    def voice_frame(self, samples):
+        self.voice_capture.feed(samples)
+
+    async def start_enrollment(self, profile):
+        if self.speaker_service and self.voice and self.voice.ready:
+            await self.voice.interrupt()
+        await super().start_enrollment(profile)
+        if self.enrollment and self.voice_capture.active:
+            self.voice_capture.active['enrollment'] = True
+
+    async def route_accepted(self, name, args):
+        if not getattr(self.turn_question, 'memory_recorded', False):
+            self.dialogue.add('user',str(self.turn_question))
+            if hasattr(self.turn_question,'memory_recorded'):
+                self.turn_question.memory_recorded = True
+        self.wake.clear()
 
     def assistant_audio_pending(self):
         return self.voice_speaking or super().assistant_audio_pending()
@@ -195,14 +229,23 @@ class LiveKitSessionMixin:
         # The media framework still owns playout. Only a recognized vocative can
         # force interruption before the final transcript/relevance check.
         if (self.mic and self.mic_on and self.voice and self.voice.ready
+                and not self.enrollment and not (self.voice_capture.active or {}).get('enrollment')
                 and self.voice_speaking and self.wake.addressed(text) is not None):
             await self.voice.interrupt()
 
-    async def voice_input(self, text):
+    async def voice_input(self, text, *, item_id=None):
         async with self.voice_input_lock:
-            await self.accept_voice_input(text)
+            turn = self.voice_capture.final(text,item_id)
+            if turn.get('duplicate'):
+                return
+            ids = (turn['recording_id'],) if turn.get('recording_id') else ()
+            context = self.recording_audio_context.set(ids)
+            try:
+                await self.accept_voice_input(text, turn)
+            finally:
+                self.recording_audio_context.reset(context)
 
-    async def accept_voice_input(self, text):
+    async def accept_voice_input(self, text, turn):
         if not self.mic or self.closed or not self.voice or not self.voice.ready:
             return
         self.awaiting_transcript = False
@@ -211,18 +254,36 @@ class LiveKitSessionMixin:
             self.transcript_guard_task = None
         if not self.mic_on or not text.strip():
             self.log('input_ignored', reason='mic_off_or_empty')
+            self.voice_capture.settle(turn,'input_ignored','mic_off_or_empty')
+            await self.flush_pending()
+            return
+        if self.enrollment or turn.get('enrollment'):
+            self.log('input_ignored',reason='enrollment')
+            self.voice_capture.settle(turn,'input_ignored','enrollment')
             await self.flush_pending()
             return
         accepted = self.wake.addressed(text)
+        addressed = accepted is not None
+        ambient = self.addressing_mode == 'ambient'
+        if ambient and not addressed and turn.get('overlap'):
+            self.log('input_ignored',reason='ambient_playback_overlap')
+            self.voice_capture.settle(turn,'input_ignored','ambient_playback_overlap')
+            await self.flush_pending()
+            return
         reply_to = None
         reply_lease = None
         camera_action = 'none'
         if accepted is None:
             prompt = self.wake.current(self.reply_binding())
             if not prompt:
-                self.log('input_ignored', reason='wake_name_required')
-                await self.flush_pending()
-                return
+                if ambient:
+                    await self.queue_voice_candidate(text,turn,addressed=False)
+                    return
+                else:
+                    self.log('input_ignored', reason='wake_name_required')
+                    self.voice_capture.settle(turn,'input_ignored','wake_name_required')
+                    await self.flush_pending()
+                    return
             # The exact explicitly invited camera keyword needs no model call.
             keyword = text.strip(' \t\n.,!！。？?').lower()
             if prompt.kind == 'camera' and keyword in ('start', '开始'):
@@ -244,6 +305,7 @@ class LiveKitSessionMixin:
                         await self.phone_json({'type': 'reply_retry', 'message':
                             'I could not check that reply. Say “Scout” and repeat it.'})
                     self.awaiting_transcript = False
+                    self.voice_capture.settle(turn,'input_ignored','reply_service_unavailable')
                     await self.flush_pending()
                     return
                 finally:
@@ -253,12 +315,18 @@ class LiveKitSessionMixin:
                 # A delayed classification cannot answer an expired or replaced question.
                 if (self.closed or self.input_revision != revision or self.reply_binding() != binding
                         or self.wake.current(binding) is not prompt):
+                    self.voice_capture.settle(turn,'input_ignored','stale_reply')
                     return
             if decision['kind'] != 'answer':
+                if ambient:
+                    await self.queue_voice_candidate(text,turn,addressed=False)
+                    return
                 self.log('input_ignored', reason='not_answer_to_pending_question')
+                self.voice_capture.settle(turn,'input_ignored','not_answer_to_pending_question')
                 await self.flush_pending()
                 return
             accepted, reply_to = text, prompt.question
+            addressed = True
             reply_lease = (prompt.binding, self.input_revision, prompt.expires)
             if prompt.kind == 'camera':
                 camera_action = decision['camera_action']
@@ -275,6 +343,7 @@ class LiveKitSessionMixin:
         if reply_lease and (self.reply_binding() != reply_lease[0]
                 or self.input_revision != reply_lease[1] or self.wake.clock() >= reply_lease[2]):
             self.log('input_ignored', reason='reply_context_changed')
+            self.voice_capture.settle(turn,'input_ignored','reply_context_changed')
             await self.flush_pending()
             return
         if camera_action in ('start', 'cancel'):
@@ -282,22 +351,42 @@ class LiveKitSessionMixin:
             self.input_revision += 1
             self.auto_speech_paused = False
             await self.camera_confirmation('start' if camera_action == 'start' else 'cancel')
+            self.voice_capture.settle(turn,'camera_confirmation')
             await self.flush_pending()
         else:
             await self.handle_phone({'type': 'text', 'text': accepted,
-                '_addressed': True, '_reply_to': reply_to}, self.mic)
+                '_addressed': True, '_reply_to': reply_to, '_voice_input':True,
+                '_recording_ids':self.recording_audio_context.get()}, self.mic)
+            if (turn.get('recording_id') not in self.recording_turns and not any(
+                    row[0]=='text' and turn.get('recording_id') in getattr(row[1],'recording_ids',()) for row in self.pending)):
+                self.voice_capture.settle(turn,'direct_action')
+
+    async def queue_voice_candidate(self, text, turn, *, addressed):
+        self.log('user_transcript',text=text,transport='livekit',addressed=addressed)
+        self.user_speaking = self.awaiting_transcript = False
+        await self.phone_json({'type':'transcript','role':'user','text':text,'final':True})
+        await self.handle_phone({'type':'text','text':text,'_voice_input':True,
+            '_addressed':addressed,'_defer_interrupt':not addressed,
+            '_recording_ids':self.recording_audio_context.get()},self.mic)
 
     async def handle_phone(self, event, client=None):
         if event.get('type') == 'text' and isinstance(event.get('text'), str) and 0 < len(event['text'].strip()) <= 8000:
+            addressed = bool(event.get('_addressed')) if event.get('_voice_input') else True
+            if addressed:
+                self.wake.clear()
+                self.dialogue.add('user', event['text'])
+            event = {**event, '_addressed':addressed, '_memory_recorded':addressed}
+        if event.get('type') == 'addressing_mode':
             self.wake.clear()
-            self.dialogue.add('user', event['text'])
-            event = {**event, '_addressed': True}
         return await super().handle_phone(event, client)
 
     async def voice_answer(self, text, *, interrupted=False, epoch=None):
         if self.closed or (epoch is not None and epoch != self.epoch):
             return
         self.last_assistant_text = text
+        if self.recorder:
+            for turn_id in self.recording_turns:
+                self.recorder.update(turn_id,assistant_audio=True)
         self.heard_assistant(text, interrupted=interrupted)
         self.log('assistant_transcript', text=text, transport='livekit')
         await self.phone_json({'type': 'transcript', 'role': 'assistant', 'text': text, 'final': True})
@@ -320,6 +409,10 @@ class LiveKitSessionMixin:
             await self.flush_pending()
 
     async def voice_user_state(self, state):
+        if state == 'speaking':
+            self.voice_capture.begin()
+        else:
+            self.voice_capture.end()
         self.user_speaking = state == 'speaking'
         if self.user_speaking:
             # Notification coordination only; addressing decides interruption.
@@ -389,6 +482,9 @@ class LiveKitSessionMixin:
         text, pcm = recording(kind, language)
         played = await self.voice.say(text, pcm)
         if played and (guard is None or guard()):
+            if self.recorder:
+                for turn_id in self.recording_audio_context.get():
+                    self.recorder.update(turn_id,assistant_audio=True)
             self.last_assistant_text = text
             if kind != 'received':
                 self.heard_assistant(text, kind='camera' if kind == 'camera-ready' else 'question')
@@ -436,9 +532,13 @@ class LiveKitSessionMixin:
         await super().reset()
         self.wake.clear()
         await self.dialogue.reset()
+        self.voice_capture.clear()
         await self.state()
 
     async def close_voice(self):
+        self.cancel_enrollment()
+        if self.recorder:
+            self.recorder.flush('microphone_detached',self.recording_position)
         self.wake.clear()
         if self.transcript_guard_task:
             self.transcript_guard_task.cancel()
@@ -453,6 +553,7 @@ class LiveKitSessionMixin:
             await asyncio.gather(task, return_exceptions=True)
         if voice:
             await voice.close()
+        self.voice_capture.clear()
         if self.routing_task:
             self.routing_task.cancel()
             await asyncio.gather(self.routing_task, return_exceptions=True)

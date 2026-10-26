@@ -180,6 +180,59 @@ adaptive initialization, an interrupted reply, and no fallback to VAD. See the
 split into two transcripts before the checklist answer, so this is not a claim
 of perfect segmentation. The test does not evaluate browser AEC or phone echo.
 
+## Conversation modes, recordings and voice profiles
+
+The settings drawer offers two LiveKit conversation modes. **Scout** remains the
+default: a new spoken request needs the wake name, while a relevant answer to a
+current question (including Start after camera readiness) does not. **Ambient**
+keeps the addressee branch's natural conversation routing and silent question
+cards. Uncertain questions can appear without speech; **Answer** submits the
+card's original transcript as an explicit request. Naming Scout is explicit in
+either mode and cannot be downgraded to a silent card. Mode changes clear old
+implicit requests/cards, without resetting the checklist or conversation memory.
+
+Ambient is not a wake-word guarantee: its router can still mistake conversation
+between people for a request. Unprefixed speech overlapping assistant playback
+is ignored rather than interrupting it; explicitly naming Scout can interrupt.
+Speaker similarity is diagnostic only and never decides who may issue commands.
+
+**Save turn recordings** is off by default. Enabling it saves per-turn microphone
+WAVs and metadata under ignored `recordings/`; disabling it stops new WAVs. Each
+turn keeps the recording consent state from its start, so enabling the setting
+does not save earlier audio. Persistent redacted diagnostic logs go under
+ignored `logs/` (`--no-log-file` disables them); logs can still contain spoken
+transcripts. `--record-dir` explicitly opts recording in at server startup.
+
+The optional local SpeechBrain ECAPA service runs independently of the voice
+backend. On Windows, install `requirements-speaker.txt` in `.venv-speaker`, then
+run `powershell -File backend/start_speaker.ps1`; it listens on loopback port
+8821. `start_livekit.ps1` starts it automatically when that environment exists
+(`-SkipSpeaker` opts out). Model files use ordinary copies on Windows, avoiding
+the symlink privilege requirement. Profile embeddings live in ignored
+`speakers/`; the service's `/reset` endpoint can remove a named profile.
+
+Choose a profile name and **Enroll voice** in settings, then read naturally for
+20 seconds. Enrollment speech cannot trigger tasks, including a delayed final
+transcript after capture stops. Registration and per-turn scoring run in the
+background; failures/timeouts do not block normal conversation. Voice profiles
+are not authentication, and accuracy with short/noisy field speech remains
+unmeasured.
+
+LiveKit recordings and embeddings use a separate reader of the **native chat
+audio track**, with its own 48 kHz ring and VAD sample positions. They never use
+the browser's independent raw BirdNET microphone ring. Bird recognition retains
+that original raw path. With voice matching configured, the chat ring exists
+transiently in memory even when WAV recording is off; disabling recordings is
+not the same as disabling voice-profile scoring.
+
+The merged implementation passed an actual model enrollment/score check and
+[seven real Cloud integration checks](benchmarks/livekit_modes_recording_speaker.json),
+including native 20-second enrollment, command suppression during reading,
+WAV/transcript/route/score correlation, recording off, silent cards, Answer and
+switching back to Scout. A complete camera replay also passed all seven steps
+with voice matching enabled. These use synthetic microphone audio, not a
+physical phone, and do not measure biometric accuracy or acoustic echo.
+
 ## Limits and rollback
 
 Automatic adaptive/VAD interruption is disabled in Scout mode. Accepted requests

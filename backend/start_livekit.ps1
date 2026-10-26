@@ -1,7 +1,9 @@
 param(
     [ValidateRange(1,65535)][int]$Port = 8805,
     [ValidateRange(1,65535)][int]$BirdPort = 8811,
-    [switch]$SkipVision
+    [ValidateRange(1,65535)][int]$SpeakerPort = 8821,
+    [switch]$SkipVision,
+    [switch]$SkipSpeaker
 )
 $ErrorActionPreference = 'Stop'
 $livekitRoot = Split-Path -Parent $PSScriptRoot
@@ -44,6 +46,11 @@ if (-not $SkipVision -and $livekitDefaultVision) {
 }
 $livekitLogs = Join-Path $livekitRoot 'out\livekit'
 New-Item -ItemType Directory -Force -Path $livekitLogs | Out-Null
+$livekitSpeakerURL = ''
+if (-not $SkipSpeaker -and (Test-Path -LiteralPath (Join-Path $livekitRoot '.venv-speaker\Scripts\python.exe'))) {
+    & (Join-Path $PSScriptRoot 'start_speaker.ps1') -Port $SpeakerPort
+    $livekitSpeakerURL = "http://127.0.0.1:$SpeakerPort"
+}
 $livekitWorkerKeyFile = Join-Path $livekitLogs 'birdnet-worker.key'
 if (-not (Test-Path -LiteralPath $livekitWorkerKeyFile)) {
     $livekitRandom = [byte[]]::new(32)
@@ -57,7 +64,9 @@ $livekitOldWorkerFile = $env:FIELD_BIRDNET_WORKER_KEY_FILE
 try {
     $env:FIELD_BIRDNET_WORKER_URL = "http://127.0.0.1:$BirdPort"
     $env:FIELD_BIRDNET_WORKER_KEY_FILE = $livekitWorkerKeyFile
-    $livekitApp = Start-Process -FilePath $livekitPython -ArgumentList @('-X','utf8','-B','backend/server.py','--host','127.0.0.1','--port',$Port,'--realtime-provider','openai','--enable-livekit') -WorkingDirectory $livekitRoot -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $livekitLogs 'app.stdout.log') -RedirectStandardError (Join-Path $livekitLogs 'app.stderr.log')
+    $livekitAppArgs = @('-X','utf8','-B','backend/server.py','--host','127.0.0.1','--port',$Port,'--realtime-provider','openai','--enable-livekit')
+    if ($livekitSpeakerURL) { $livekitAppArgs += @('--speaker-service',$livekitSpeakerURL) }
+    $livekitApp = Start-Process -FilePath $livekitPython -ArgumentList $livekitAppArgs -WorkingDirectory $livekitRoot -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $livekitLogs 'app.stdout.log') -RedirectStandardError (Join-Path $livekitLogs 'app.stderr.log')
 } finally {
     $env:FIELD_BIRDNET_WORKER_URL = $livekitOldWorkerURL
     $env:FIELD_BIRDNET_WORKER_KEY_FILE = $livekitOldWorkerFile

@@ -8,6 +8,7 @@ import asyncio
 import base64
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 from datetime import date, datetime, timedelta
 from dataclasses import dataclass, field, asdict
 import math
@@ -34,11 +35,17 @@ from tool_feedback import TOOLS as FEEDBACK_TOOLS, recording as feedback_recordi
 from route_safety import route_guard
 from task_retry import select_retry_tasks
 from realtime_provider import RealtimeConfig
+from session_data import TurnRecorder, append_jsonl, extract_turn_audio, redact, wall_time
+from speaker_client import speaker_request
+from speaker_service import profile_name
 
 MODEL = "higgs-realtime-1.5-preview"
 SR = 48000
 ROOT = Path(__file__).resolve().parents[1]
 LOG = logging.getLogger("field-companion")
+EVENT_LOG_DIR = ROOT / "logs"
+RECORD_DIR = None  # Explicit opt-in only.
+SPEAKER_SERVICE = None  # Shadow diagnostics only; never a routing signal.
 GROUPS = ["Aves", "Insecta", "Plantae", "Mammalia", "Fungi", "Reptilia", "Amphibia", "Arachnida", "Mollusca", "Actinopterygii"]
 PHOTO_GROUPS = ['Any', *GROUPS]
 
@@ -266,6 +273,7 @@ TOOLS = [
     tool_schema("speak", "Request speech for general questions, greetings, or mic checks ('Can you hear me?'); not for questions needing checklist or recent-sound data. No answer during routing. Never for lone fillers/acknowledgements (Ah/Okay/Uh/Oh/Mm/Mm-hmm): ignore those.", {"reason": NAME}, ("reason",)),
     tool_schema("clarify_request", "Ask ONE short specific clarification when an addressed request has an unclear action or referent. Do not perform an action or guess from stale evidence.", {"question": NAME}, ("question",)),
     tool_schema("ignore", 'Silently ignore chatter, unintelligible fragments, incomplete commands, and lone fillers/acknowledgements (Ah, Okay, Uh, Oh, Mm, Mm-hmm). With pending BirdNET suggestions or an unfinished prior request, never accept or dismiss on them. Exception: Okay/好的 accepts the latest investigation explanation offer via get_investigations(explain=true).'),
+    {'type': 'function', 'name': 'show_silently', 'description': "Possibly addressed nature question with no clear addressee (e.g. 'Is that a hawk?'): put a short note on screen without speaking.", 'parameters': {'type': 'object', 'properties': {'text': {'type': 'string'}}, 'required': ['text']}},
 ]
 INSTRUCTIONS = """You are a concise hands-free birding/naturalist companion with an open microphone.
 Reply in English by default; the user may speak Chinese: answer in the language of the question.
@@ -363,6 +371,10 @@ Earlier tool outputs are already handled. Do not invent sightings from questions
 [TAP] means the next utterance is addressed to you.
 """
 ROUTING = 'HIGHEST-PRIORITY ROUTING RULE: If the latest assistant question is an investigation explanation offer, Okay/好的 explicitly accepts that offer: use get_investigations(explain=true), never accept_suggestions. Otherwise a turn consisting only of ah, okay, uh, oh, mm, or mm-hmm is ignore, even immediately after a pending-suggestion question or an unfinished earlier request. These fillers are NOT approval or dismissal. Yes/yeah/sure or an intelligible add command can approve BirdNET suggestions. Apply this before choosing any other tool.' + "\n" + ROUTING
+# Keep the measured override last, including after dynamic context in config().
+ROUTING_BASE = ROUTING
+ADDRESSEE_RULE = "ADDRESSEE RULE (overrides any earlier rule about general questions): The microphone hears the user's companions and strangers. Speak only when the latest turn is clearly addressed to you: it names you or the companion app, asks about the checklist, recent sounds, identification or the camera, is a mic check, directly answers your latest question, or follows [TAP]. Turns that could be meant for a person (plans, food, weather, time, personal questions, requests like 'can you pass me...', opinions like 'do you think...', anything said to a named person) are ignore. A sighting reported by someone else or as an opinion ('I think it's a red-tailed') is not a confirmed user sighting: ignore. When unsure whether a nature question is for you, use show_silently; for non-nature chatter, ignore."
+ROUTING += "\n\n" + ADDRESSEE_RULE
 ANSWER = """You are the spoken voice of a cautious field naturalist companion.
 The application has ALREADY approved this speech turn. Render the supplied result,
 event or addressed question; do not classify it again or decide whether to respond.
@@ -389,7 +401,8 @@ ask_expert error without answer, ask the user to look at an organism first.
 SESSIONS = {}
 SESSION_TTL = 600
 FOCUS_TTL = 120
-ALLOWLIST_DIR = Path("/data/build/tmp")
+ALLOWLIST_DIR = Path(os.environ.get("FIELD_COMPANION_CACHE", str(ROOT / "out" / "cache"))).expanduser()
+ALLOWLIST_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def scientific_species(name):
@@ -417,13 +430,15 @@ class TurnItems(set):
 
 class TurnText(str):
     """Transcript plus any already-committed audio item (never a newer turn)."""
-    def __new__(cls, text, item_ids=(), acknowledged=False, context=None, *, addressed=False, reply_to=None):
+    def __new__(cls, text, item_ids=(), acknowledged=False, context=None, recording_ids=(), *, addressed=False, reply_to=None, memory_recorded=False):
         obj = super().__new__(cls, text)
         obj.item_ids = set(item_ids)
         obj.acknowledged = acknowledged
         obj.context = context
         obj.addressed = addressed
         obj.reply_to = reply_to
+        obj.recording_ids = tuple(recording_ids)
+        obj.memory_recorded = memory_recorded
         return obj
 
 
@@ -463,6 +478,7 @@ class Session:
         self.speech_stopped_at = None
         self.turn_stopped_at = None
         self.turn_question = ""
+        self.silent_notes = {}  # id -> (original server transcript, expiry); ephemeral, bounded
         self.input_acknowledged = False
         self.turn_context = None
         self.turn_revision = None
@@ -483,6 +499,7 @@ class Session:
         self.closed = False
         self.mic_on = True
         self.quiet = False
+        self.addressing_mode = 'ambient'
         self.lang = "en"
         self.lat, self.lng = 43.66, -79.39
         self.active = False
@@ -512,6 +529,15 @@ class Session:
         self.echo_ring = np.zeros(len(self.ring), dtype=bool)
         self.position = 0
         self.next_window = 3 * SR
+        self.speaker_service = SPEAKER_SERVICE
+        self.speaker_tasks = set()
+        self.enrollment = None
+        self.recording_enabled = RECORD_DIR is not None
+        self.recording_directory = Path(RECORD_DIR) if RECORD_DIR else ROOT / 'recordings'
+        self.recorder = TurnRecorder(RECORD_DIR, self.id, self.extract_turn_audio, SR,
+            on_audio=self.score_turn if self.speaker_service else None) if RECORD_DIR is not None or self.speaker_service else None
+        self.recording_turns = ()
+        self.recording_audio_context = ContextVar("recording_audio_" + self.id, default=())
         self.filter_taps = firwin(63, 10800, fs=SR)
         self.filter_state = np.zeros(62)
         self.decimation_phase = 0
@@ -1269,7 +1295,11 @@ class Session:
         return row
 
     def log(self, event, **fields):
-        LOG.info("%s", json.dumps({"connection": self.id, "event": event, **fields}, ensure_ascii=False))
+        record = redact({"connection": self.id, "event": event, **fields, "timestamp": wall_time()})
+        LOG.info("%s", json.dumps(record, ensure_ascii=False))
+        if EVENT_LOG_DIR is not None:
+            append_jsonl(Path(EVENT_LOG_DIR) / ("session-" + datetime.now().strftime("%Y%m%d") + ".jsonl"), record)
+
         client = self.mic
         if client is not None and getattr(client, "diagnostics", False) and len(self.diagnostic_tasks) < 100:
             # No text, SDP, credentials, tool arguments, GPS or provider errors.
@@ -1302,10 +1332,129 @@ class Session:
             await self.cancel_speech()
             self.log("barge_in", confirmation="vad")
 
+    def extract_turn_audio(self, start_sample, stop_sample, padding=.3):
+        """Reusable mono 48 kHz ring extraction; bounds report truncation."""
+        return extract_turn_audio(self.ring, self.position, start_sample, stop_sample,
+                                  sample_rate=SR, padding=padding)
+
+    @property
+    def recording_position(self):
+        return self.position
+
+    async def set_recording(self, enabled):
+        if enabled == self.recording_enabled:
+            return
+        if self.recorder is None:
+            self.recorder = TurnRecorder(None, self.id, self.extract_turn_audio, SR,
+                on_audio=self.score_turn if self.speaker_service else None)
+        self.recorder.flush('recording_changed', self.recording_position)
+        self.recorder.directory = self.recording_directory if enabled else None
+        self.recording_enabled = enabled
+        self.log('recording_changed', enabled=enabled)
+        await self.state()
+
+    async def route_accepted(self, name, args):
+        """Transport hook after execution guards; silence does not grant speech."""
+        pass
+
+    def speaker_background(self, coroutine):
+        task = asyncio.create_task(coroutine)
+        self.speaker_tasks.add(task)
+        task.add_done_callback(self.speaker_tasks.discard)
+        return task
+
+    def score_turn(self, turn_id, samples):
+        # Capture callback never awaits HTTP, resampling or inference. Bounded
+        # diagnostics can be dropped under load; routing does not consult them.
+        if len(self.speaker_tasks) >= 8:
+            self.log("speaker_score_failed", turn_id=turn_id, reason="busy")
+            self.recorder.speaker_done(turn_id, speaker_error="busy")
+            return
+        self.speaker_background(self.score_turn_background(turn_id, samples))
+
+    async def score_turn_background(self, turn_id, samples):
+        try:
+            result = await asyncio.wait_for(asyncio.to_thread(
+                speaker_request, self.speaker_service, "score", samples), 1.6)
+            scores = result["scores"]
+            fields = {"speaker_scores": scores,
+                      "speaker_best_profile": max(scores, key=scores.get) if scores else None,
+                      "speaker_ms": result["ms"]}
+            self.log("speaker_scores", turn_id=turn_id, duration_s=len(samples) / SR, **fields)
+            self.recorder.speaker_done(turn_id, **fields)
+        except Exception as exc:
+            self.log("speaker_score_failed", turn_id=turn_id, error_type=type(exc).__name__)
+            self.recorder.speaker_done(turn_id, speaker_error=type(exc).__name__)
+
+    async def start_enrollment(self, profile):
+        if not self.speaker_service:
+            await self.phone_json({"type": "enrollment", "status": "error", "error": "Speaker service is disabled", "duration_s": 0})
+            return
+        profile = profile_name(profile)
+        if self.enrollment:
+            raise ValueError("Voice enrollment is already running")
+        self.enrollment = {"profile": profile, "start": self.recording_position}
+        # Tag any in-flight VAD occurrence too; delayed finals remain suppressed
+        # after enroll_stop. Scores still run on these ordinary turn boundaries.
+        for record in self.input_audio_turns:
+            if record["stopped"] is None:
+                record["enrollment"] = True
+                if self.recorder:
+                    self.recorder.update(record.get("recording_id"), enrollment=True)
+        self.enrollment["timer"] = asyncio.get_running_loop().call_later(
+            20, lambda: self.speaker_background(self.stop_enrollment()))
+        self.log("enrollment_started", profile=profile)
+        await self.phone_json({"type": "enrollment", "status": "capturing", "profile": profile, "duration_s": 0})
+
+    def cancel_enrollment(self):
+        if self.enrollment:
+            self.enrollment["timer"].cancel()
+            self.enrollment = None
+
+    async def stop_enrollment(self):
+        window = self.enrollment
+        if not window:
+            return
+        self.cancel_enrollment()
+        stop = min(self.recording_position, window["start"] + 20 * SR)
+        samples, bounds = self.extract_turn_audio(window["start"], stop, padding=0)
+        duration = len(samples) / SR
+        await self.phone_json({"type": "enrollment", "status": "processing", "duration_s": duration})
+        # Extraction is synchronous and precedes scheduling, so a reset/rollover
+        # cannot change the selected sample span while HTTP is in progress.
+        self.speaker_background(self.enroll_background(window["profile"], samples, bounds))
+
+    async def enroll_background(self, profile, samples, bounds):
+        duration = len(samples) / SR
+        try:
+            result = await asyncio.wait_for(asyncio.to_thread(
+                speaker_request, self.speaker_service, "enroll", samples, profile), 10.5)
+            if result.get("ok") is not True:
+                raise ValueError("Enrollment was not accepted")
+            event = {"type": "enrollment", "status": "ok", "profile": profile, "duration_s": duration}
+        except Exception as exc:
+            event = {"type": "enrollment", "status": "error", "duration_s": duration,
+                     "error": "Voice enrollment failed (" + type(exc).__name__ + ")"}
+        self.log("enrollment_result", **event, **bounds)
+        await self.phone_json(event)
+
+    def record_route(self, name, arguments):
+        if self.recorder:
+            try:
+                args = json.loads(arguments or "{}")
+            except (TypeError, ValueError):
+                args = "[invalid JSON]"
+            for turn_id in self.recording_turns:
+                self.recorder.update(turn_id, outcome="routed", reason=None,
+                                     routed_tool=name, routed_arguments=args)
+
     async def phone_json(self, event):
         await asyncio.gather(*(c.send_json(event) for c in list(self.clients)), return_exceptions=True)
 
     async def phone_audio(self, pcm, *, guard=None):
+        if pcm and self.recorder:
+            for turn_id in self.recording_audio_context.get():
+                self.recorder.update(turn_id, assistant_audio=True)
         await asyncio.gather(*(c.send_audio(pcm, guard=guard) for c in list(self.clients)
                                if c.role == "mic" or c.audio), return_exceptions=True)
 
@@ -1447,8 +1596,9 @@ class Session:
             self.input_audio_turns.remove(record)
         return record
 
-    async def finish_input_audio(self, event):
-        record = self.match_input_audio_turn(event, final=True)
+    async def finish_input_audio(self, event, record, recording_id):
+        if self.recorder:
+            self.recorder.input_final(recording_id, event.get("transcript", ""), self.position, time.monotonic())
         blocked = (record is not None and record["blocked"]) or self.echo_blocked()
         current = self.current_input_audio_turn
         owns_input = record is current if record is not None else current is None
@@ -1461,9 +1611,17 @@ class Session:
         # Clear completed/failed audio without erasing a newer accepted turn.
         if not newer_input:
             await self.rt_send({"type": "input_audio_buffer.clear"})
-        if blocked:
-            self.log("input_audio_guarded", event_type=event.get("type"),
-                     item_id=event.get("item_id"), reason="playback_turn" if record and record["blocked"] else "playback")
+        recording = self.recorder.pending.get(recording_id) if self.recorder else None
+        enrolling = bool((record and record.get("enrollment")) or
+                         (recording and recording["row"].get("enrollment")))
+        if enrolling or blocked:
+            if self.recorder:
+                if enrolling:
+                    self.recorder.settle(recording_id, outcome="input_ignored", reason="enrollment")
+                else:
+                    self.recorder.settle(recording_id, outcome="guarded_during_playback", reason="playback")
+            self.log("input_ignored" if enrolling else "input_audio_guarded", event_type=event.get("type"),
+                     item_id=event.get("item_id"), reason="enrollment" if enrolling else "playback_turn" if record and record["blocked"] else "playback")
             if event.get("item_id"):
                 reused = any(r["id"] == event["item_id"] for r in self.input_audio_turns)
                 reused |= (self.current_input_audio_turn is not None
@@ -1572,6 +1730,10 @@ class Session:
                 "features": {"audio_diagnostics": True, "webrtc": bool(getattr(app.state, "enable_webrtc", False)),
                              "livekit": bool(getattr(app.state, "enable_livekit", False))},
                 "connected": self.connected, "echo_guard": self.echo_guard,
+                'addressing_mode': self.addressing_mode,
+                'supports_addressing_modes': self.transport == 'livekit',
+                'recording_enabled': self.recording_enabled,
+                'speaker_enabled': bool(self.speaker_service),
                 "session": self.id, "server_build": SERVER_BUILD}
 
     def input_context(self):
@@ -1644,7 +1806,7 @@ class Session:
                 "Speak only this text, with no additions, hints, translation or explanation. "
                 "Text to read: " + json.dumps(self.expert_readout, ensure_ascii=False))
         return self.realtime.phase({"output_modalities": ["text" if phase == "route" else "audio"],
-                "instructions": (ROUTING + "\nFresh state snapshot (context only; sounds are unconfirmed): "
+                "instructions": (ROUTING_BASE + "\nFresh state snapshot (context only; sounds are unconfirmed): "
                                  + json.dumps(self.route_snapshot())
                                  + "\nCurrent pending BirdNET suggestions (unconfirmed; latest turn only): "
                                  + json.dumps([r["en"] for r in self.suggestions.values()])
@@ -1664,6 +1826,7 @@ class Session:
                                  + json.dumps([{**{k: row[k] for k in ("id", "species", "status", "stage")},
                                                 "question": row["question"][:200]}
                                                for row in self.investigations.payload()["items"][-8:]])
+                                 + ("\n\n" + ADDRESSEE_RULE if self.addressing_mode == 'ambient' else '')
                                  if phase == "route" else answer_instructions),
                 "tools": TOOLS if phase == "route" else [],
                 "tool_choice": "required" if phase == "route" else "none"})
@@ -1918,7 +2081,8 @@ class Session:
                     acknowledged = acknowledged or getattr(more, "acknowledged", False)
                     merged_ids.update(getattr(more, "item_ids", ()))
                 if len(parts) > 1:
-                    value = TurnText(" ".join(parts), merged_ids, acknowledged, getattr(parts[-1], "context", None))
+                    value = TurnText(" ".join(parts), merged_ids, acknowledged, getattr(parts[-1], "context", None),
+                                     recording_ids=[r for part in parts for r in getattr(part, "recording_ids", ())])
                     self.pending[0] = (kind, value, stopped)
                     self.log("turns_merged", n=len(parts))
             self.turn_stale = stopped is not None and time.monotonic() - stopped > 12
@@ -1952,6 +2116,8 @@ class Session:
             self.turn_in_progress = True
             self.turn_stopped_at = stopped if kind in ("text", "audio") else None
             self.turn_items = TurnItems(getattr(value, "item_ids", ()))
+            self.recording_turns = getattr(value, "recording_ids", ())
+            audio_context = self.recording_audio_context.set(self.recording_turns)
             self.input_acknowledged = getattr(value, "acknowledged", False)
             self.turn_context = getattr(value, "context", None)
             self.turn_revision = self.input_revision
@@ -2021,6 +2187,11 @@ class Session:
                 if kind != "investigation":
                     await self.error("Turn failed; please try again.")
             finally:
+                if self.recorder:
+                    for turn_id in self.recording_turns:
+                        self.recorder.settle(turn_id)
+                self.recording_audio_context.reset(audio_context)
+                self.recording_turns = ()
                 self.turn_items = None
                 self.turn_question = ""
                 self.input_acknowledged = False
@@ -2076,7 +2247,9 @@ class Session:
         name = call["name"]
         words = " ".join(self.normalized_words(str(self.turn_question)))
         idle_start = (not self.camera_request and words in ("start", "start please", "开 始", "开 始 吧"))
-        if idle_start:
+        if name == "show_silently":
+            pass  # Never promote a silent card to camera/status speech or feedback.
+        elif idle_start:
             self.log("camera_guard", requested_tool=name, reason="no_pending_capture")
             self.queue_feedback("clarify")
             call = {**call, "name": "ignore", "arguments": "{}"}
@@ -2099,6 +2272,9 @@ class Session:
                 raise ValueError("seconds must be finite")
             if name == 'manage_investigation' and args.get('action') == 'retry':
                 raise ValueError('Use retry_task to resolve photo or investigation retries')
+            if name == "show_silently" and not isinstance(args.get("text"), str):
+                raise ValueError("show_silently requires text")
+            self.record_route(name, call.get("arguments"))
             decision, reason = route_guard(name, args, self.turn_question,
                 suggestions=bool(self.suggestions), **self.consent_context())
             if ((name in WRITE_TOOLS or name == "discard_observation") and self.turn_context is not None
@@ -2110,7 +2286,7 @@ class Session:
                 decision, reason = 'ignore', 'stale_clarification'
             if (getattr(self.turn_question, 'addressed', False) and not idle_start
                     and (self.turn_revision is None or self.turn_revision == self.input_revision)
-                    and (name == 'ignore' or (decision == 'ignore' and reason in (
+                    and (name in ('ignore','show_silently') or (decision == 'ignore' and reason in (
                         'unprompted_acknowledgement', 'filler', 'speak_ignore_contradiction')))):
                 # Addressing is already established. Unclear intent needs a
                 # question, not silence. Never override stale action ownership.
@@ -2120,6 +2296,9 @@ class Session:
                     or not 1 <= len(args['question'].strip()) <= 300):
                 raise ValueError('Clarification requires one short question')
             if decision != "allow":
+                if self.recorder:
+                    for turn_id in self.recording_turns:
+                        self.recorder.update(turn_id, outcome="input_ignored", reason=reason)
                 self.log("route_guard", requested_tool=name, decision=decision, reason=reason)
                 result = {"ok": False, "suppress_answer": True, "guard": reason}
                 if decision == "clarify":
@@ -2128,7 +2307,9 @@ class Session:
                     "type": "function_call_output", "call_id": call["call_id"],
                     "output": json.dumps(result)}})
                 return
-            await self.acknowledge_tool(name)
+            if name not in ("ignore", "show_silently"):
+                await self.route_accepted(name, args)
+                await self.acknowledge_tool(name)
             # Local feedback yields to microphone/UI events. Recheck ownership
             # before a delayed route can replace a newer camera request.
             if name in ("look", "new_observation") and not self.camera_route_current(name, args):
@@ -2141,6 +2322,7 @@ class Session:
             result = {"ok": True} if name == "ignore" else (
                 {"ready_to_answer": True, "reason": args.get("reason")} if name == "speak"
                 else {"ok": True, "answer": args['question']} if name == 'clarify_request'
+                else await self.show_silent_note(args["text"]) if name == "show_silently"
                 else await self.tool(name, args))
             if name == "get_observation" and result.get("analysis_status") in ("awaiting_confirmation", "capturing", "analyzing", "failed"):
                 status = result["analysis_status"]
@@ -2266,6 +2448,8 @@ class Session:
                         waiter.set_exception(ConnectionError("Realtime disconnected"))
                 self.rt = None
                 self.connected = False
+                if self.recorder:
+                    self.recorder.flush("realtime_disconnected", self.position)
                 self.user_speaking = self.awaiting_transcript = False
                 self.input_audio_turns.clear()
                 self.current_input_audio_turn = None
@@ -2353,9 +2537,18 @@ class Session:
         elif ty == "input_audio_buffer.speech_started":
             self.log("input_vad_start", item_id=event.get("item_id"))
             record = {"id": event.get("item_id"), "blocked": self.echo_blocked(),
-                      "at": time.monotonic(), "stopped": None}
+                      "at": time.monotonic(), "stopped": None, "enrollment": self.enrollment is not None}
+            if self.recorder:
+                record["recording_id"] = self.recorder.start(record["id"], self.position, record["at"],
+                    {"mode": "speaker" if self.speaker_mode else "earphones", "echo_guard": self.echo_guard})
+                if record["blocked"]:
+                    self.recorder.update(record["recording_id"], outcome="guarded_during_playback", reason="playback")
+                if record["enrollment"]:
+                    self.recorder.update(record["recording_id"], enrollment=True)
             self.input_audio_turns.append(record)
             self.prune_input_audio_turns()
+            if record["enrollment"]:
+                return  # Read-aloud capture is not a command or an interruption.
             if record["blocked"]:
                 self.log("input_audio_guarded", event_type=ty, item_id=record["id"], reason="playback")
                 return
@@ -2371,16 +2564,27 @@ class Session:
             record = self.match_input_audio_turn(event)
             if record is not None:
                 record["stopped"] = time.monotonic()
+                record["enrollment"] = record.get("enrollment", False) or self.enrollment is not None
+            if self.recorder:
+                recording_id = record.get("recording_id") if record else self.recorder.find(event.get("item_id"))
+                self.recorder.stop(recording_id, self.position, time.monotonic())
+                if self.enrollment or (record and record.get("enrollment")):
+                    self.recorder.update(recording_id, enrollment=True)
             if (record is not None and record["blocked"]) or self.echo_blocked():
                 return
             if record is self.current_input_audio_turn:
                 self.user_speaking = False
                 self.speech_stopped_at = time.monotonic()
         elif ty == "conversation.item.input_audio_transcription.completed":
-            if not await self.finish_input_audio(event):
+            record = self.match_input_audio_turn(event, final=True)
+            recording_id = record.get("recording_id") if record else (
+                self.recorder.find(event.get("item_id"), final=True) if self.recorder else None)
+            if not await self.finish_input_audio(event, record, recording_id):
                 return
             text = event.get("transcript", "")
             if self.transcript_is_echo(text):
+                if self.recorder:
+                    self.recorder.settle(recording_id, outcome="echo_dropped", reason="transcript_echo")
                 self.log("echo_dropped", text=text)
                 if event.get("item_id"):
                     await self.delete_items([event["item_id"]])
@@ -2388,6 +2592,8 @@ class Session:
                 return
             ignored = self.ignored_input_reason(text)
             if ignored:
+                if self.recorder:
+                    self.recorder.settle(recording_id, outcome="input_ignored", reason=ignored)
                 self.log("input_ignored", text=text, reason=ignored)
                 if event.get("item_id"):
                     await self.delete_items([event["item_id"]])
@@ -2401,19 +2607,36 @@ class Session:
             if text.strip():
                 self.input_revision += 1
                 if self.stop_request(text):
+                    if self.recorder:
+                        self.recorder.settle(recording_id, outcome="stop", reason=None)
                     self.auto_speech_paused = True
                     await self.flush_pending()
                     return  # Stay listening; a stop command needs no spoken reply.
                 self.auto_speech_paused = False
-                if await self.camera_confirmation(text):
+                audio_context = self.recording_audio_context.set((recording_id,) if recording_id else ())
+                try:
+                    camera_handled = await self.camera_confirmation(text)
+                finally:
+                    self.recording_audio_context.reset(audio_context)
+                if camera_handled:
+                    if self.recorder:
+                        self.recorder.settle(recording_id, outcome="camera_confirmation", reason=None)
                     await self.flush_pending()
                     return
                 self.pending.append(("text", TurnText(text, [event["item_id"]] if event.get("item_id") else [],
-                                                       context=self.input_context()), self.speech_stopped_at))
+                                                       context=self.input_context(),
+                                                       recording_ids=[recording_id] if recording_id else ()), self.speech_stopped_at))
+                if self.recorder:
+                    self.recorder.update(recording_id, reason="awaiting_route")
                 await self.flush_pending()
         elif ty == "conversation.item.input_audio_transcription.failed":
-            if not await self.finish_input_audio(event):
+            record = self.match_input_audio_turn(event, final=True)
+            recording_id = record.get("recording_id") if record else (
+                self.recorder.find(event.get("item_id"), final=True) if self.recorder else None)
+            if not await self.finish_input_audio(event, record, recording_id):
                 return
+            if self.recorder:
+                self.recorder.settle(recording_id, outcome="input_ignored", reason="transcription_failed")
             await self.error("Input transcription failed.")
             await self.flush_pending()
         elif ty == "response.created":
@@ -2436,6 +2659,10 @@ class Session:
             if rid in self.cancelled_ids or not self.audio_allowed:
                 return
             pcm = base64.b64decode(event["delta"])
+            if pcm and self.recorder:
+                # The independent Realtime reader has no worker ContextVar.
+                for turn_id in self.recording_turns:
+                    self.recorder.update(turn_id, assistant_audio=True)
             was_speaking = time.monotonic() < self.play_until
             # Close the gate BEFORE sending audio: mic ingestion runs concurrently.
             self.play_until = max(time.monotonic(), self.play_until) + len(pcm) / 48000
@@ -2825,6 +3052,8 @@ class Session:
             self.ring[:n - first] = frame[first:]
             self.echo_ring[:n - first] = contaminated
         self.position += n
+        if self.recorder:
+            self.recorder.poll_audio(self.recording_position)
         self.total_audio_in += len(raw)
         # Stateful 63-tap anti-alias filter, ~0.65 ms delay; phase survives odd-length packets.
         filtered, self.filter_state = lfilter(self.filter_taps, [1.0], frame, zi=self.filter_state)
@@ -2865,15 +3094,72 @@ class Session:
             finally:
                 self.audio_queue.task_done()
 
+    def prune_silent_notes(self):
+        now = time.monotonic()
+        self.silent_notes = {key: value for key, value in self.silent_notes.items() if value[1] > now}
+
+    async def show_silent_note(self, text):
+        self.prune_silent_notes()
+        while len(self.silent_notes) >= 20:
+            del self.silent_notes[next(iter(self.silent_notes))]
+        note_id = uuid.uuid4().hex
+        question = str(self.turn_question)
+        self.silent_notes[note_id] = (question, time.monotonic() + 30)
+        event = {"type": "silent_note", "id": note_id, "question": question, "note": text[:120]}
+        self.log("silent_note", id=note_id, question=question, note=event["note"])
+        await self.phone_json(event)
+        return {"ok": True, "suppress_answer": True}
+
     async def handle_phone(self, event, client=None):
         client = client or self.mic or next((c for c in self.clients if c.role == "mic"), None)
         ty = event.get("type")
+        if ty == 'recording':
+            if client is not self.mic or not isinstance(event.get('enabled'), bool):
+                raise ValueError('Only the current microphone controls recording')
+            await self.set_recording(event['enabled'])
+            return
+        if ty == 'addressing_mode':
+            if client is not self.mic or self.transport != 'livekit' or event.get('value') not in ('scout','ambient'):
+                raise ValueError('Only the current LiveKit microphone can change conversation mode')
+            self.input_revision += 1
+            self.addressing_mode = event['value']
+            self.pending = deque(row for row in self.pending if row[0] != 'text' or getattr(row[1], 'addressed', False))
+            for note_id in list(self.silent_notes):
+                await self.phone_json({'type':'silent_note_removed','id':note_id})
+            self.silent_notes.clear()
+            await self.cancel_speech()
+            self.log('addressing_mode', mode=self.addressing_mode)
+            await self.state()
+            return
         if ty == "diagnostics":
             if client is not self.mic or not isinstance(event.get("enabled"), bool):
                 raise ValueError("Only the current phone controls diagnostics")
             client.diagnostics = event["enabled"]
             self.log("diagnostics", enabled=client.diagnostics, transport=self.transport)
             return
+        if ty in ("enroll_start", "enroll_stop"):
+            if client is None or client is not self.mic:
+                raise ValueError("Only the current microphone can enroll a voice")
+            if ty == "enroll_start":
+                if not self.mic_on:
+                    raise ValueError("Resume the microphone before enrolling")
+                await self.start_enrollment(event.get("profile", "owner"))
+            else:
+                await self.stop_enrollment()
+            return
+        if ty == "answer_note":
+            if not isinstance(event.get("id"), str):
+                raise ValueError("answer_note requires a note id")
+            self.prune_silent_notes()
+            note = self.silent_notes.pop(event.get("id"), None)
+            if note is None:
+                return  # Expired, reset or already answered on another client.
+            self.tap_at = time.monotonic()  # Also enables this answer in Quiet mode.
+            await self.phone_json({"type": "silent_note_removed", "id": event["id"]})
+            self.log("answer_note", id=event["id"])
+            # Reuse the ordinary queued text-turn path; never trust client/model question text.
+            event = {"type": "text", "text": "[TAP] " + note[0], '_addressed':True}
+            ty = "text"
         if ty == "audio_mode" or (ty == "hello" and "earphones" in event):
             if not isinstance(event.get("earphones"), bool):
                 raise ValueError("earphones must be boolean")
@@ -2982,19 +3268,20 @@ class Session:
             if not isinstance(text, str) or not text.strip() or len(text) > 8000:
                 raise ValueError("text must contain 1–8000 characters")
             self.input_revision += 1
-            if self.stop_request(text):
+            if not event.get('_defer_interrupt') and self.stop_request(text):
                 self.auto_speech_paused = True
                 await self.cancel_speech()
                 await self.flush_pending()
                 return
             self.auto_speech_paused = False
-            if await self.camera_confirmation(text):
+            if not event.get('_defer_interrupt') and await self.camera_confirmation(text):
                 await self.flush_pending()
                 return
-            if self.assistant_audio_pending():
+            if self.assistant_audio_pending() and not event.get('_defer_interrupt'):
                 await self.cancel_speech()
             self.pending.append(("text", TurnText(text, context=self.input_context(),
-                addressed=bool(event.get('_addressed')), reply_to=event.get('_reply_to')), None))
+                recording_ids=event.get('_recording_ids',()), addressed=bool(event.get('_addressed',True)),
+                reply_to=event.get('_reply_to'), memory_recorded=bool(event.get('_memory_recorded'))), None))
             await self.flush_pending()
         elif ty == "look":
             self.input_revision += 1
@@ -3065,6 +3352,9 @@ class Session:
 
     async def reset(self):
         self.retry_offer = None
+        self.cancel_enrollment()
+        if self.recorder:
+            self.recorder.flush("reset", self.recording_position)
         self.epoch += 1
         if self.turn_task is not None:
             self.turn_task.cancel()
@@ -3088,7 +3378,7 @@ class Session:
         self.connected = False
         await self.clear_outing()
         for rows in (self.history, self.windows, self.seen, self.notified, self.pending,
-                     self.spoken, self.transcripts, self.conversation_ids):
+                     self.spoken, self.transcripts, self.conversation_ids, self.silent_notes):
             rows.clear()
         self.last_proactive = float("-inf")
         self.user_speaking = self.awaiting_transcript = self.active = False
@@ -3155,6 +3445,11 @@ class Session:
                       asyncio.create_task(self.suggestion_loop())]
 
     async def close(self):
+        self.cancel_enrollment()
+        if self.recorder:
+            self.recorder.flush("session_closed", self.recording_position)
+        while self.speaker_tasks:
+            await asyncio.gather(*list(self.speaker_tasks), return_exceptions=True)
         self.closed = True
         await self.investigations.close()
         tasks = self.tasks + list(self.diagnostic_tasks) + [t for t in (self.bird_task, self.playback_task) if t is not None]
@@ -3201,6 +3496,7 @@ class Client:
         s.clients.add(self)
         if self.role == "mic":
             old = s.mic
+            s.cancel_enrollment()
             await s.cancel_camera_request()
             s.mic = self
             if old is not None:
@@ -3249,6 +3545,7 @@ class Client:
         finally:
             s.clients.discard(self)
             if s.mic is self:
+                s.cancel_enrollment()
                 await s.cancel_camera_request()
                 s.mic = None
                 await s.mic_detached(self)
@@ -3480,7 +3777,14 @@ if __name__ == "__main__":
     parser.add_argument("--realtime-model", default=None, help="Override the OpenAI Realtime model")
     parser.add_argument("--enable-webrtc", action="store_true", help="Enable the opt-in OpenAI browser media experiment")
     parser.add_argument('--enable-livekit', action='store_true', help='Enable LiveKit-managed GPT voice (use .venv-livekit)')
+    parser.add_argument("--log-dir", type=Path, default=ROOT / "logs", help="Local daily session JSONL directory")
+    parser.add_argument("--no-log-file", action="store_true", help="Disable persistent event JSONL")
+    parser.add_argument("--record-dir", type=Path, help="Opt in to local per-turn mic WAVs and turns.jsonl")
+    parser.add_argument("--speaker-service", help="Local speaker HTTP URL; shadow scores only (off by default)")
     args = parser.parse_args()
+    SPEAKER_SERVICE = args.speaker_service
+    EVENT_LOG_DIR = None if args.no_log_file else args.log_dir.expanduser()
+    RECORD_DIR = args.record_dir
     if args.realtime_provider:
         os.environ["REALTIME_PROVIDER"] = args.realtime_provider
     if args.realtime_model:

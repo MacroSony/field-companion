@@ -52,6 +52,11 @@ From the repository root:
 
 Choose an unused port; do not use the live backend port. Static assets and `/ws` share the chosen port. The mock fetches six default taxon photos from iNaturalist at startup (bounded timeouts, source-icon fallback offline). It sends English example observations with coordinates, detections, captions, candidates, earcons, a 24 kHz tone, and a flush. The tone is not speech.
 
+The mock also emits a silent question card. Phone and display show it near captions
+without sound; **Answer** sends `answer_note` with its id. The live server re-routes
+its stored original question with `[TAP]`; the mock only echoes that addressed turn
+without changing the checklist. Dismiss is local; cards expire after about 30 s.
+
 Mock checklist state is shared per session, persists through reconnects, and clears on `reset` or when the mock process restarts. The mock accepts mic `location` updates and supports suggestion chips. Add `--offline` to skip remote photos for deterministic headless runs. Edit/delete/text changes fan out to all clients in that session. A new mic replaces the previous mic. Displays receive binary audio only with `audio=1`; sending microphone frames from a display is rejected. The mock simulates echo gating but has no BirdNET, speech recognition, identification, or persistent storage. Typed input always adds a mallard, regardless of wording.
 
 ## Implementation notes
@@ -91,6 +96,22 @@ Current screenshots: `screenshot.png` (390×844 phone, drawer closed) and `scree
 Screenshots: `screenshot.png` (phone) and `screenshot-display.png` (1280×720 projector).
 
 To rerun: start a **fresh** mock on 8877 and Chrome with `--headless=new --no-sandbox --use-fake-device-for-media-stream --use-fake-ui-for-media-stream --remote-debugging-port=9223`, then run `/data/build/birding-demo/.venv/bin/python web/self-test.py`. The test denies real downloads and examines CSV Blobs directly. Its sessions should be fresh for deterministic initial counts.
+Set `FIELD_WEB_TEST_OUT=/path/to/worktree/out/addressee-web` to keep results and
+screenshots in ignored output instead of replacing historical evidence. The CDP
+socket disables optional compression. One uncompressed run completed; several
+fresh-browser retries stalled at CDP `Page.navigate` (including uncompressed
+retries), so the navigation failure's cause remains unconfirmed.
+
+## V2 silent-card verification (2026-10-24)
+
+The extended `self-test.py` exercises phone and silent display cards: original
+question rendering (including literal HTML-like text), Answer id submission and
+mock `[TAP]` echo, dismissal, simulated 30-second expiry, and no new audio contexts
+or sources from a card. Build/cache identifiers are bumped for the new protocol.
+Evidence from the completed offline mock run on 8877 and isolated Chromium CDP
+on 9223 is in ignored `out/addressee-web/self-test-nocompress.log` and
+`self-test-results.json`. Later retries failed at initial navigation, not at the
+card assertions. Physical phone/field routing is not validated.
 
 ## Camera and observation follow-up
 

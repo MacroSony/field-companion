@@ -132,7 +132,8 @@ class LiveKitControllerTests(unittest.IsolatedAsyncioTestCase):
         self.session.handle_phone = AsyncMock()
         await self.session.voice_input('Scout, start.')
         self.session.handle_phone.assert_awaited_once_with(
-            {'type':'text','text':'start.', '_addressed':True, '_reply_to':None},self.client)
+            {'type':'text','text':'start.', '_addressed':True, '_reply_to':None,
+             '_voice_input':True,'_recording_ids':()},self.client)
 
     async def test_bystander_question_does_not_interrupt_or_enter_either_context(self):
         self.session.voice_speaking = True
