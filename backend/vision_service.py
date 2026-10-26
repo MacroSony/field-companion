@@ -12,6 +12,8 @@ from pathlib import Path
 import threading
 import time
 import warnings
+from typing import Literal
+from vision_policy import GROUPS, assess_visual, iconic_group
 
 # Keep downloaded models in the ignored workspace cache on every platform.
 # An explicitly configured Hugging Face cache still takes precedence.
@@ -32,6 +34,8 @@ class FrameRequest(BaseModel):
     jpeg_b64: str = Field(min_length=4, max_length=4 * ((MAX_JPEG + 2) // 3))
     crop: tuple[float, float, float, float] | None = None
     candidates: list[str] | None = Field(default=None, max_length=512)
+    target_group: Literal['Aves', 'Insecta', 'Plantae', 'Mammalia', 'Fungi', 'Reptilia',
+                          'Amphibia', 'Arachnida', 'Mollusca', 'Actinopterygii'] | None = None
     k: int = Field(default=5, ge=1, le=512)
 
     @field_validator("crop")
@@ -121,6 +125,9 @@ class VisionEngine:
         # pybioclip 2.1.6: txt_embeddings is [embedding_dim, taxa], NOT [taxa, dim].
         # txt_names[i] = [taxonomy, common_name]; taxonomy ends in genus, epithet.
         self.names = [" ".join(row[0][-2:]) for row in self.tree.txt_names]
+        self.groups = [iconic_group(row[0]) for row in self.tree.txt_names]
+        self.group_indices = {group: torch.tensor([i for i,g in enumerate(self.groups) if g == group],
+                              dtype=torch.long) for group in GROUPS}
         self.name_indices = {}
         for index, name in enumerate(self.names):
             self.name_indices.setdefault(name, []).append(index)
@@ -156,29 +163,57 @@ class VisionEngine:
         return [{"sci": names[i], "p": float(p)}
                 for i, p in zip(indices.tolist(), values.tolist())]
 
+    def evidence_top(self, probs, indices, k, denominator=1.0):
+        values, positions = probs.topk(min(k, len(probs)))
+        original_indices = indices[positions].tolist()
+        return [{'sci': self.names[i], 'p': float(p)/denominator, 'global_p': float(p),
+                 'group': self.groups[i]} for i,p in zip(original_indices, values.tolist())]
+
     def _classify(self, request):
         started = time.perf_counter()
         image, crop_used, sharpness = prepare_image(request)
         with self.torch.inference_mode():
             features = self.tree.create_image_features([image])
             open_probs = self.tree.create_probabilities(features, self.tree.txt_embeddings)[0]
-            open_top = self.top(open_probs, self.names, 3)
+            all_indices = self.torch.arange(len(self.names))
+            open_top = self.evidence_top(open_probs, all_indices, 3)
             missing = []
+            indices = self.group_indices[request.target_group] if request.target_group else all_indices
+            group_mass = float(open_probs[indices].sum())
             if not request.candidates:
-                predictions = self.top(open_probs, self.names, request.k)
+                scores = open_probs[indices]
+                candidate_mass = float(scores.sum())
+                predictions = (self.evidence_top(scores, indices, request.k,
+                    candidate_mass if request.target_group else 1.0) if candidate_mass > 0 else [])
             else:
-                names, missing, embeddings, owners = self.subset(tuple(request.candidates))
+                # Reuse the full image probabilities, preserving duplicate-label mass.
+                names, rows, owners = [], [], []
+                for name in request.candidates:
+                    matched = [i for i in self.name_indices.get(name, ())
+                               if not request.target_group or self.groups[i] == request.target_group]
+                    if not matched:
+                        missing.append(name)
+                        continue
+                    owners.extend([len(names)]*len(matched)); rows.extend(matched); names.append(name)
+                predictions = []
+                candidate_mass = 0.0
                 if names:
-                    row_probs = self.tree.create_probabilities(features, embeddings)[0]
-                    # Preserve all probability mass if a binomial has multiple rows.
-                    probs = self.torch.zeros(len(names), dtype=row_probs.dtype)
-                    probs.scatter_add_(0, owners, row_probs)
-                    predictions = self.top(probs, names, request.k)
-                else:
-                    predictions = []  # Never silently turn an all-missing list into open mode.
-        return {"candidates": predictions, "open_top": open_top, "missing": missing,
+                    probs = self.torch.zeros(len(names),dtype=open_probs.dtype)
+                    probs.scatter_add_(0,self.torch.tensor(owners,dtype=self.torch.long),open_probs[rows])
+                    candidate_mass = float(probs.sum())
+                    if candidate_mass > 0:
+                        for row in self.top(probs,names,request.k):
+                            raw = row['p']; row.update(p=raw/candidate_mass,global_p=raw,
+                                group=request.target_group or self.groups[self.name_indices[row['sci']][0]])
+                            predictions.append(row)
+        scope = {'target_group':request.target_group,'group_mass':group_mass,
+                 'candidate_mass':candidate_mass,'category_conflict':bool(request.target_group
+                     and open_top[0]['group'] in GROUPS and open_top[0]['group'] != request.target_group)}
+        result = {"candidates": predictions, "open_top": open_top, "missing": missing, 'scope':scope,
                 "sharpness": sharpness, "crop_used": crop_used,
                 "ms": round((time.perf_counter() - started) * 1000, 2)}
+        result['assessment'] = assess_visual(result,request.target_group)
+        return result
 
     def classify(self, request):
         started = time.perf_counter()
@@ -212,6 +247,7 @@ app = FastAPI(title="BioCLIP 2 vision", lifespan=lifespan)
 async def health():
     engine = getattr(app.state, "engine", None)
     return {"loaded": engine is not None, "model": "imageomics/bioclip-2",
+            'capabilities': ['target_group_scope', 'global_visual_scores'],
             "warm_ms": engine.warm_ms if engine else None,
             "load_ms": engine.load_ms if engine else None,
             "taxa": len(engine.names) if engine else 0}

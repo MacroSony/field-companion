@@ -162,6 +162,7 @@ notes describe their dated revisions, not necessarily today's behavior.
 - Optional GPT Realtime conversation experiment: [docs/GPT_REALTIME.md](docs/GPT_REALTIME.md).
 - Speaker echo diagnostics and optional WebRTC voice: [docs/AUDIO_LAB.md](docs/AUDIO_LAB.md).
 - LiveKit-managed GPT voice and interruption: [docs/LIVEKIT.md](docs/LIVEKIT.md).
+- Photo target categories, conflict clarification and image evaluation: [docs/VISUAL_TARGETS.md](docs/VISUAL_TARGETS.md).
 
 LiveKit settings retain **Scout** wake-name mode and add **Ambient** routing with
 silent question cards. Optional turn WAV recording is off by default; local

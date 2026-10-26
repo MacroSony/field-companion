@@ -204,7 +204,8 @@ window.FieldCamera = class FieldCamera {
     if (different || !message.focus || message.status !== 'open') this.cancelCapture();
     this.observation = message; this.focus = !!message.focus;
     if (different || message.status !== 'open') this.$('observation-count').value = String(message.count || 1);
-    if (this.focus && message.group) this.$('camera-group').value = message.group;
+    if (this.focus && message.group) this.$('camera-group').value =
+      'target_group' in message ? (message.target_group || 'Any') : message.group;
     const card = this.$('active-observation'); card.hidden = false;
     this.$('observation-status').textContent = message.status === 'open'
       ? (this.focus ? (message.analysis_status === 'analyzing' ? 'Analyzing photo'
@@ -213,6 +214,10 @@ window.FieldCamera = class FieldCamera {
       : message.status === 'confirmed' ? 'Added to checklist' : 'Closed';
     const hint = this.$('observation-hint');
     hint.textContent = message.hint || ''; hint.hidden = !message.hint;
+    const warning = this.$('observation-warning');
+    warning.hidden = !message.visual_assessment?.category_conflict;
+    warning.textContent = warning.hidden ? '' :
+      'The photo and your selected category disagree. Tap the subject in the preview, frame it more closely, then choose Look again.';
     const candidates = this.$('observation-candidates'); candidates.replaceChildren();
     for (const candidate of (message.fused || []).slice(0, 3)) {
       const item = document.createElement('li'), name = document.createElement('strong');

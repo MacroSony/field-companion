@@ -38,6 +38,7 @@ from realtime_provider import RealtimeConfig
 from session_data import TurnRecorder, append_jsonl, extract_turn_audio, redact, wall_time
 from speaker_client import speaker_request
 from speaker_service import profile_name
+from vision_policy import assess_visual, category_question
 
 MODEL = "higgs-realtime-1.5-preview"
 SR = 48000
@@ -112,6 +113,7 @@ class Detection:
     candidates: list = field(default_factory=list)
     thumb: str | None = None
     text: str | None = None
+    quality: dict | None = None
 
 
 @dataclass
@@ -128,6 +130,9 @@ class Observation:
     lat: float = 43.66
     lng: float = -79.39
     group: str = "Aves"
+    target_group: str | None = None  # Explicit user/UI intent; never a model guess.
+    identified_group: str | None = None
+    visual_assessment: dict = field(default_factory=dict)
     touched: float = field(default_factory=time.monotonic, repr=False)
     awaiting_answer: bool = field(default=False, repr=False)
     analysis_status: str = "idle"
@@ -178,7 +183,7 @@ def fuse(detections, allowed=None, priors=None):
         # Local abundance and renormalization may reorder ranks, but cannot turn
         # weak visual evidence into a confident identity. Frames are correlated.
         image = images[-1]
-        raw = {c["sci"]: float(c["p"]) for c in image.candidates}
+        raw = {c["sci"]: float(c.get("global_p", c["p"])) for c in image.candidates}
         winner = fused[0]["sci"]
         support = raw.get(winner, 0)
         alternative = max((p for sci, p in raw.items() if sci != winner), default=0)
@@ -186,16 +191,19 @@ def fuse(detections, allowed=None, priors=None):
     return fused, uncertain
 
 
-def classify_frame(jpeg, crop, candidates):
+def classify_frame(jpeg, crop, candidates, target_group=None):
     try:
         response = requests.post(VISION_URL + "/classify", json={
             "jpeg_b64": base64.b64encode(jpeg).decode(), "crop": crop,
-            "candidates": candidates or None, "k": 5}, timeout=30)
+            "candidates": candidates or None, "k": 5,
+            **({'target_group': target_group} if target_group else {})}, timeout=30)
         response.raise_for_status()
         result = response.json()
         for c in result["candidates"]:
             if not isinstance(c["sci"], str) or not math.isfinite(float(c["p"])) or not 0 <= float(c["p"]) <= 1:
                 raise ValueError("invalid candidate")
+            if 'global_p' in c and (not math.isfinite(float(c['global_p'])) or not 0 <= float(c['global_p']) <= 1):
+                raise ValueError('invalid original visual score')
         return result
     except (requests.RequestException, ValueError, KeyError, TypeError):
         raise HTTPException(503, "Vision service unavailable or invalid response (expected " + VISION_URL + "/classify)")
@@ -236,7 +244,7 @@ TOOLS = [
     tool_schema("look", "Prepare a photo: target=new identifies a new unknown organism with independent evidence; target=current takes another photo of the existing organism. Always wait for Start/Identify before capture. Use Any/omit when the category is unspecified; a narrower group requires a user-supplied category. To read an existing result use get_observation; to check progress use get_task_status.",
                 {"target": {"type": "string", "enum": ["current", "new"]},
                  "hint": NAME, "group": {"type": "string", "enum": PHOTO_GROUPS,
-                    "description": "Use Any or omit when the organism category is unspecified. Generic animal does not mean Mammalia. Use a narrower group only when the user identifies that category."}}, ("target",)),
+                    "description": "Use Any or omit when the organism category is unspecified. Generic animal does not mean Mammalia. Use a narrower group only when the user identifies that category. Never copy a model-inferred identified_group as user intent."}}, ("target",)),
     tool_schema("get_observation", "Read the existing focus evidence/identification without taking a new photo. For progress use get_task_status; for species facts or comparisons use ask_expert."),
     tool_schema("get_task_status", "Read actual photo identification or expert investigation progress without restarting work or explaining results. Use for identification process, status, progress, is it done; select a task when ambiguous.",
                 {**TASK_SELECTOR, "scope": {"type": "string", "enum": ["auto", "camera", "investigations", "all"]}}),
@@ -775,6 +783,8 @@ class Session:
                     obs.analysis_status, obs.analysis_status)
             status = {"awaiting_confirmation": "waiting", "capturing": "running",
                       "analyzing": "running", "ready": "completed"}.get(obs.analysis_status, obs.analysis_status)
+            if obs.analysis_status == 'ready' and obs.visual_assessment.get('category_conflict'):
+                stage = 'needs_target_confirmation'
             linked = [j for j in self.investigations.jobs.values() if j.origin == "vision"
                       and j.observation["id"] == obs.id
                       and j.observation.get("image_revision") == obs.image_revision
@@ -831,6 +841,8 @@ class Session:
             "fusing": ("正在综合图片、地点和声音证据。", "I'm combining the image results with local and sound evidence."),
             "awaiting_expert": ("图片识别已完成，专家分析正在等待启动。", "Image recognition is complete; expert analysis is waiting to start."),
             "ready": ("照片识别已完成，结果已就绪。", "Photo identification is complete; the result is ready."),
+            'needs_target_confirmation': ('照片已分析，但主体类别存在冲突，需要你确认主体或拍近一点。',
+                'The photo has been analyzed, but the subject category conflicts. Please clarify the subject or take a closer photo.'),
             "failed": ("照片识别未能完成，可以说重试，重新准备拍照。", "Photo identification could not finish; say Retry to prepare another photo."),
             "cancelled": ("照片识别已取消。", "Photo identification was cancelled.")}
         return words.get(stage, ("照片任务正在处理。", "The photo task is being processed."))[0 if zh else 1]
@@ -922,7 +934,7 @@ class Session:
         if (self.focus, obs.analysis_request_id, self.input_revision) != expected:
             return {'ok': False, 'suppress_answer': True, 'guard': 'stale_camera_context'}
         self.retry_offer = None
-        result = await self.request_look(obs.hint, obs.group)
+        result = await self.request_look(obs.hint, obs.target_group)
         return {**result, 'suppress_answer': True, 'retried_task_id': row['id']}
 
     def remember_retry_offer(self, result):
@@ -972,7 +984,8 @@ class Session:
                                  or expected["request_id"] != obs.analysis_request_id))):
             self.log("stale_vision_answer_skipped", observation_id=obs.id)
             return
-        if obs.uncertain and self.expert.available:
+        category_conflict = obs.visual_assessment.get('category_conflict', False)
+        if obs.uncertain and self.expert.available and not category_conflict:
             question = "根据现有证据，这是什么？不确定时告诉我还需要拍什么。" if self.lang.startswith("zh") else (
                 "What is this organism, based on the evidence? If uncertain, what should I capture next?")
             try:
@@ -1002,7 +1015,9 @@ class Session:
             # to classify. Its readout is grounded before it reaches speech.
             zh = self.lang.startswith('zh')
             names = [row.get('en') or row['sci'] for row in obs.fused[:2]]
-            if not names:
+            if category_conflict:
+                answer = category_question(obs.target_group, zh)
+            elif not names:
                 answer = '暂时无法识别，请拍近一点的照片。' if zh else 'I could not identify it yet; please take a closer photo.'
             elif obs.uncertain:
                 choices = '或'.join(names) if zh else ' or '.join(names)
@@ -1052,14 +1067,15 @@ class Session:
             await asyncio.sleep(1)
             await self.expire_focus()
 
-    async def new_focus(self, group="Aves"):
+    async def new_focus(self, group="Aves", *, target_group=None):
         await self.cancel_camera_request()
         self.last_assistant_text = ""
         old = self.observations.get(self.focus)
         if old and old.status == "open":
             old.status = "discarded"
             old.awaiting_answer = False
-        obs = Observation("ob" + uuid.uuid4().hex[:10], lat=self.lat, lng=self.lng, group=group)
+        obs = Observation("ob" + uuid.uuid4().hex[:10], lat=self.lat, lng=self.lng, group=group,
+                          target_group=target_group)
         self.observations[obs.id] = obs
         self.focus = obs.id
         if old:
@@ -1073,7 +1089,8 @@ class Session:
         if create and (not obs or obs.status != "open"):
             # A confirmed entry stays immutable; another photo opens a record
             # in the same category instead of silently defaulting back to birds.
-            obs = await self.new_focus(obs.group if obs else "Aves")
+            obs = await self.new_focus(obs.group if obs else "Aves",
+                                       target_group=obs.target_group if obs else None)
         if obs:
             obs.touched = time.monotonic()
         return obs
@@ -1088,6 +1105,11 @@ class Session:
             return  # reset/remove-all while the range lookup was in flight
         priors = getattr(self, "_prior_counts", {})
         obs.fused, obs.uncertain = fuse(obs.detections, allowed, priors)
+        images = [d for d in obs.detections if d.kind == 'image']
+        if images and images[-1].quality:
+            obs.visual_assessment = dict(images[-1].quality)
+            obs.uncertain |= (obs.visual_assessment.get('category_conflict', False)
+                              or obs.visual_assessment.get('weak_visual_evidence', False))
         if touch:
             obs.touched = time.monotonic()
         await self.broadcast_observation(obs)
@@ -1122,6 +1144,8 @@ class Session:
         obs = await self.current_focus(create=True)
         if group is not None:
             obs.group = group
+            obs.target_group = group if group in GROUPS else None
+        obs.visual_assessment = {}
         obs.hint = str(hint or obs.hint)[:500]
         obs.awaiting_answer = False
         obs.analysis_status = "awaiting_confirmation"
@@ -1793,6 +1817,8 @@ class Session:
         focus = self.observations.get(self.focus)
         focus_context = ({"id": focus.id, "status": focus.status, "top3": focus.fused[:3],
                           "group": focus.group,
+                          'target_group': focus.target_group, 'identified_group': focus.identified_group,
+                          'visual_assessment': focus.visual_assessment,
                           "analysis_status": focus.analysis_status,
                           "uncertain": focus.uncertain,
                           "image_detections": sum(d.kind == "image" for d in focus.detections)}
@@ -1836,7 +1862,10 @@ class Session:
                 "pending": [r["en"] for r in self.suggestions.values()],
                 "last_heard": list(dict.fromkeys(d["en"] for _, d in reversed(self.history)))[:3],
                 "focus": ({"id": obs.id, "top3": obs.fused[:3], "uncertain": obs.uncertain,
-                           "hint": obs.hint} if (obs := self.observations.get(self.focus)) else None)}
+                           "hint": obs.hint, 'target_group':obs.target_group,
+                           'identified_group':obs.identified_group,
+                           'visual_assessment':obs.visual_assessment}
+                          if (obs := self.observations.get(self.focus)) else None)}
 
     async def prune_history(self):
         async with self.history_lock:
@@ -2371,9 +2400,17 @@ class Session:
                 response = await self.speak_expert(result['answer'], guard=lambda: self.input_revision == revision)
                 if self.input_revision == revision and response and response.get('status') == 'completed':
                     self.remember_retry_offer(result)
-            elif name in ("ask_expert", "get_investigations", "manage_investigation", "clarify_request") and result.get("answer"):
+            elif name in ("ask_expert", "get_investigations", "manage_investigation", "clarify_request", "get_observation") and result.get("answer"):
                 revision = self.input_revision
-                response = await self.speak_expert(result["answer"])
+                read_identity = (result.get('observation',{}).get('id'),result.get('observation',{}).get('image_revision'))
+                def current_readout():
+                    current_obs = self.observations.get(self.focus)
+                    return (self.input_revision == revision and current_obs is not None
+                            and (current_obs.id,current_obs.image_revision) == read_identity)
+                response = (await self.speak_expert(result['answer'],guard=current_readout)
+                            if name == 'get_observation' else await self.speak_expert(result['answer']))
+                if name == 'get_observation' and response and response.get('status') == 'completed' and current_readout():
+                    self.vision_answered.add(read_identity)
                 if self.input_revision == revision and response and response.get('status') == 'completed':
                     self.remember_retry_offer(result)
             else:
@@ -2765,21 +2802,24 @@ class Session:
                 group = args.get("group", "Any")
                 if group not in PHOTO_GROUPS:
                     raise ValueError("invalid iconic group")
-                await self.new_focus(group)
+                await self.new_focus(group, target_group=group if group in GROUPS else None)
                 return await self.request_look(args.get("hint", ""))
             return await self.request_look(args.get("hint", ""), args.get("group"))
         if name == "new_observation":
             group = args.get("group", "Any")
             if group not in PHOTO_GROUPS:
                 raise ValueError("invalid iconic group")
-            await self.new_focus(group)
+            await self.new_focus(group, target_group=group if group in GROUPS else None)
             return await self.request_look()
         if name in ("get_observation", "confirm_observation", "discard_observation", "ask_expert", "describe"):
             obs = await self.current_focus(create=name == "describe")
             if not obs:
                 return {"ok": False, "error": "No focus observation; look first"}
             if name == "get_observation":
-                return {"observation": obs.payload(), "analysis_status": obs.analysis_status}
+                result = {"observation": obs.payload(), "analysis_status": obs.analysis_status}
+                if obs.analysis_status == 'ready' and obs.visual_assessment.get('category_conflict'):
+                    result['answer'] = category_question(obs.target_group,self.lang.startswith('zh'))
+                return result
             if name == "ask_expert":
                 # The router can paraphrase Chinese into English or add claims.
                 # Use this turn's actual text/STT transcript when available.
@@ -3684,16 +3724,21 @@ async def post_frame(request: Request, session: str, obs: str, x: float | None =
     await s.flush_pending()
     s.log("camera_photo_received", request_id=camera["id"])
     try:
-        allowed = await asyncio.get_running_loop().run_in_executor(s.executor, s.allowed_species) if observation.group == "Aves" else None
+        allowed = await asyncio.get_running_loop().run_in_executor(s.executor, s.allowed_species) if observation.target_group == "Aves" else None
         if not await s.photo_stage(observation, camera, "recognizing"):
             raise HTTPException(409, "Capture cancelled before image recognition")
-        result = await asyncio.to_thread(classify_frame, jpeg, crop, sorted(allowed) if allowed else None)
+        if observation.target_group:
+            result = await asyncio.to_thread(classify_frame, jpeg, crop,
+                sorted(allowed) if allowed else None, observation.target_group)
+        else:
+            result = await asyncio.to_thread(classify_frame, jpeg, crop, sorted(allowed) if allowed else None)
     except Exception:
         await s.photo_failed(observation, camera)
         raise
     if not await s.photo_stage(observation, camera, "resolving_species"):
         raise HTTPException(409, "Capture cancelled before species lookup")
     candidates = []
+    assessment = assess_visual(result,observation.target_group)
     for candidate in result["candidates"]:
         sci = candidate["sci"]
         taxon = s.names.get(sci)
@@ -3709,16 +3754,28 @@ async def post_frame(request: Request, session: str, obs: str, x: float | None =
                 taxon = None
             if taxon:
                 s.names[sci] = taxon
-        candidates.append({**(taxon or {"sci": sci, "en": sci}), "sci": sci, "p": float(candidate["p"])})
+        identified_group = candidate.get('group') or (taxon or {}).get('group')
+        if observation.target_group and identified_group != observation.target_group:
+            # Enforce intent even if an older/misconfigured service ignores its scope.
+            assessment.update(status='needs_target_confirmation',category_conflict=True)
+            continue
+        candidates.append({**(taxon or {"sci": sci, "en": sci}), "sci": sci,
+            "p": float(candidate["p"]),
+            **({'global_p':float(candidate['global_p'])} if 'global_p' in candidate else {}),
+            **({'group':identified_group} if identified_group else {})})
     # Vision is slow: discard late frames if focus changed while inference ran.
     await s.expire_focus()
     if observation.status != "open" or s.focus != obs or s.camera_request is not camera:
         raise HTTPException(409, "Observation closed or focus changed during classification")
-    if candidates and candidates[0].get('group') in GROUPS and candidates[0]['group'] != observation.group:
-        s.log('photo_group_resolved', requested_group=observation.group, group=candidates[0]['group'])
-        observation.group = candidates[0]['group']
+    if candidates and candidates[0].get('group') in GROUPS:
+        observation.identified_group = candidates[0]['group']
+        if not observation.target_group and observation.identified_group != observation.group:
+            s.log('photo_group_resolved', requested_group=observation.group, group=observation.identified_group)
+            observation.group = observation.identified_group
+    observation.visual_assessment = assessment
     detection_id = "d" + uuid.uuid4().hex[:12]
-    detection = Detection(detection_id, "image", now_iso(), candidates, thumb="/api/frame/" + detection_id + ".jpg")
+    detection = Detection(detection_id, "image", now_iso(), candidates,
+                          thumb="/api/frame/" + detection_id + ".jpg", quality=assessment)
     s.frames[detection_id] = thumb.getvalue()
     observation.detections.append(detection)
     observation.image_revision += 1

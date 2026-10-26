@@ -1,13 +1,16 @@
 """Camera browser integration with fake media and real Observation/frame routes.
 
-Start --serve on 8878, an isolated Chromium CDP on 9224 with fake media, then
+Start --serve on 8878, an isolated Chromium CDP on 9224 with fake media and
+--mute-audio (test acknowledgements must not reach real speakers), then
 run without --serve. No model/API requests; JSON/screenshots go to ignored out/.
 """
 import argparse
 import asyncio
 import base64
+from contextvars import ContextVar
 import io
 import json
+import os
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -17,7 +20,7 @@ from urllib.request import urlopen
 from websockets.asyncio.client import connect
 
 ROOT = Path(__file__).resolve().parents[1]
-OUT = ROOT / "out" / "camera-checks"
+OUT = Path(os.environ.get('FIELD_CAMERA_TEST_OUT',str(ROOT / "out" / "camera-checks")))
 
 
 def serve(port):
@@ -29,6 +32,15 @@ def serve(port):
     import threading
     classification_release = threading.Event()
     classification_release.set()
+    classification_session = ContextVar('fixture_classification_session',default=None)
+
+    @backend.app.middleware('http')
+    async def bind_fixture_session(request, call_next):
+        token=classification_session.set(backend.SESSIONS.get(request.query_params.get('session')))
+        try:
+            return await call_next(request)
+        finally:
+            classification_session.reset(token)
 
     class FixtureSession(backend.Session):
         def __init__(self, session_id):
@@ -156,14 +168,15 @@ def serve(port):
                 return
             return await super().handle_phone(event, client)
 
-    def classify(jpeg, crop, allowed):
+    def classify(jpeg, crop, allowed, target_group=None):
+        sci = getattr(classification_session.get(),'fixture_species',None) or 'Turdus migratorius'
         if not classification_release.wait(20):
             raise RuntimeError("Fixture classification not released")
         image = Image.open(io.BytesIO(jpeg))
         if image.format != "JPEG" or max(image.size) > 1920:
             raise ValueError("Invalid camera JPEG")
-        sci = "Haliaeetus leucocephalus" if allowed and "Haliaeetus leucocephalus" in allowed else "Turdus migratorius"
-        return {"candidates": [{"sci": sci, "p": .91}], "sharpness": 50}
+        candidate={'sci':sci,'p':.91,'global_p':.91,'group':'Aves'}
+        return {"candidates": [candidate], 'open_top':[candidate], "sharpness": 50}
 
     backend.Session = FixtureSession
     backend.classify_frame = classify
@@ -240,6 +253,8 @@ async def test(port, cdp):
         await call("Emulation.setDeviceMetricsOverride", width=390, height=844, deviceScaleFactor=1, mobile=True)
         await call("Browser.grantPermissions", permissions=["audioCapture", "videoCapture", "geolocation"], origin=origin)
         await call("Page.addScriptToEvaluateOnNewDocument", source="""
+          // This is an isolated test profile: start each page with deterministic audio settings.
+          try { localStorage.removeItem('field-earphones'); localStorage.removeItem('field-microphone'); } catch (_) {}
           window.__streams = []; window.__uploads = []; window.__requests = []; window.__sockets = []; window.__messages = [];
           window.__encodes = [];
           const encode = HTMLCanvasElement.prototype.toBlob;
@@ -359,12 +374,13 @@ async def test(port, cdp):
         await voice_input("fixture:status")
         await js("window.__sockets[0].send(JSON.stringify({type:'text',text:'fixture:release-worker'}))")
         await until("window.__messages.slice(" + str(ready_marker) + ").some(e=>e.text==='Photo identification is complete; the result is ready.')")
-        await until("window.__messages.slice(" + str(ready_marker) + ").some(e=>e.type==='fixture_visual_answer')")
+        await until("window.__messages.slice(" + str(ready_marker) + ").some(e=>e.type==='transcript' && e.role==='assistant' && e.text.includes('American Robin'))")
         ready_messages = await js("window.__messages.slice(" + str(ready_marker) + ")")
         status_done = next(i for i, e in enumerate(ready_messages)
                            if e.get("text") == "Photo identification is complete; the result is ready.")
         assert any(e.get("type") == "fixture_status_routed" for e in ready_messages)
-        auto_answer = next(i for i, e in enumerate(ready_messages) if e.get("type") == "fixture_visual_answer")
+        auto_answer = next(i for i, e in enumerate(ready_messages) if e.get('type') == 'transcript'
+                           and e.get('role') == 'assistant' and 'American Robin' in e.get('text',''))
         assert status_done < auto_answer
         assert not any(e.get("type") in ("camera_prepare", "capture")
                        or e.get("text") == "Camera ready. Say start to take a photo." for e in ready_messages)
@@ -647,6 +663,21 @@ async def test(port, cdp):
         errors = [e for e in events if e.get("method") == "Runtime.exceptionThrown"]
         assert not errors, errors
         results["runtimeErrors"] = 0
+        results['visualTargetUI'] = await js("""(() => {
+          const view = {$: id => document.getElementById(id), cancelCapture(){}, updateConnection(){}};
+          const base = {id:'target-ui-test',status:'open',focus:true,group:'Aves',
+            target_group:null,identified_group:'Aves',fused:[],detections:[]};
+          window.FieldCamera.prototype.observe.call(view,base);
+          const inferredStaysAny = document.getElementById('camera-group').value === 'Any';
+          window.FieldCamera.prototype.observe.call(view,{...base,group:'Plantae',target_group:'Plantae',
+            identified_group:'Plantae',visual_assessment:{category_conflict:true}});
+          const result = {inferredStaysAny,explicitTargetPreserved:document.getElementById('camera-group').value === 'Plantae',
+            conflictVisible:!document.getElementById('observation-warning').hidden};
+          window.FieldCamera.prototype.observe.call(view,{...base,visual_assessment:{category_conflict:false}});
+          result.warningClears = document.getElementById('observation-warning').hidden;
+          return result;
+        })()""")
+        assert all(results['visualTargetUI'].values()), results['visualTargetUI']
         (OUT / "results.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
         print(json.dumps(results, indent=2), flush=True)
         reading.cancel()

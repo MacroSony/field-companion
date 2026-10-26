@@ -1,0 +1,289 @@
+{
+  "regression": {
+    "all": {
+      "n": 96,
+      "open": {
+        "top1_correct": 79,
+        "top1_percent": 82.3,
+        "top3_correct": 84,
+        "accepted": 73,
+        "wrong_accepted": 3,
+        "accepted_accuracy_percent": 95.9
+      },
+      "scoped": {
+        "top1_correct": 81,
+        "top1_percent": 84.4,
+        "top3_correct": 86,
+        "accepted": 70,
+        "wrong_accepted": 0,
+        "accepted_accuracy_percent": 100.0
+      },
+      "category_conflicts": 7
+    },
+    "by_group": {
+      "Insecta": {
+        "n": 24,
+        "open": {
+          "top1_correct": 20,
+          "top1_percent": 83.3,
+          "top3_correct": 22,
+          "accepted": 20,
+          "wrong_accepted": 2,
+          "accepted_accuracy_percent": 90.0
+        },
+        "scoped": {
+          "top1_correct": 21,
+          "top1_percent": 87.5,
+          "top3_correct": 23,
+          "accepted": 18,
+          "wrong_accepted": 0,
+          "accepted_accuracy_percent": 100.0
+        },
+        "category_conflicts": 2
+      },
+      "Plantae": {
+        "n": 24,
+        "open": {
+          "top1_correct": 19,
+          "top1_percent": 79.2,
+          "top3_correct": 20,
+          "accepted": 15,
+          "wrong_accepted": 1,
+          "accepted_accuracy_percent": 93.3
+        },
+        "scoped": {
+          "top1_correct": 20,
+          "top1_percent": 83.3,
+          "top3_correct": 21,
+          "accepted": 14,
+          "wrong_accepted": 0,
+          "accepted_accuracy_percent": 100.0
+        },
+        "category_conflicts": 4
+      },
+      "Aves": {
+        "n": 24,
+        "open": {
+          "top1_correct": 22,
+          "top1_percent": 91.7,
+          "top3_correct": 23,
+          "accepted": 21,
+          "wrong_accepted": 0,
+          "accepted_accuracy_percent": 100.0
+        },
+        "scoped": {
+          "top1_correct": 22,
+          "top1_percent": 91.7,
+          "top3_correct": 23,
+          "accepted": 21,
+          "wrong_accepted": 0,
+          "accepted_accuracy_percent": 100.0
+        },
+        "category_conflicts": 0
+      },
+      "Mammalia": {
+        "n": 24,
+        "open": {
+          "top1_correct": 18,
+          "top1_percent": 75.0,
+          "top3_correct": 19,
+          "accepted": 17,
+          "wrong_accepted": 0,
+          "accepted_accuracy_percent": 100.0
+        },
+        "scoped": {
+          "top1_correct": 18,
+          "top1_percent": 75.0,
+          "top3_correct": 19,
+          "accepted": 17,
+          "wrong_accepted": 0,
+          "accepted_accuracy_percent": 100.0
+        },
+        "category_conflicts": 1
+      }
+    }
+  },
+  "holdout": {
+    "all": {
+      "n": 48,
+      "open": {
+        "top1_correct": 40,
+        "top1_percent": 83.3,
+        "top3_correct": 47,
+        "accepted": 37,
+        "wrong_accepted": 2,
+        "accepted_accuracy_percent": 94.6
+      },
+      "scoped": {
+        "top1_correct": 42,
+        "top1_percent": 87.5,
+        "top3_correct": 47,
+        "accepted": 36,
+        "wrong_accepted": 1,
+        "accepted_accuracy_percent": 97.2
+      },
+      "category_conflicts": 2
+    },
+    "by_group": {
+      "Insecta": {
+        "n": 12,
+        "open": {
+          "top1_correct": 11,
+          "top1_percent": 91.7,
+          "top3_correct": 11,
+          "accepted": 9,
+          "wrong_accepted": 0,
+          "accepted_accuracy_percent": 100.0
+        },
+        "scoped": {
+          "top1_correct": 11,
+          "top1_percent": 91.7,
+          "top3_correct": 11,
+          "accepted": 9,
+          "wrong_accepted": 0,
+          "accepted_accuracy_percent": 100.0
+        },
+        "category_conflicts": 0
+      },
+      "Plantae": {
+        "n": 12,
+        "open": {
+          "top1_correct": 8,
+          "top1_percent": 66.7,
+          "top3_correct": 12,
+          "accepted": 8,
+          "wrong_accepted": 1,
+          "accepted_accuracy_percent": 87.5
+        },
+        "scoped": {
+          "top1_correct": 10,
+          "top1_percent": 83.3,
+          "top3_correct": 12,
+          "accepted": 7,
+          "wrong_accepted": 0,
+          "accepted_accuracy_percent": 100.0
+        },
+        "category_conflicts": 2
+      },
+      "Aves": {
+        "n": 12,
+        "open": {
+          "top1_correct": 10,
+          "top1_percent": 83.3,
+          "top3_correct": 12,
+          "accepted": 8,
+          "wrong_accepted": 0,
+          "accepted_accuracy_percent": 100.0
+        },
+        "scoped": {
+          "top1_correct": 10,
+          "top1_percent": 83.3,
+          "top3_correct": 12,
+          "accepted": 8,
+          "wrong_accepted": 0,
+          "accepted_accuracy_percent": 100.0
+        },
+        "category_conflicts": 0
+      },
+      "Mammalia": {
+        "n": 12,
+        "open": {
+          "top1_correct": 11,
+          "top1_percent": 91.7,
+          "top3_correct": 12,
+          "accepted": 12,
+          "wrong_accepted": 1,
+          "accepted_accuracy_percent": 91.7
+        },
+        "scoped": {
+          "top1_correct": 11,
+          "top1_percent": 91.7,
+          "top3_correct": 12,
+          "accepted": 12,
+          "wrong_accepted": 1,
+          "accepted_accuracy_percent": 91.7
+        },
+        "category_conflicts": 0
+      }
+    }
+  },
+  "wrong_target_controls": {
+    "n": 8,
+    "clarified_or_uncertain": 8,
+    "wrongly_accepted": 0
+  },
+  "unknown_target_controls": {
+    "n": 8,
+    "unrestricted_rankings_preserved": true
+  },
+  "assumptions": [
+    "Category-assisted accuracy assumes the user supplied the correct broad category.",
+    "Unspecified targets remain unrestricted; this change does not establish reliable automatic subject detection.",
+    "Holdout species and observations are disjoint from the original 96-photo convenience sample.",
+    "No confidence thresholds were tuned on either dataset; existing .5/.2 visual thresholds are retained."
+  ],
+  "verification": {
+    "original_unrestricted_rankings_and_scores_preserved": true,
+    "datasets_photo_id_and_sha256_disjoint": true,
+    "all_160_assessments_match_final_policy": true,
+    "policy_sha256": "0342a5f08123b219493bd48f14a5e7f6d217fac9633175aa3d3855e0384ea59b",
+    "source_sha256": {
+      "server.py": "3117349c5b1fa80935c43fc6feaa713b32e14be495c1f3decbe4461d762d0aa7",
+      "vision_service.py": "b1a3f637e2b7f8f13f028bf15f66ce9028d376267e0748669f8ea120199524e8",
+      "vision_policy.py": "0342a5f08123b219493bd48f14a5e7f6d217fac9633175aa3d3855e0384ea59b",
+      "expert.py": "fa93f295fabbc0c2928522678db0b8085032a8a825289bb984c0955dc5c96888"
+    }
+  },
+  "real_cloud_workflow": {
+    "passed": true,
+    "physical_phone": false,
+    "acoustic_echo_test": false,
+    "checks": [
+      {
+        "case": "Application signaling and both participants connect through LiveKit Cloud",
+        "passed": true
+      },
+      {
+        "case": "Spoken explicit plant intent becomes a persistent plant target without automatic capture",
+        "passed": true
+      },
+      {
+        "case": "Real conflicting pine photo keeps plant target and stays uncertain with only plant candidates",
+        "passed": true
+      },
+      {
+        "case": "Conflict prompts for subject framing over real speech without silently starting expert research",
+        "received_audio_frames": 633,
+        "passed": true
+      },
+      {
+        "case": "Spoken progress query reports the category conflict without taking another photo",
+        "passed": true
+      },
+      {
+        "case": "Spoken result query preserves the clarification instead of presenting a guessed species as certain",
+        "received_audio_frames": 604,
+        "passed": true
+      }
+    ]
+  },
+  "offline_tests": {
+    "backend_discovered": 451,
+    "backend_passed": 448,
+    "optional_torch_skipped_in_voice_venv": 3,
+    "torch_numerical_tests_passed_in_vision_venv": 3,
+    "final_target_policy_tests_passed": 9
+  },
+  "browser_regression": {
+    "passed": true,
+    "runtime_errors": 0,
+    "visual_target_ui": {
+      "inferredStaysAny": true,
+      "explicitTargetPreserved": true,
+      "conflictVisible": true,
+      "warningClears": true
+    },
+    "headless_browser_muted": true,
+    "full_camera_workflow_checks": 32
+  }
+}

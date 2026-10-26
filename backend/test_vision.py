@@ -204,7 +204,9 @@ def integration(args):
         missing_request = dict(good, candidates=[names[0], "Notagenus notaspecies", names[0]])
         missing, _ = http(base, "/classify", missing_request)
         assert missing["missing"] == ["Notagenus notaspecies"]
-        assert missing["candidates"] == [{"sci": names[0], "p": 1.0}]
+        assert len(missing['candidates']) == 1
+        assert missing['candidates'][0]['sci'] == names[0] and missing['candidates'][0]['p'] == 1.0
+        assert 0 <= missing['candidates'][0]['global_p'] <= 1
         all_missing, _ = http(base, "/classify", dict(good, candidates=["Notagenus notaspecies"]))
         assert not all_missing["candidates"] and all_missing["open_top"]
         for invalid in (dict(good, crop=[0, 0, 2, 1]), dict(good, jpeg_b64="!!!!"),

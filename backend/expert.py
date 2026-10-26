@@ -148,12 +148,16 @@ def compact_observation(observation):
     """Bound model input, omitting local URLs and unrelated application state."""
     def candidates(rows):
         return [{"sci": str(c.get("sci", ""))[:100],
-                 "en": str(c.get("en", ""))[:100], "score": c.get("p")}
+                 "en": str(c.get("en", ""))[:100], "score": c.get("p"),
+                 **({'visual_score':c['global_p']} if 'global_p' in c else {}),
+                 **({'group':c['group']} if c.get('group') else {})}
                 for c in rows[:5]]
     return {"id": observation["id"], "status": observation.get("status", "open"),
             "time": observation.get("t_start"), "group": observation.get("group"),
             "location": {"lat": observation.get("lat"), "lng": observation.get("lng")},
             "uncertain": observation.get("uncertain", True),
+            **({'target_group':observation['target_group']} if observation.get('target_group') else {}),
+            **({'visual_assessment':observation['visual_assessment']} if observation.get('visual_assessment') else {}),
             "fused": candidates(observation.get("fused", [])),
             "detections": [{"id": d["id"], "kind": d.get("kind"), "time": d.get("t"),
                             "text": str(d.get("text") or "")[:600],

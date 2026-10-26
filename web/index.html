@@ -14,12 +14,12 @@
   <link rel="stylesheet" href="vendor/leaflet/leaflet.css">
   <link rel="stylesheet" href="style.css">
   <script src="vendor/leaflet/leaflet.js" defer></script>
-  <script src="camera.js" defer></script>
+  <script src="camera.js?v=20261025-visual-targets" defer></script>
   <script src="audio-diagnostics.js" defer></script>
   <script src="webrtc-audio.js" defer></script>
   <script src="vendor/livekit/livekit-client.umd.js" defer></script>
   <script src="livekit-audio.js" defer></script>
-  <script src="app.js?v=20261025-voice-modes-1" defer></script>
+  <script src="app.js?v=20261025-visual-targets" defer></script>
 </head>
 <body>
   <div class="app-shell">
@@ -64,6 +64,7 @@
       <section id="active-observation" class="active-observation" aria-labelledby="observation-heading" hidden>
         <div class="section-label"><h2 id="observation-heading">Current observation</h2><span id="observation-status" class="observation-status"></span></div>
         <p id="observation-hint" class="observation-hint" hidden></p>
+        <p id="observation-warning" class="observation-hint" role="status" hidden></p>
         <ol id="observation-candidates" class="observation-candidates" aria-label="Candidate species"></ol>
         <p id="observation-empty" class="camera-note">Waiting for an image or description.</p>
         <div id="observation-evidence" class="observation-evidence" aria-label="Observation evidence"></div>
