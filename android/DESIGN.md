@@ -65,7 +65,7 @@ Add an `?shell=android` mode: role=display, but with full controls and Look/came
 ## Milestones
 
 - **M0**: Field Probe on the real phone (README test plan). Go/no-go for this design.
-- **M1**: Native mic client and WebView shell running on the emulator against a local server, with a WAV-file "fake mic" so tests are repeatable.
+- **M1**: Native mic client and WebView shell running on the emulator against a local server, with a WAV-file "fake mic" so tests are repeatable. *Status 2026-10-26: the native mic client, the fake mic and the WebView display client pass end-to-end against `web/mock-server.py` (tools/emulator-link-test.sh). Still to do: `?shell=android` phone layout in web/app.js, the JS bridge for mute/quiet/mic, and a run against the real backend.*
 - **M2**: Real phone with DJI Mic Mini 2 + Enco: talk, log a bird, interrupt, screen off.
 - **M3**: First outing, with data recorded for the addressee research.
 

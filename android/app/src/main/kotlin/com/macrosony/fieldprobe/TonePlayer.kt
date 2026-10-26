@@ -21,6 +21,9 @@ object TonePlayer {
     /** Two-note chime, ~0.35 s. */
     fun chime(): ShortArray = concat(tone(880.0, 0.15), silence(0.04), tone(1320.0, 0.16))
 
+    /** Sequential notes (frequency Hz to seconds), used for server earcons. */
+    fun notes(seq: List<Pair<Double, Double>>): ShortArray = concat(*seq.map { tone(it.first, it.second) }.toTypedArray())
+
     /** Longer sweep for checking routing/latency by ear (~3 s). */
     fun sweep(): ShortArray {
         val n = (RATE * 3.0).toInt()

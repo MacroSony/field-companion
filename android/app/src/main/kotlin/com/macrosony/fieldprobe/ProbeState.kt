@@ -27,6 +27,8 @@ object ProbeState {
 
     /** Set by the service while recording; invoked from any thread. */
     @Volatile var marker: ((String) -> Unit)? = null
+    @Volatile var tapper: ((String) -> Unit)? = null
+    @Volatile var linkState: String = ""
 
     fun postLevels(l: Levels) = main.post { levelListener?.invoke(l) }
 

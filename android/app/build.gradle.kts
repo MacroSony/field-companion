@@ -10,8 +10,8 @@ android {
         applicationId = "com.macrosony.fieldprobe"
         minSdk = 33
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.2.0"
     }
 
     buildTypes {
@@ -30,4 +30,8 @@ kotlin {
     compilerOptions {
         jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
     }
+}
+
+dependencies {
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
 }

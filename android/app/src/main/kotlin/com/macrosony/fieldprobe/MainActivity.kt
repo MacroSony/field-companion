@@ -15,6 +15,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.ArrayAdapter
 import android.widget.Button
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Spinner
@@ -35,6 +36,10 @@ class MainActivity : Activity() {
     private lateinit var startBtn: Button
     private lateinit var stopBtn: Button
     private lateinit var markBtn: Button
+    private lateinit var linkUrl: EditText
+    private lateinit var linkChSpinner: Spinner
+    private lateinit var fakeWav: EditText
+    private val prefs by lazy { getSharedPreferences("probe", MODE_PRIVATE) }
 
     private var inputs: List<AudioDeviceInfo?> = listOf(null)
     private var outputs: List<AudioDeviceInfo?> = listOf(null)
@@ -98,8 +103,12 @@ class MainActivity : Activity() {
         val output = outputs.getOrNull(outSpinner.selectedItemPosition)
         val source = AudioInfo.SOURCES[srcSpinner.selectedItemPosition].second
         val channels = if (chSpinner.selectedItemPosition == 0) 2 else 1
+        savePrefs()
         val intent = Intent(this, RecorderService::class.java)
             .setAction(RecorderService.ACTION_START)
+            .putExtra(RecorderService.EXTRA_LINK_URL, linkUrl.text.toString().trim())
+            .putExtra(RecorderService.EXTRA_LINK_CHANNEL, linkChSpinner.selectedItemPosition)
+            .putExtra(RecorderService.EXTRA_FAKE_WAV, fakeWav.text.toString().trim())
             .putExtra(RecorderService.EXTRA_INPUT_ID, input?.id ?: -1)
             .putExtra(RecorderService.EXTRA_OUTPUT_ID, output?.id ?: -1)
             .putExtra(RecorderService.EXTRA_SOURCE, source)
@@ -109,6 +118,29 @@ class MainActivity : Activity() {
 
     private fun stopRecording() {
         startService(Intent(this, RecorderService::class.java).setAction(RecorderService.ACTION_STOP))
+    }
+
+    private fun savePrefs() {
+        prefs.edit()
+            .putString("link_url", linkUrl.text.toString().trim())
+            .putInt("link_channel", linkChSpinner.selectedItemPosition)
+            .putString("fake_wav", fakeWav.text.toString().trim())
+            .apply()
+    }
+
+    /** ws(s)://host/ws?session=X&role=mic  ->  http(s)://host/?display=1&session=X */
+    private fun webUiUrl(): String? {
+        val u = android.net.Uri.parse(linkUrl.text.toString().trim())
+        val scheme = when (u.scheme) { "wss" -> "https"; "ws" -> "http"; else -> return null }
+        val sessionId = u.getQueryParameter("session") ?: return null
+        return android.net.Uri.Builder().scheme(scheme).encodedAuthority(u.encodedAuthority).path("/")
+            .appendQueryParameter("display", "1").appendQueryParameter("session", sessionId).build().toString()
+    }
+
+    private fun openWebUi() {
+        savePrefs()
+        val url = webUiUrl() ?: return ProbeState.log("link URL must be ws(s)://host/ws?session=…")
+        startActivity(Intent(this, WebUiActivity::class.java).putExtra(WebUiActivity.EXTRA_URL, url))
     }
 
     private fun playCue(sweep: Boolean) {
@@ -161,6 +193,7 @@ class MainActivity : Activity() {
             append(AudioInfo.systemStateLine(am)).append('\n')
             append("unprocessed_supported=").append(unprocessed).append('\n')
             if (ProbeState.recording) append("routed input: ").append(ProbeState.routedInput)
+            if (ProbeState.linkState.isNotEmpty()) append("\nlink: ").append(ProbeState.linkState)
         }
         startBtn.isEnabled = !ProbeState.recording
         stopBtn.isEnabled = ProbeState.recording
@@ -228,7 +261,7 @@ class MainActivity : Activity() {
             text = "Field Probe ${BuildConfigLite.VERSION}"
             textSize = 20f
         })
-        status = mono()
+        status = mono().apply { setLines(6) } // fixed height so buttons never jump
         root.addView(status)
 
         root.addView(label("Input"))
@@ -242,10 +275,33 @@ class MainActivity : Activity() {
         startBtn = button("● Record") { startRecording() }
         stopBtn = button("■ Stop") { stopRecording() }
         markBtn = button("Mark") { if (!ProbeState.mark("button")) ProbeState.log("not recording") }
-        root.addView(row(startBtn, stopBtn, markBtn))
+        val tapBtn = button("Tap") { ProbeState.tapper?.invoke("button") ?: ProbeState.log("not linked") }
+        root.addView(row(startBtn, stopBtn, markBtn, tapBtn))
 
-        levels = mono().apply { textSize = 13f; text = "levels appear while recording" }
+        levels = mono().apply { textSize = 13f; setLines(5); text = "levels appear while recording" }
         root.addView(levels)
+
+        root.addView(label("Link (native mic client, optional)"))
+        linkUrl = EditText(this).apply {
+            hint = "ws://host:port/ws?session=…&role=mic  (empty = record only)"
+            setSingleLine(true)
+            textSize = 13f
+            setText(prefs.getString("link_url", "ws://10.0.2.2:8767/ws?session=android-test&role=mic"))
+        }
+        root.addView(linkUrl)
+        linkChSpinner = Spinner(this).apply {
+            adapter = adapter(listOf("Send LEFT channel (collar mic)", "Send RIGHT channel", "Send L+R mix"))
+            setSelection(prefs.getInt("link_channel", 0))
+        }
+        root.addView(linkChSpinner)
+        fakeWav = EditText(this).apply {
+            hint = "fake mic WAV path (48 kHz PCM16), empty = real mic"
+            setSingleLine(true)
+            textSize = 13f
+            setText(prefs.getString("fake_wav", ""))
+        }
+        root.addView(fakeWav)
+        root.addView(row(button("Open web UI (display client)") { openWebUi() }))
 
         root.addView(label("Cue output"))
         outSpinner = Spinner(this); root.addView(outSpinner)

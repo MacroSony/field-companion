@@ -2,7 +2,7 @@
 
 Minimal native probe for the field-companion audio path: **USB-C wireless-mic receiver in, Bluetooth (A2DP) earbuds out**, without dropping into call mode. It records raw PCM on the phone and logs every routing change, so we can check on a real device whether this setup works before building the full app.
 
-Status: v0.1.0, tested on an Android 16 (API 36) emulator only. Not yet tested on a real phone.
+Status: v0.2.0, tested on an Android 16 (API 36) emulator only. Not yet tested on a real phone.
 
 ## What it does
 
@@ -17,7 +17,13 @@ Status: v0.1.0, tested on an Android 16 (API 36) emulator only. Not yet tested o
 - Shows live L/R RMS and peak levels plus the L−R difference, to check that the two transmitters really land on separate channels.
 - Plays cue sounds as `USAGE_MEDIA` to a chosen output (Chime, or a 3 s 500 Hz→8 kHz sweep) and logs the device each cue actually played on.
 - **Marks**: from the button, the notification action, or headset media keys (play/pause, next, …). Each mark plays a short chime.
-- When recording stops, everything is copied to `Download/FieldProbe/`: `probe-<stamp>_NN.wav` and `probe-<stamp>.json`. No network access.
+- When recording stops, everything is copied to `Download/FieldProbe/`: `probe-<stamp>_NN.wav` and `probe-<stamp>.json`.
+- **Link (optional, v0.2)**: the app becomes the backend's native mic client (`/ws?role=mic`, websocket transport) while it keeps recording locally.
+  - Uplink: one channel (L by default, the collar mic) as mono 48 kHz PCM16, sent in 20 ms frames.
+  - Downlink: the assistant's 24 kHz speech is played as media, with `playback {active, response_id, drained}` reports matching web/app.js.
+  - Also handles server `flush`/`earcon`, has a *Tap* control (button and notification), reconnects automatically, and logs transcripts and server events to the session JSON.
+  - *Open web UI* opens the existing page in a WebView as a `display` client of the same session.
+- **Fake mic**: point the app at a 48 kHz PCM16 WAV and it streams that instead of the microphone, in real time. Used for repeatable emulator tests.
 
 ## Build
 
@@ -42,8 +48,19 @@ Before you start: set the mobile receiver's noise-cancel switch to **O**. In DJI
 
 Pull files with any file manager (`Download/FieldProbe`), or `adb pull /sdcard/Download/FieldProbe`.
 
+## Emulator end-to-end test
+
+```bash
+. /data/opt/android-env.sh && ./gradlew assembleDebug
+emulator -avd probe36 -no-window -gpu swiftshader_indirect -port 5584 &   # AVD under /data/opt/avd
+ADB_SERIAL=emulator-5584 tools/emulator-link-test.sh <web-dir-containing-mock-server.py> <python-with-websockets>
+```
+
+The script starts `web/mock-server.py`, installs the APK, presets the link URL and fake WAV, and drives the UI: record → Tap → open web UI → stop. It then checks the mock log for the mic hello, 20 ms uplink frames, the tap, playback active/drained, and the display client joining the same session. Last run (2026-10-26, mock from `feat/gpt-realtime`): 6/6 PASS, 0 dropped frames.
+
 ## Known limits
 
 - Tested on the emulator only: no USB audio, no Bluetooth.
 - Depending on the earbud's gesture settings (HeyMelody app), a tap may not send media keys. Media keys reach us only while our `MediaSession` is the active one; the start chime is there to help with that.
+- In the WebView, display mode currently renders the laptop "big screen" layout, which is too cramped on a phone. A phone-shell mode in web/app.js is needed (see DESIGN.md).
 - PCM is 16-bit. If the USB receiver reports a 24-bit native format, Android converts it; the `actual` block in the JSON records what we got.

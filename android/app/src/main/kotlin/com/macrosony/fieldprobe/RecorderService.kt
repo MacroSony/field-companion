@@ -32,10 +32,10 @@ import kotlin.math.max
 import kotlin.math.sqrt
 
 /**
- * Foreground microphone service: records raw PCM to rolling WAV segments, logs every
- * routing / audio-mode change, and accepts timestamped markers (UI, notification,
- * headset media buttons). Nothing leaves the phone; finished sessions are copied to
- * Download/FieldProbe.
+ * Foreground microphone service. Always records raw PCM to rolling WAV segments and logs
+ * routing / audio-mode changes and markers. Optionally ("link") also acts as the backend's
+ * native mic client: streams one channel as mono 48 kHz to /ws?role=mic and plays the
+ * assistant's 24 kHz speech as media. A WAV file can stand in for the microphone (emulator tests).
  */
 class RecorderService : Service() {
 
@@ -43,14 +43,23 @@ class RecorderService : Service() {
         const val ACTION_START = "start"
         const val ACTION_STOP = "stop"
         const val ACTION_MARK = "mark"
+        const val ACTION_TAP = "tap"
         const val EXTRA_INPUT_ID = "input_id"
         const val EXTRA_OUTPUT_ID = "output_id"
         const val EXTRA_SOURCE = "source"
         const val EXTRA_CHANNELS = "channels"
         const val EXTRA_SEGMENT_MIN = "segment_min"
+        const val EXTRA_LINK_URL = "link_url"
+        const val EXTRA_LINK_CHANNEL = "link_channel" // 0 = left, 1 = right, 2 = mix
+        const val EXTRA_FAKE_WAV = "fake_wav"
         private const val CHANNEL_ID = "recording"
         private const val NOTIF_ID = 7
         private const val SAMPLE_RATE = 48_000
+        private const val BLOCK_FRAMES = SAMPLE_RATE / 50 // 20 ms
+        private val LOGGED_SERVER_EVENTS = setOf(
+            "server_transcript", "server_audio_start", "server_audio_end", "server_flush",
+            "server_earcon", "server_error", "server_reply_retry",
+        )
     }
 
     private lateinit var am: AudioManager
@@ -61,8 +70,12 @@ class RecorderService : Service() {
     @Volatile private var running = false
     private var worker: Thread? = null
     private var rec: AudioRecord? = null
+    private var fake: WavInput? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var session: MediaSession? = null
+    private var player: StreamPlayer? = null
+    private var link: LinkClient? = null
+    private var linkChannel = 0
 
     private lateinit var dir: File
     private lateinit var name: String
@@ -115,8 +128,7 @@ class RecorderService : Service() {
         cbThread = HandlerThread("probe-callbacks").also { it.start() }
         cbHandler = Handler(cbThread.looper)
         cbExecutor = Executor { cbHandler.post(it) }
-        val nm = getSystemService(NotificationManager::class.java)
-        nm.createNotificationChannel(
+        getSystemService(NotificationManager::class.java).createNotificationChannel(
             NotificationChannel(CHANNEL_ID, "Recording", NotificationManager.IMPORTANCE_LOW)
         )
     }
@@ -126,6 +138,7 @@ class RecorderService : Service() {
             ACTION_START -> if (!running) start(intent)
             ACTION_STOP -> stopRecording("stop_requested")
             ACTION_MARK -> mark("notification")
+            ACTION_TAP -> tap("notification")
         }
         return START_NOT_STICKY
     }
@@ -137,39 +150,51 @@ class RecorderService : Service() {
         val source = intent.getIntExtra(EXTRA_SOURCE, android.media.MediaRecorder.AudioSource.UNPROCESSED)
         channels = intent.getIntExtra(EXTRA_CHANNELS, 2)
         val segmentMin = intent.getIntExtra(EXTRA_SEGMENT_MIN, 30)
+        val linkUrl = intent.getStringExtra(EXTRA_LINK_URL)?.trim().orEmpty()
+        linkChannel = intent.getIntExtra(EXTRA_LINK_CHANNEL, 0)
+        val fakePath = intent.getStringExtra(EXTRA_FAKE_WAV)?.trim().orEmpty()
 
         name = "probe-" + Times.stampNow()
         dir = File(getExternalFilesDir("sessions"), name).also { it.mkdirs() }
         startForeground(NOTIF_ID, notification("Starting…"), ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
 
         val preferred = am.getDevices(AudioManager.GET_DEVICES_INPUTS).firstOrNull { it.id == inputId }
-        val mask = if (channels == 2) AudioFormat.CHANNEL_IN_STEREO else AudioFormat.CHANNEL_IN_MONO
-        val fmt = AudioFormat.Builder()
-            .setSampleRate(SAMPLE_RATE)
-            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-            .setChannelMask(mask)
-            .build()
-        val minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE, mask, AudioFormat.ENCODING_PCM_16BIT)
-        val r = try {
-            AudioRecord.Builder()
-                .setAudioSource(source)
-                .setAudioFormat(fmt)
-                .setBufferSizeInBytes(max(minBuf * 4, SAMPLE_RATE * channels * 2 / 2))
+        val cueOut = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS).firstOrNull { it.id == outputId }
+
+        if (fakePath.isNotEmpty()) {
+            val f = try { WavInput(File(fakePath)) } catch (e: Exception) {
+                ProbeState.log("fake WAV failed: $e"); stopSelf(); return
+            }
+            if (f.sampleRate != SAMPLE_RATE) {
+                ProbeState.log("fake WAV must be 48 kHz (got ${f.sampleRate})"); f.release(); stopSelf(); return
+            }
+            fake = f
+            channels = f.channels
+        } else {
+            val mask = if (channels == 2) AudioFormat.CHANNEL_IN_STEREO else AudioFormat.CHANNEL_IN_MONO
+            val fmt = AudioFormat.Builder()
+                .setSampleRate(SAMPLE_RATE)
+                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                .setChannelMask(mask)
                 .build()
-        } catch (e: Exception) {
-            ProbeState.log("AudioRecord build failed: $e")
-            stopSelf()
-            return
+            val minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE, mask, AudioFormat.ENCODING_PCM_16BIT)
+            val r = try {
+                AudioRecord.Builder()
+                    .setAudioSource(source)
+                    .setAudioFormat(fmt)
+                    .setBufferSizeInBytes(max(minBuf * 4, SAMPLE_RATE * channels * 2 / 2))
+                    .build()
+            } catch (e: Exception) {
+                ProbeState.log("AudioRecord build failed: $e"); stopSelf(); return
+            }
+            if (r.state != AudioRecord.STATE_INITIALIZED) {
+                ProbeState.log("AudioRecord not initialized (source=${AudioInfo.sourceName(source)})")
+                r.release(); stopSelf(); return
+            }
+            if (preferred != null) r.setPreferredDevice(preferred)
+            r.addOnRoutingChangedListener(routeListener, cbHandler)
+            rec = r
         }
-        if (r.state != AudioRecord.STATE_INITIALIZED) {
-            ProbeState.log("AudioRecord not initialized (source=${AudioInfo.sourceName(source)})")
-            r.release()
-            stopSelf()
-            return
-        }
-        if (preferred != null) r.setPreferredDevice(preferred)
-        r.addOnRoutingChangedListener(routeListener, cbHandler)
-        rec = r
 
         meta.put("kind", "recording_session")
         meta.put("app_version", BuildConfigLite.VERSION)
@@ -178,15 +203,18 @@ class RecorderService : Service() {
         meta.put("build", AudioInfo.buildInfo())
         meta.put("properties", AudioInfo.properties(am))
         meta.put("requested", JSONObject().apply {
-            put("source", AudioInfo.sourceName(source))
+            put("source", if (fake != null) "fake_wav" else AudioInfo.sourceName(source))
+            put("fake_wav", fakePath.ifEmpty { JSONObject.NULL })
             put("sample_rate", SAMPLE_RATE)
             put("channels", channels)
             put("preferred_input", AudioInfo.describe(preferred))
             put("cue_output_id", outputId)
             put("segment_minutes", segmentMin)
+            put("link_url", linkUrl.ifEmpty { JSONObject.NULL })
+            put("link_channel", listOf("left", "right", "mix").getOrElse(linkChannel) { "left" })
         })
         meta.put("system_state_start", AudioInfo.systemState(am))
-        val allDevices = am.getDevices(AudioManager.GET_DEVICES_ALL)
+        val allDevices = am.getDevices(AudioManager.GET_DEVICES_INPUTS or AudioManager.GET_DEVICES_OUTPUTS)
         devicesAtStart.clear()
         allDevices.forEach { devicesAtStart.add(it.id) }
         meta.put("devices_at_start", JSONArray(allDevices.map { AudioInfo.describe(it) }))
@@ -202,7 +230,7 @@ class RecorderService : Service() {
         startElapsed = SystemClock.elapsedRealtime()
         totalFrames = 0
         try {
-            r.startRecording()
+            rec?.startRecording()
         } catch (e: Exception) {
             ProbeState.log("startRecording failed: $e")
             stopRecording("start_failed")
@@ -212,31 +240,74 @@ class RecorderService : Service() {
         ProbeState.recording = true
         ProbeState.sessionName = name
         ProbeState.marker = { label -> mark(label) }
-        event("recording_started", JSONObject().put("record_state", r.recordingState))
-        ProbeState.log("recording $name  source=${AudioInfo.sourceName(source)} ch=$channels")
+        ProbeState.tapper = { label -> tap(label) }
+        event("recording_started", JSONObject().put("record_state", rec?.recordingState ?: -1))
+        ProbeState.log("recording $name  source=${if (fake != null) "fake_wav" else AudioInfo.sourceName(source)} ch=$channels")
+
+        if (linkUrl.isNotEmpty()) startLink(linkUrl, cueOut)
         ProbeState.stateChanged()
         setupMediaSession()
         cue()
 
         val segmentFrames = segmentMin.toLong() * 60 * SAMPLE_RATE
-        worker = Thread({ loop(r, segmentFrames) }, "probe-recorder").also { it.start() }
+        worker = Thread({ loop(segmentFrames) }, "probe-recorder").also { it.start() }
         updateNotification()
     }
 
-    private fun loop(r: AudioRecord, segmentFrames: Long) {
-        val block = SAMPLE_RATE / 10 * channels // 100 ms
+    private fun startLink(url: String, out: AudioDeviceInfo?) {
+        val p = StreamPlayer(out)
+        player = p
+        link = LinkClient(url, p) { type, detail ->
+            if (type.startsWith("link_") || type in LOGGED_SERVER_EVENTS) {
+                event(type, if (type == "server_transcript") JSONObject()
+                    .put("role", detail.optString("role")).put("text", detail.optString("text"))
+                    .put("final", detail.optBoolean("final")) else detail)
+            }
+            when (type) {
+                "link_open" -> { ProbeState.linkState = "connected"; ProbeState.log("link connected") }
+                "link_closed", "link_failure" -> {
+                    ProbeState.linkState = "disconnected"
+                    ProbeState.log("link ${type.removePrefix("link_")}: ${detail.optString("error", detail.optString("reason"))}")
+                }
+                "server_transcript" -> if (detail.optBoolean("final")) {
+                    ProbeState.log("${detail.optString("role")}: ${detail.optString("text")}")
+                }
+                "server_audio_start" -> cbHandler.postDelayed({
+                    event("speech_output_route", AudioInfo.describe(p.routedDevice))
+                }, 300)
+                "server_error" -> ProbeState.log("server error: ${detail.optString("message")}")
+            }
+            ProbeState.stateChanged()
+        }.also { it.connect() }
+        ProbeState.linkState = "connecting"
+        ProbeState.log("link -> $url (channel ${listOf("L", "R", "mix").getOrElse(linkChannel) { "L" }})")
+    }
+
+    private fun readBlock(buf: ShortArray): Int {
+        fake?.let { return it.read(buf, buf.size) }
+        return rec!!.read(buf, 0, buf.size, AudioRecord.READ_BLOCKING)
+    }
+
+    private fun loop(segmentFrames: Long) {
+        val block = BLOCK_FRAMES * channels
         val buf = ShortArray(block)
+        val mono = ShortArray(BLOCK_FRAMES)
         var seg = 0
         var writer = openSegment(seg)
         var segStart = 0L
         var lastSlow = SystemClock.elapsedRealtime()
+        var lastLevels = 0L
         var lastSilenced: Boolean? = null
         var actualLogged = false
         var clipped = 0L
+        val sumSq = DoubleArray(channels)
+        val peak = IntArray(channels)
+        var levelFrames = 0
         try {
             while (running) {
-                val n = r.read(buf, 0, buf.size, AudioRecord.READ_BLOCKING)
+                val n = readBlock(buf)
                 if (n < 0) {
+                    if (fake != null) { ProbeState.log("fake WAV ended"); break }
                     event("read_error", JSONObject().put("code", n))
                     ProbeState.log("read error $n")
                     Thread.sleep(50)
@@ -247,8 +318,6 @@ class RecorderService : Service() {
                 val frames = n / channels
                 totalFrames += frames
 
-                val sumSq = DoubleArray(channels)
-                val peak = IntArray(channels)
                 for (i in 0 until frames * channels) {
                     val c = i % channels
                     val v = buf[i].toInt()
@@ -257,37 +326,66 @@ class RecorderService : Service() {
                     if (a > peak[c]) peak[c] = a
                     if (a >= 32767) clipped++
                 }
-                val rms = DoubleArray(channels) { db(sqrt(sumSq[it] / frames)) }
-                val pk = DoubleArray(channels) { db(peak[it].toDouble()) }
+                levelFrames += frames
+
+                link?.let { l ->
+                    if (channels == 1) {
+                        l.sendPcm(buf, frames)
+                    } else {
+                        for (f in 0 until frames) {
+                            mono[f] = when (linkChannel) {
+                                1 -> buf[2 * f + 1]
+                                2 -> ((buf[2 * f].toInt() + buf[2 * f + 1].toInt()) / 2).toShort()
+                                else -> buf[2 * f]
+                            }
+                        }
+                        l.sendPcm(mono, frames)
+                    }
+                }
 
                 val now = SystemClock.elapsedRealtime()
+                if (now - lastLevels >= 100 && levelFrames > 0) {
+                    lastLevels = now
+                    val rms = DoubleArray(channels) { db(sqrt(sumSq[it] / levelFrames)) }
+                    val pk = DoubleArray(channels) { db(peak[it].toDouble()) }
+                    ProbeState.postLevels(ProbeState.Levels(rms, pk, totalFrames, lastSilenced, clipped))
+                    sumSq.fill(0.0); peak.fill(0); levelFrames = 0
+                }
                 if (now - lastSlow >= 1000) {
                     lastSlow = now
+                    val r = rec
                     if (!actualLogged) {
                         actualLogged = true
                         meta.put("actual", JSONObject().apply {
-                            put("sample_rate", r.sampleRate)
-                            put("channel_count", r.channelCount)
-                            put("encoding", AudioInfo.encodingName(r.audioFormat))
-                            put("audio_session_id", r.audioSessionId)
-                            put("routed_input", AudioInfo.describe(r.routedDevice))
+                            if (r != null) {
+                                put("sample_rate", r.sampleRate)
+                                put("channel_count", r.channelCount)
+                                put("encoding", AudioInfo.encodingName(r.audioFormat))
+                                put("audio_session_id", r.audioSessionId)
+                                put("routed_input", AudioInfo.describe(r.routedDevice))
+                            } else {
+                                put("sample_rate", SAMPLE_RATE)
+                                put("channel_count", channels)
+                                put("source", "fake_wav")
+                            }
                         })
-                        ProbeState.routedInput = AudioInfo.shortLabel(r.routedDevice)
+                        if (r != null) ProbeState.routedInput = AudioInfo.shortLabel(r.routedDevice)
                         ProbeState.stateChanged()
                     }
-                    val silenced = am.activeRecordingConfigurations
-                        .firstOrNull { it.clientAudioSessionId == r.audioSessionId }?.isClientSilenced
-                    if (silenced != lastSilenced) {
-                        lastSilenced = silenced
-                        event("client_silenced", JSONObject().put("silenced", silenced ?: JSONObject.NULL))
-                        ProbeState.log("client silenced = $silenced")
+                    if (r != null) {
+                        val silenced = am.activeRecordingConfigurations
+                            .firstOrNull { it.clientAudioSessionId == r.audioSessionId }?.isClientSilenced
+                        if (silenced != lastSilenced) {
+                            lastSilenced = silenced
+                            event("client_silenced", JSONObject().put("silenced", silenced ?: JSONObject.NULL))
+                            ProbeState.log("client silenced = $silenced")
+                        }
                     }
                     if ((now - startElapsed) % 10_000 < 1000) {
                         writer.patchHeader()
                         saveMeta(final = false)
                     }
                 }
-                ProbeState.postLevels(ProbeState.Levels(rms, pk, totalFrames, lastSilenced, clipped))
 
                 if (totalFrames - segStart >= segmentFrames) {
                     closeSegment(writer, segStart)
@@ -339,6 +437,14 @@ class RecorderService : Service() {
         cue()
     }
 
+    private fun tap(source: String) {
+        val l = link
+        if (!running || l == null) { ProbeState.log("tap ignored (no link)"); return }
+        event("tap", JSONObject().put("source", source))
+        l.tap()
+        ProbeState.log("TAP ($source)")
+    }
+
     private fun cue() {
         val out = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS).firstOrNull { it.id == outputId }
         TonePlayer.play(TonePlayer.chime(), out) { routed ->
@@ -376,12 +482,22 @@ class RecorderService : Service() {
         running = false
         worker?.join(3000)
         worker = null
+        link?.let {
+            event("link_stats", JSONObject().put("sent_frames", it.sentFrames).put("dropped_frames", it.droppedFrames))
+            it.close()
+        }
+        link = null
+        player?.release()
+        player = null
+        ProbeState.linkState = ""
         rec?.let {
             try { it.stop() } catch (_: Exception) {}
             it.removeOnRoutingChangedListener(routeListener)
             it.release()
         }
         rec = null
+        fake?.release()
+        fake = null
         session?.release()
         session = null
         try {
@@ -392,6 +508,7 @@ class RecorderService : Service() {
         wakeLock?.let { if (it.isHeld) it.release() }
         wakeLock = null
         ProbeState.marker = null
+        ProbeState.tapper = null
         ProbeState.recording = false
 
         if (wasRunning) {
@@ -431,24 +548,21 @@ class RecorderService : Service() {
     }
 
     private fun notification(text: String): Notification {
+        fun svc(code: Int, action: String) = PendingIntent.getService(
+            this, code, Intent(this, RecorderService::class.java).setAction(action), PendingIntent.FLAG_IMMUTABLE
+        )
         val open = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
         )
-        val stop = PendingIntent.getService(
-            this, 1, Intent(this, RecorderService::class.java).setAction(ACTION_STOP), PendingIntent.FLAG_IMMUTABLE
-        )
-        val markPi = PendingIntent.getService(
-            this, 2, Intent(this, RecorderService::class.java).setAction(ACTION_MARK), PendingIntent.FLAG_IMMUTABLE
-        )
-        return Notification.Builder(this, CHANNEL_ID)
+        val b = Notification.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
-            .setContentTitle("Field Probe recording")
+            .setContentTitle(if (link != null) "Field Probe · link" else "Field Probe recording")
             .setContentText(text)
             .setOngoing(true)
             .setContentIntent(open)
-            .addAction(Notification.Action.Builder(null, "Mark", markPi).build())
-            .addAction(Notification.Action.Builder(null, "Stop", stop).build())
-            .build()
+            .addAction(Notification.Action.Builder(null, "Mark", svc(2, ACTION_MARK)).build())
+        if (link != null) b.addAction(Notification.Action.Builder(null, "Tap", svc(3, ACTION_TAP)).build())
+        return b.addAction(Notification.Action.Builder(null, "Stop", svc(1, ACTION_STOP)).build()).build()
     }
 
     private fun updateNotification() {
