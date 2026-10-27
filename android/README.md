@@ -2,7 +2,7 @@
 
 Minimal native probe for the field-companion audio path: **USB-C wireless-mic receiver in, Bluetooth (A2DP) earbuds out**, without dropping into call mode. It records raw PCM on the phone and logs every routing change, so we can check on a real device whether this setup works before building the full app.
 
-Status: v0.2.0, tested on an Android 16 (API 36) emulator only. Not yet tested on a real phone.
+Status: v0.3.0. Real-device indoor tests passed on 2026-10-27 (Honor LDY-AN00, Android 16, DJI Mic Mini 2 mobile RX + OPPO Enco Free 4); see the results section below.
 
 ## What it does
 
@@ -33,7 +33,7 @@ cd android && ./gradlew assembleDebug
 # -> app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Toolchain: AGP 9.4.1 with built-in Kotlin, Gradle 9.6.0, compileSdk/targetSdk 36, minSdk 33. No AndroidX or other third-party dependencies.
+Toolchain: AGP 9.4.1 with built-in Kotlin, Gradle 9.6.0, compileSdk/targetSdk 36, minSdk 33. One dependency: OkHttp 4.12 (no AndroidX).
 
 ## First real-device test (DJI Mic Mini 2 + mobile receiver, OPPO Enco Free 4)
 
@@ -47,6 +47,15 @@ Before you start: set the mobile receiver's noise-cancel switch to **O**. In DJI
 6. **Power.** Note the battery % per hour with and without a power bank through the receiver's USB-C pass-through.
 
 Pull files with any file manager (`Download/FieldProbe`), or `adb pull /sdcard/Download/FieldProbe`.
+
+## Real-device results (2026-10-27, indoor)
+
+- USB input `Wireless Mic Rx`: 48 kHz, 1/2 ch, pcm16/float/pcm24. **DJI Mimo must be set to stereo**; the default sends identical L/R.
+- Stereo: corr(L,R) = 0.0035; talking into one TX gives 17–21 dB separation (acoustic bleed only). Quiet floor about -61 dBFS RMS. Speech is still ~25 dB above the floor at 16–20 kHz; nothing above 20 kHz.
+- `mode=NORMAL` throughout, never silenced, every cue routed to `bluetooth_a2dp`. An Enco gesture arrives as `KEYCODE_MEDIA_PLAY`.
+- Link mode over a cloudflared tunnel against `feat/gpt-realtime` (websocket transport, Ambient): conversation works with `--realtime-provider openai`; BirdNET heard played Killdeer / Great Horned Owl calls from the left channel.
+- Gotchas: Mimo firmware updates hang while we hold the USB stream. MagicOS asks for on-phone confirmation for every `adb install`. `higgs-realtime-1.5-preview` was retired; plain `higgs-realtime` connects, but the backend's route step timed out (not yet investigated).
+- v0.3: in link mode an earbud gesture sends **Tap** (also logged). The notification shows the latest transcript line, manual cues are logged, and *Open web UI* adds `shell=android` (needs the matching web/app.js change: phone layout as display + per-species dedupe).
 
 ## Emulator end-to-end test
 

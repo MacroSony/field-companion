@@ -29,6 +29,8 @@ object ProbeState {
     @Volatile var marker: ((String) -> Unit)? = null
     @Volatile var tapper: ((String) -> Unit)? = null
     @Volatile var linkState: String = ""
+    /** Set by the service while recording: append an event to the session JSON. */
+    @Volatile var eventSink: ((String, org.json.JSONObject) -> Unit)? = null
 
     fun postLevels(l: Levels) = main.post { levelListener?.invoke(l) }
 

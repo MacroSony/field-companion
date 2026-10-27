@@ -134,7 +134,8 @@ class MainActivity : Activity() {
         val scheme = when (u.scheme) { "wss" -> "https"; "ws" -> "http"; else -> return null }
         val sessionId = u.getQueryParameter("session") ?: return null
         return android.net.Uri.Builder().scheme(scheme).encodedAuthority(u.encodedAuthority).path("/")
-            .appendQueryParameter("display", "1").appendQueryParameter("session", sessionId).build().toString()
+            .appendQueryParameter("display", "1").appendQueryParameter("shell", "android")
+            .appendQueryParameter("session", sessionId).build().toString()
     }
 
     private fun openWebUi() {
@@ -146,8 +147,12 @@ class MainActivity : Activity() {
     private fun playCue(sweep: Boolean) {
         val output = outputs.getOrNull(outSpinner.selectedItemPosition)
         val before = AudioInfo.systemStateLine(am)
+        val kind = if (sweep) "sweep" else "chime"
+        ProbeState.eventSink?.invoke("manual_cue", org.json.JSONObject().put("kind", kind))
         TonePlayer.play(if (sweep) TonePlayer.sweep() else TonePlayer.chime(), output) { routed ->
             ProbeState.log("cue routed -> ${AudioInfo.shortLabel(routed)}  [$before]")
+            ProbeState.eventSink?.invoke("manual_cue_route",
+                AudioInfo.describe(routed).put("kind", kind))
         }
     }
 

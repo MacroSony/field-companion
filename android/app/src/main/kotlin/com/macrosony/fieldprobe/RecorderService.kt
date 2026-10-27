@@ -76,6 +76,7 @@ class RecorderService : Service() {
     private var player: StreamPlayer? = null
     private var link: LinkClient? = null
     private var linkChannel = 0
+    @Volatile private var lastLine = ""
 
     private lateinit var dir: File
     private lateinit var name: String
@@ -241,6 +242,7 @@ class RecorderService : Service() {
         ProbeState.sessionName = name
         ProbeState.marker = { label -> mark(label) }
         ProbeState.tapper = { label -> tap(label) }
+        ProbeState.eventSink = { type, detail -> event(type, detail) }
         event("recording_started", JSONObject().put("record_state", rec?.recordingState ?: -1))
         ProbeState.log("recording $name  source=${if (fake != null) "fake_wav" else AudioInfo.sourceName(source)} ch=$channels")
 
@@ -264,13 +266,17 @@ class RecorderService : Service() {
                     .put("final", detail.optBoolean("final")) else detail)
             }
             when (type) {
-                "link_open" -> { ProbeState.linkState = "connected"; ProbeState.log("link connected") }
+                "link_open" -> { ProbeState.linkState = "connected"; ProbeState.log("link connected"); updateNotification() }
                 "link_closed", "link_failure" -> {
                     ProbeState.linkState = "disconnected"
+                    updateNotification()
                     ProbeState.log("link ${type.removePrefix("link_")}: ${detail.optString("error", detail.optString("reason"))}")
                 }
                 "server_transcript" -> if (detail.optBoolean("final")) {
-                    ProbeState.log("${detail.optString("role")}: ${detail.optString("text")}")
+                    val line = "${if (detail.optString("role") == "user") "You" else "AI"}: ${detail.optString("text")}"
+                    ProbeState.log(line)
+                    lastLine = line
+                    updateNotification()
                 }
                 "server_audio_start" -> cbHandler.postDelayed({
                     event("speech_output_route", AudioInfo.describe(p.routedDevice))
@@ -458,7 +464,10 @@ class RecorderService : Service() {
                 override fun onMediaButtonEvent(mediaButtonIntent: Intent): Boolean {
                     val ke = mediaButtonIntent.getParcelableExtra(Intent.EXTRA_KEY_EVENT, KeyEvent::class.java)
                     if (ke != null && ke.action == KeyEvent.ACTION_DOWN && ke.repeatCount == 0) {
-                        mark("media_button:" + KeyEvent.keyCodeToString(ke.keyCode))
+                        val label = "media_button:" + KeyEvent.keyCodeToString(ke.keyCode)
+                        // Linked: the earbud gesture means "hey / stop talking" (tap). The tap event is
+                        // logged with the same frame, so it doubles as a marker without an extra chime.
+                        if (link != null) tap(label) else mark(label)
                     }
                     return true
                 }
@@ -509,6 +518,7 @@ class RecorderService : Service() {
         wakeLock = null
         ProbeState.marker = null
         ProbeState.tapper = null
+        ProbeState.eventSink = null
         ProbeState.recording = false
 
         if (wasRunning) {
@@ -558,6 +568,7 @@ class RecorderService : Service() {
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setContentTitle(if (link != null) "Field Probe · link" else "Field Probe recording")
             .setContentText(text)
+            .setStyle(Notification.BigTextStyle().bigText(text))
             .setOngoing(true)
             .setContentIntent(open)
             .addAction(Notification.Action.Builder(null, "Mark", svc(2, ACTION_MARK)).build())
@@ -566,7 +577,12 @@ class RecorderService : Service() {
     }
 
     private fun updateNotification() {
-        getSystemService(NotificationManager::class.java).notify(NOTIF_ID, notification(name))
+        if (!running) return
+        val text = buildString {
+            if (link != null) append(if (ProbeState.linkState == "connected") "● " else "○ offline · ")
+            append(lastLine.ifEmpty { name })
+        }
+        getSystemService(NotificationManager::class.java).notify(NOTIF_ID, notification(text))
     }
 
     override fun onDestroy() {
